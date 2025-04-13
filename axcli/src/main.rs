@@ -1,4 +1,6 @@
-mod vmm;
+mod instance;
+mod elf;
+mod hvc;
 
 use clap::{Args, Parser, Subcommand};
 
@@ -7,7 +9,7 @@ extern crate log;
 
 #[derive(Parser)]
 #[command(name = "axcli")]
-#[command(about = "CommandLine Interface for ArceOS Hypervisor", long_about = None)]
+#[command(about = "CommandLine Interface for AxVisor", long_about = None)]
 #[command(args_conflicts_with_subcommands = true)]
 #[command(flatten_help = true)]
 struct CLI {
@@ -24,10 +26,10 @@ enum CLISubCmd {
         #[command(subcommand)]
         subcmd: HvSubCmd,
     },
-    /// Subcommands related to the management of guest virtual machines.
-    Vm {
+    /// Subcommands related to the management of the container instance.
+    Instance {
         #[command(subcommand)]
-        subcmd: VmSubCmd,
+        subcmd: InstanceSubCmd,
     },
 }
 
@@ -44,24 +46,16 @@ enum HvSubCmd {
 #[derive(Subcommand)]
 #[command(args_conflicts_with_subcommands = true)]
 #[command(flatten_help = true)]
-enum VmSubCmd {
-    /// list the info of the vm
+enum InstanceSubCmd {
+    /// list the info of the instance
     List,
-    Create(VmCreateArgs),
-    Boot(VmBootShutdownArgs),
-    Shutdown(VmBootShutdownArgs),
+    Init(InstanceInitArgs),
 }
 
 #[derive(Debug, Args)]
-struct VmCreateArgs {
+struct InstanceInitArgs {
     #[arg(short, long)]
-    pub config_path: String,
-}
-
-#[derive(Debug, Args)]
-struct VmBootShutdownArgs {
-    #[arg(short, long)]
-    pub vmid: u64,
+    pub elf_path: String,
 }
 
 fn main() {
@@ -76,15 +70,9 @@ fn main() {
             HvSubCmd::Enable => todo!(),
             HvSubCmd::Disable => todo!(),
         },
-        CLISubCmd::Vm { subcmd } => match subcmd {
-            VmSubCmd::List => todo!(),
-            VmSubCmd::Create(arg) => vmm::axvmm_create_vm(arg).expect("Failed in axvmm_create_vm"),
-            VmSubCmd::Boot(arg) => {
-                vmm::axvmm_boot_shutdown_vm(true, arg).expect("Failed to boot VM")
-            }
-            VmSubCmd::Shutdown(arg) => {
-                vmm::axvmm_boot_shutdown_vm(false, arg).expect("Failed to shutdown VM")
-            }
+        CLISubCmd::Instance { subcmd } => match subcmd {
+            InstanceSubCmd::List => todo!(),
+            InstanceSubCmd::Init(arg) => instance::init_instance(arg),
         },
     }
 }
