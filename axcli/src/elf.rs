@@ -194,6 +194,7 @@ pub fn parse_elf_file(path: &str) {
         total_count as _,
         shared_pages.as_ptr() as u64,
         shared_pages.len() as _,
+        elf.header.pt2.entry_point(),
     );
 
     free_shared_pages(&mut shared_pages);
