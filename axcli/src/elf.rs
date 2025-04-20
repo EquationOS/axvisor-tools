@@ -93,7 +93,7 @@ fn free_shared_pages(shared_pages: &mut Vec<*mut c_void>) {
     shared_pages.clear();
 }
 
-pub fn parse_elf_file(path: &str) {
+pub fn parse_elf_file(path: &str, one2onemapping: bool) {
     let mut total_count = 0;
     let mut current_offset = 0;
     let mut shared_pages: Vec<*mut c_void> = Vec::new();
@@ -195,6 +195,7 @@ pub fn parse_elf_file(path: &str) {
         shared_pages.as_ptr() as u64,
         shared_pages.len() as _,
         elf.header.pt2.entry_point(),
+        if one2onemapping { 0 } else { 1 },
     );
 
     free_shared_pages(&mut shared_pages);

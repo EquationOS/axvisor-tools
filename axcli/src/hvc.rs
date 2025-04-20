@@ -42,6 +42,7 @@ pub fn hvc_create_instance(
     memory_regions_page_base: u64,
     memory_regions_page_count: u64,
     entry: u64,
+    one2onemapping: u64,
 ) {
     let result = trigger_hypercall(
         HyperCallCode::HCreateInstance,
@@ -50,7 +51,7 @@ pub fn hvc_create_instance(
         memory_regions_page_base,
         memory_regions_page_count,
         entry,
-        0,
+        one2onemapping,
     );
     info!("hvc_create_instance result: {:#x}", result);
 }

@@ -1,6 +1,6 @@
-mod instance;
 mod elf;
 mod hvc;
+mod instance;
 
 use clap::{Args, Parser, Subcommand};
 
@@ -56,6 +56,8 @@ enum InstanceSubCmd {
 struct InstanceInitArgs {
     #[arg(short, long)]
     pub elf_path: String,
+    #[arg(short, long, default_value_t = false)]
+    pub one2onemapping: bool,
 }
 
 fn main() {
