@@ -18,4 +18,4 @@ page_table_multiarch = "0.5"
 axhvc = { git = "https://github.com/arceos-hypervisor/axhvc.git" }
 
 [patch."https://github.com/arceos-hypervisor/axhvc.git"]
-axhvc = { path = "../../axhvc" }
+axhvc = { path = "../../../crates/axhvc" }

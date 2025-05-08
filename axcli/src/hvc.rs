@@ -36,6 +36,11 @@ pub fn hvc_debug() {
     info!("hvc_debug result: {:#x}", result);
 }
 
+pub fn hvc_init_shim() {
+    let result = trigger_hypercall(HyperCallCode::HInitShim, 0, 0, 0, 0, 0, 0);
+    info!("hvc_init_shim result: {:#x}", result);
+}
+
 pub fn hvc_create_instance(
     instance_id: u64,
     memory_regions_total_count: u64,

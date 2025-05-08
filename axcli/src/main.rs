@@ -49,11 +49,14 @@ enum HvSubCmd {
 enum InstanceSubCmd {
     /// list the info of the instance
     List,
-    Init(InstanceInitArgs),
+    /// Init instance runtime environment.
+    Init,
+    /// Create a new instance.
+    Create(InstanceCreateArgs)
 }
 
 #[derive(Debug, Args)]
-struct InstanceInitArgs {
+struct InstanceCreateArgs {
     #[arg(short, long)]
     pub elf_path: String,
     #[arg(short, long, default_value_t = false)]
@@ -74,7 +77,9 @@ fn main() {
         },
         CLISubCmd::Instance { subcmd } => match subcmd {
             InstanceSubCmd::List => todo!(),
-            InstanceSubCmd::Init(arg) => instance::init_instance(arg),
+            InstanceSubCmd::Init => instance::init_shim(),
+            InstanceSubCmd::Create(arg) => instance::create_instance(arg),
+
         },
     }
 }
