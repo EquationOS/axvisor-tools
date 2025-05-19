@@ -57,8 +57,12 @@ enum InstanceSubCmd {
 
 #[derive(Debug, Args)]
 struct InstanceCreateArgs {
+    /// Path to the ELF file or binary file.
     #[arg(short, long)]
-    pub elf_path: String,
+    pub file_path: Option<String>,
+    /// Instance type, 0 for LibOS, 1 for kernel.
+    #[arg(short, long, default_value_t = 0)]
+    pub instance_type: usize,
     #[arg(short, long, default_value_t = false)]
     pub one2onemapping: bool,
 }

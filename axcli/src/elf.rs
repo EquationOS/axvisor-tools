@@ -13,20 +13,6 @@ use page_table_multiarch::MappingFlags;
 
 use crate::hvc::hvc_create_instance;
 
-/// The structure of the memory region.
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
-struct ELFMemoryRegion {
-    /// Start address of the memory region (8 bytes).
-    start: u64,
-    /// End address of the memory region (8 bytes).
-    end: u64,
-    /// Flags associated with the memory region (8 bytes).
-    flags: u64,
-}
-
-const MAX_REGIONS_PER_PAGE: usize = PAGE_SIZE_4K / std::mem::size_of::<ELFMemoryRegion>();
-
 fn init_shared_page(shared_pages: &mut Vec<*mut c_void>) -> *mut c_void {
     let page = unsafe {
         mmap(
@@ -44,10 +30,6 @@ fn init_shared_page(shared_pages: &mut Vec<*mut c_void>) -> *mut c_void {
             "Failed to allocate shared page: {}",
             std::io::Error::last_os_error()
         );
-    }
-
-    unsafe {
-        memset(page, 0, PAGE_SIZE_4K);
     }
 
     shared_pages.push(page);
@@ -93,18 +75,18 @@ fn free_shared_pages(shared_pages: &mut Vec<*mut c_void>) {
     shared_pages.clear();
 }
 
-pub fn parse_elf_file(path: &str, one2onemapping: bool) {
+pub fn copy_file(path: &str) {
     let mut total_count = 0;
     let mut current_offset = 0;
     let mut shared_pages: Vec<*mut c_void> = Vec::new();
 
-    let mut current_page = init_shared_page(&mut shared_pages) as *mut ELFMemoryRegion;
+    let mut current_page = init_shared_page(&mut shared_pages);
 
-    let elf_file = File::open(path).expect("Failed to open ELF file");
+    let raw_file_path = File::open(path).expect("Failed to open ELF file");
 
-    let raw_elf_file = std::fs::read(path).expect("Failed to read ELF file");
+    let raw_file = std::fs::read(path).expect("Failed to read ELF file");
 
-    let elf = ElfFile::new(&raw_elf_file).expect("Failed to parse ELF file");
+    let elf = ElfFile::new(&raw_file).expect("Failed to parse ELF file");
 
     assert_eq!(
         elf.header.pt2.type_().as_type(),
@@ -155,7 +137,7 @@ pub fn parse_elf_file(path: &str, one2onemapping: bool) {
                 file_size,
                 prot,
                 MAP_FIXED_NOREPLACE | MAP_POPULATE | MAP_SHARED,
-                elf_file.as_raw_fd(),
+                raw_file_path.as_raw_fd(),
                 align_down(ph.offset() as usize, page_size) as libc::off_t,
             )
         };
