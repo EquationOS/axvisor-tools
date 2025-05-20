@@ -11,8 +11,8 @@ fn trigger_hypercall(
     arg4: u64,
     arg5: u64,
     arg6: u64,
-) -> u64 {
-    let result: u64;
+) -> isize {
+    let result: isize;
     unsafe {
         asm!(
             "vmcall",
@@ -42,21 +42,19 @@ pub fn hvc_init_shim() {
 }
 
 pub fn hvc_create_instance(
-    instance_id: u64,
-    memory_regions_total_count: u64,
-    memory_regions_page_base: u64,
-    memory_regions_page_count: u64,
-    entry: u64,
-    one2onemapping: u64,
-) {
-    let result = trigger_hypercall(
+    instance_type: u64,
+    mapping_type: u64,
+    file_size: u64,
+    shared_pages_base: u64,
+    shared_pages_num: u64,
+) -> isize {
+    trigger_hypercall(
         HyperCallCode::HCreateInstance,
-        instance_id,
-        memory_regions_total_count,
-        memory_regions_page_base,
-        memory_regions_page_count,
-        entry,
-        one2onemapping,
-    );
-    info!("hvc_create_instance result: {:#x}", result);
+        instance_type,
+        mapping_type,
+        file_size,
+        shared_pages_base,
+        shared_pages_num,
+        0,
+    )
 }
