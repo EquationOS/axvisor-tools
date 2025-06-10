@@ -8,9 +8,9 @@ int main()
 {
 	const char *device_path = "/dev/axivc_publisher";
 	char buffer[128];
-	ssize_t bytes_read;
+	ssize_t bytes_read, bytes_write;
 
-	int fd = open(device_path, O_RDONLY);
+	int fd = open(device_path, O_RDWR);
 	if (fd < 0)
 	{
 		perror("Failed to open device");
@@ -28,6 +28,15 @@ int main()
 	buffer[bytes_read] = '\0';
 
 	printf("Read from device: %s", buffer);
+
+	bytes_write = write(fd, "Hello from user space!\n", 23);
+	if (bytes_write < 0)
+	{
+		perror("Failed to write to device");
+		close(fd);
+		return 1;
+	}
+	printf("Wrote %zd bytes to device\n", bytes_write);
 
 	close(fd);
 	return 0;

@@ -15,5 +15,8 @@ u64 hvc_call(
 
 u64 hvc_publish_channel(u64 channel_key, u64 shm_base_ptr, u64 shm_size_ptr);
 u64 hvc_unpublish_channel(u64 channel_key);
+u64 hvc_subscribe_channel(
+	u64 publisher_id, u64 channel_key, u64 shm_base_ptr, u64 shm_size_ptr);
+u64 hvc_unsubscribe_channel(u64 publisher_id, u64 channel_key);
 
 #endif

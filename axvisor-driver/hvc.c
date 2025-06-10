@@ -1,6 +1,6 @@
 #include <linux/types.h>
 
-#include "hvc.h"
+#include "includes/hvc.h"
 
 /// Refer to
 /// https://github.com/arceos-hypervisor/arm_vcpu/blob/1e107bc68bedb82c387eedb423d08c84ff9ea09e/src/exception.rs#L97
@@ -32,5 +32,18 @@ u64 hvc_publish_channel(u64 channel_key, u64 shm_base_ptr, u64 shm_size_ptr)
 
 u64 hvc_unpublish_channel(u64 channel_key)
 {
-    return hvc_call(HIVCUnPublishChannel, channel_key, 0, 0, 0, 0, 0);
+	return hvc_call(HIVCUnPublishChannel, channel_key, 0, 0, 0, 0, 0);
+}
+
+u64 hvc_subscribe_channel(
+	u64 publisher_id, u64 channel_key, u64 shm_base_ptr, u64 shm_size_ptr)
+{
+	return hvc_call(
+		HIVCSubscribChannel, publisher_id, channel_key, shm_base_ptr,
+		shm_size_ptr, 0, 0);
+}
+u64 hvc_unsubscribe_channel(u64 publisher_id, u64 channel_key)
+{
+	return hvc_call(
+		HIVCUnSubscribChannel, publisher_id, channel_key, 0, 0, 0, 0);
 }

@@ -5,9 +5,9 @@
 
 #include <linux/module.h>
 
-#include "hvc.h"
-#include "ivc.h"
-#include "utils.h"
+#include "includes/hvc.h"
+#include "includes/ivc.h"
+#include "includes/utils.h"
 
 #define AXVISOR_VERSION "0.0.1"
 
@@ -38,12 +38,12 @@ static int __init axvisor_init(void)
 {
 	int ret;
 
-	pr_info("axvisor: Initializing AxVisor Linux kernel driver\n");
+	INFO("Initializing AxVisor Linux kernel driver v%s\n", AXVISOR_VERSION);
 
 	ret = init_ivc_devices();
 	if (ret)
 	{
-		pr_err("axvisor: Failed to initialize IVC devices\n");
+		ERROR("axvisor: Failed to initialize IVC devices\n");
 		return ret;
 	}
 	return 0;
@@ -51,7 +51,7 @@ static int __init axvisor_init(void)
 
 static void __exit axvisor_exit(void)
 {
-	pr_info("axvisor: Exiting axvisor driver\n");
+	INFO("Exiting axvisor driver\n");
 	uninit_ivc_devices();
 }
 
