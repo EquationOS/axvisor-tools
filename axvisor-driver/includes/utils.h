@@ -17,8 +17,6 @@
 	do                                                                         \
 	{                                                                          \
 		pr_err("[AXERROR] " args);                                    \
-		while (1)                                                              \
-			;                                                                  \
 	} while (0)
 
 #define MRS(var, reg) asm volatile("mrs %0, " #reg "\n\r" : "=r"(var))

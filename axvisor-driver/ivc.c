@@ -144,8 +144,8 @@ int ivc_publish_channel(void)
 	}
 
 	INFO(
-		"axvisor: IVC channel initialized successfully, base: 0x%llx, size: "
-		"0x%llx\n",
+		"axvisor: IVC publish channel initialized successfully, base: 0x%llx, "
+		"size: 0x%llx\n",
 		publisher_shm_base, publisher_shm_size);
 
 	return 0;
@@ -181,14 +181,20 @@ int ivc_subscribe_channel(u64 publisher_id, u64 key)
 	INFO("axvisor: Subscribing to IVC channel with key: 0x%llx\n", key);
 
 	// Call the hypervisor to subscribe to the channel
-	ret = hvc_call(HIVCSubscribChannel, key, 0, 0, 0, 0, 0);
+	ret = hvc_subscribe_channel(
+		publisher_id, key, kva2pa((u64)&subscriber_shm_base),
+		kva2pa((u64)&subscriber_shm_size));
 	if (ret != 0)
 	{
 		ERROR("axvisor: Failed to subscribe to channel, error code: %d\n", ret);
 		return -EIO;
 	}
 
-	INFO("axvisor: IVC channel subscribed successfully\n");
+	INFO(
+		"axvisor: IVC subscribtion channel init successfully, base: 0x%llx, "
+		"size: 0x%llx\n",
+		subscriber_shm_base, subscriber_shm_size);
+
 	return 0;
 }
 
@@ -316,7 +322,7 @@ static int axivc_publisher_open(struct inode *inode, struct file *file)
 
 static int axivc_publisher_release(struct inode *inode, struct file *file)
 {
-	INFO("axvisor: Closed device %s\n", IVC_PUBLISHER_DEV_NAME);
+	INFO("axvisor: Closing device %s\n", IVC_PUBLISHER_DEV_NAME);
 	return 0;
 }
 
@@ -327,14 +333,12 @@ static int axivc_subscriber_open(struct inode *inode, struct file *file)
 		(file->f_flags & O_ACCMODE) == O_RDWR)
 	{
 		ERROR(
-			"axvisor: Subscriber device cannot be opened with write "
-			"permission\n");
+			"Subscriber %s cannot be opened with write permission\n",
+			IVC_SUBSCRIBER_DEV_NAME);
 		return -EPERM; // Return permission error
 	}
 
-	INFO(
-		"axvisor: Opened device %s and subscribed to IVC channel\n",
-		IVC_SUBSCRIBER_DEV_NAME);
+	INFO("axvisor: Opened device %s success\n", IVC_SUBSCRIBER_DEV_NAME);
 	return 0;
 }
 
@@ -342,13 +346,15 @@ static int axivc_subscriber_release(struct inode *inode, struct file *file)
 {
 	int ret;
 
-	INFO(
-		"axvisor: Closed device %s and unsubscribed from IVC channel\n",
-		IVC_SUBSCRIBER_DEV_NAME);
+	INFO("axvisor: Closing device %s\n", IVC_SUBSCRIBER_DEV_NAME);
 
 	// Check if need to unsubscribe from the IVC channel.
 	if (subscriber_channel_id != 0 && subscriber_channel_key != 0)
 	{
+		INFO(
+			"axvisor: Unsubscribing from channel [%llu] with key: 0x%llx\n",
+			subscriber_channel_id, subscriber_channel_key);
+
 		ret = hvc_unsubscribe_channel(
 			subscriber_channel_id, subscriber_channel_key);
 		if (ret != 0)
@@ -437,12 +443,8 @@ axivc_subscriber_ioctl(struct file *file, unsigned int ioctl, unsigned long arg)
 			"axvisor: Subscribing to channel [%llu] with key: 0x%llx\n",
 			subscribe_arg.target_publisher_id, subscribe_arg.channel_key);
 
-		// Store the subscriber channel ID and key for future use.
-		subscriber_channel_id = subscribe_arg.target_publisher_id;
-		subscriber_channel_key = subscribe_arg.channel_key;
-
 		ret = ivc_subscribe_channel(
-			subscriber_channel_id, subscriber_channel_key);
+			subscribe_arg.target_publisher_id, subscribe_arg.channel_key);
 		if (ret)
 		{
 			ERROR(
@@ -450,6 +452,24 @@ axivc_subscriber_ioctl(struct file *file, unsigned int ioctl, unsigned long arg)
 				subscribe_arg.target_publisher_id);
 			return ret;
 		}
+
+		if (subscriber_shm_base == 0 || subscriber_shm_size == 0)
+		{
+			ERROR(
+				"axvisor: Subscriber shared memory base or size is not "
+				"initialized\n");
+			return -EINVAL;
+		}
+
+		// Store the subscriber channel ID and key for future use.
+		subscriber_channel_id = subscribe_arg.target_publisher_id;
+		subscriber_channel_key = subscribe_arg.channel_key;
+
+		INFO(
+			"axvisor: Subscribing to channel [%llu] with key: 0x%llx "
+			"success!!\n",
+			subscriber_channel_id, subscriber_channel_key);
+
 		break;
 
 	case IVC_UNSUBSCRIBE_CHANNEL:
