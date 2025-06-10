@@ -6,7 +6,7 @@
 
 int main()
 {
-	const char *device_path = "/dev/axvisor_vdev";
+	const char *device_path = "/dev/axivc_publisher";
 	char buffer[128];
 	ssize_t bytes_read;
 

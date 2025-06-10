@@ -11,7 +11,7 @@ __pycache__
 *.d
 *.cmd
 *.d
-# **/Module.*
+**/Module.*
 **/modules.*
 *_wrap.c
 **/*.dat

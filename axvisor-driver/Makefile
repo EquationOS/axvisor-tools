@@ -15,7 +15,9 @@ CURRENT_PATH := $(shell pwd)
 MODULE := axvisor-driver
 
 # Source files
-SRC := $(MODULE).c
+SRC := main.o \
+	   hvc.o \
+	   ivc.o
 
 # Default target
 all:
@@ -37,3 +39,4 @@ uninstall:
 
 # Module build rules
 obj-m := axvisor.o
+axvisor-objs := $(SRC)
