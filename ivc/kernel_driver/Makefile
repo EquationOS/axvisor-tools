@@ -26,7 +26,7 @@ SRC := main.o \
 
 # Default target
 all:
-	CROSS_COMPILE=$(CROSS_COMPILE) ARCH=$(ARCH) $(MAKE) -C $(KDIR) M=$(CURRENT_PATH)  modules
+	CROSS_COMPILE=$(CROSS_COMPILE) ARCH=$(ARCH) $(MAKE) -C $(KDIR) M=$(CURRENT_PATH) modules
 
 # Clean target
 clean:

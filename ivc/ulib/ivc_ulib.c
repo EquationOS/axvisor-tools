@@ -1,4 +1,4 @@
-#include <ivc/user.h>
+#include <ivc/ulib.h>
 
 #include <ivc/ivc_dev.h>
 #include <ivc/ioctl_args.h>
