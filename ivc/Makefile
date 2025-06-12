@@ -1,10 +1,17 @@
+# Makefile for building components of the IVC (Inter-VM Communication) library: kernel driver, user
+# library, python bindings, and demo applications.
+
+# Basic information
+LIB_NAME 		:= ivc
+
+# Architecture and cross-compilation settings
 ARCH 			?= arm64
 CROSS 			?= aarch64-linux-musl-
 CROSS_KO 		?= aarch64-linux-gnu-
-
 CCOMP 			?= $(CROSS)gcc
 CAR 			?= $(CROSS)ar
 
+# Input, output, and kernel dependency directories
 MAKEFILE_DIR 	:= $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
 BUILD_DIR 		?= $(MAKEFILE_DIR)build
@@ -15,18 +22,20 @@ KDIR 			?= /lib/modules/$(shell uname -r)/build
 ULIB_SRC_DIR 	:= $(MAKEFILE_DIR)ulib
 DEMO_SRC_DIR 	:= $(MAKEFILE_DIR)demo
 
+# Source files and outputs
 ULIB_SRC 		:= $(wildcard $(ULIB_SRC_DIR)/*.c)
-DEMO_SRC 		:= $(wildcard $(DEMO_SRC_DIR)/*.c)
 ULIB_OBJ 		:= $(patsubst $(ULIB_SRC_DIR)/%.c,$(BUILD_DIR)/ulib/%.o,$(ULIB_SRC))
-DEMO_BIN 		:= $(patsubst $(DEMO_SRC_DIR)/%.c,$(BUILD_DIR)/demo/%, $(DEMO_SRC))
-
-LIB_NAME 		:= ivc
 ULIB_STATIC		:= $(BUILD_DIR)/lib$(LIB_NAME).a
 ULIB_SHARED		:= $(BUILD_DIR)/lib$(LIB_NAME).so
 
+DEMO_SRC 		:= $(wildcard $(DEMO_SRC_DIR)/*.c)
+DEMO_BIN 		:= $(patsubst $(DEMO_SRC_DIR)/%.c,$(BUILD_DIR)/demo/%, $(DEMO_SRC))
+
+
+# Compiler flags
 CFLAGS 			?= -I$(INCLUDE_DIR)
 KO_CFLAGS 		?= $(CFLAGS)
-ULIB_CFLAGS 	?= $(CFLAGS) -Wall -Wextra -Os -s -Wl,--gc-sections
+ULIB_CFLAGS 	?= $(CFLAGS) -Wall -Wextra -Os -s -Wl,--gc-sections -fPIC
 DEMO_CFLAGS 	?= $(CFLAGS) -Wall -Wextra -Os -s -Wl,--gc-sections -static
 
 .PHONY: all ko ulib demo output_dir clean rebuild

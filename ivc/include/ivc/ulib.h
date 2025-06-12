@@ -5,6 +5,10 @@
 #include <stdio.h>
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // TODO: record publishers and subscribers created and recycle them when close the IVC manager.
 typedef struct ivc_manager {
     int64_t             fd;                 // File descriptor for the IVC device
@@ -37,3 +41,7 @@ ivc_publisher_p ivc_publish(ivc_manager_p manager, uint64_t channel_key, uint64_
 int ivc_write(ivc_publisher_p publisher, const void *buf, size_t count);
 int ivc_write_all(ivc_publisher_p publisher, const void *buf, size_t count);
 int ivc_unpublish(ivc_publisher_p publisher);
+
+#ifdef __cplusplus
+}
+#endif
