@@ -9,12 +9,13 @@ KDIR ?= /lib/modules/$(shell uname -r)/build
 # Error messages from gcc will be muted if we omit an explicit definition to CC.
 CC := ${CROSS_COMPILE}gcc
 
-# Extra compiler flags
-EXTRA_CFLAGS ?=
-ccflags-y    += $(EXTRA_CFLAGS)
-
 # Current path
 CURRENT_PATH := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+
+# Extra compiler flags
+EXTRA_CFLAGS ?=
+ccflags-y    += $(EXTRA_CFLAGS) -I $(CURRENT_PATH)/../include/
+
 
 # Module name
 MODULE := axvisor-driver
@@ -22,6 +23,7 @@ MODULE := axvisor-driver
 # Source files
 SRC := main.o \
 	   hvc.o \
+	   ring.o \
 	   ivc.o
 
 # Default target

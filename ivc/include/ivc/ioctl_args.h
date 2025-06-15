@@ -2,8 +2,10 @@
 
 #include "./ivc_dev.h"
 
-#include <sys/ioctl.h>
-#include <stdint.h>
+#ifndef __KERNEL__
+# include <sys/ioctl.h>
+# include <stdint.h>
+#endif
 
 typedef struct ivc_publish_arg {
     uint64_t    channel_key;                            // Unique key for the channel

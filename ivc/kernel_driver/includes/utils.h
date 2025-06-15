@@ -1,22 +1,21 @@
-#ifndef UTILS_H
-#define UTILS_H
+#pragma once
 
 #define INFO(args...)                                                          \
 	do                                                                         \
 	{                                                                          \
-		pr_info("[AXINFO] " args);                                     \
+		pr_info("[AXINFO] " args);                                             \
 	} while (0)
 
 #define WARNING(args...)                                                       \
 	do                                                                         \
 	{                                                                          \
-		pr_err("[AXWARNING] " args);                                  \
+		pr_err("[AXWARNING] " args);                                           \
 	} while (0)
 
 #define ERROR(args...)                                                         \
 	do                                                                         \
 	{                                                                          \
-		pr_err("[AXERROR] " args);                                    \
+		pr_err("[AXERROR] " args);                                             \
 	} while (0)
 
 #define MRS(var, reg) asm volatile("mrs %0, " #reg "\n\r" : "=r"(var))
@@ -34,5 +33,3 @@ static inline u64 kva2pa(u64 va)
 
 	return (par & PAR_MASK) | (((uint64_t)va) & (0x1000 - 1));
 }
-
-#endif // UTILS_H
