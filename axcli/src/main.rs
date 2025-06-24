@@ -1,13 +1,14 @@
-mod shared_pages;
 mod hvc;
 mod instance;
+mod junction;
+mod shared_pages;
 
 use clap::{Args, Parser, Subcommand};
 
 #[macro_use]
 extern crate log;
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(name = "axcli")]
 #[command(about = "CommandLine Interface for AxVisor", long_about = None)]
 #[command(args_conflicts_with_subcommands = true)]
@@ -17,7 +18,7 @@ struct CLI {
     subcmd: CLISubCmd,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 #[command(args_conflicts_with_subcommands = true)]
 #[command(flatten_help = true)]
 enum CLISubCmd {
@@ -33,7 +34,7 @@ enum CLISubCmd {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 #[command(args_conflicts_with_subcommands = true)]
 #[command(flatten_help = true)]
 enum HvSubCmd {
@@ -43,7 +44,7 @@ enum HvSubCmd {
     Disable,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 #[command(args_conflicts_with_subcommands = true)]
 #[command(flatten_help = true)]
 enum InstanceSubCmd {
@@ -52,7 +53,14 @@ enum InstanceSubCmd {
     /// Init instance runtime environment.
     Init,
     /// Create a new instance.
-    Create(InstanceCreateArgs)
+    #[command(subcommand)]
+    Create(InstanceKind),
+}
+
+#[derive(Subcommand, Debug)]
+enum InstanceKind {
+    Instance(InstanceCreateArgs),
+    Junction(JunctionArgs),
 }
 
 #[derive(Debug, Args)]
@@ -68,10 +76,17 @@ struct InstanceCreateArgs {
     pub one2onemapping: bool,
 }
 
+#[derive(Parser, Debug)]
+#[command(trailing_var_arg = true)]
+struct JunctionArgs {
+    #[arg(required = true)]
+    junction_args: Vec<String>,
+}
+
 fn main() {
     // configure logger and set log level
     env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Debug)
+        .filter_level(log::LevelFilter::Trace)
         .init();
 
     let cli = CLI::parse();
@@ -83,8 +98,10 @@ fn main() {
         CLISubCmd::Instance { subcmd } => match subcmd {
             InstanceSubCmd::List => todo!(),
             InstanceSubCmd::Init => instance::init_shim(),
-            InstanceSubCmd::Create(arg) => instance::create_instance(arg),
-            
+            InstanceSubCmd::Create(kind) => match kind {
+                InstanceKind::Instance(arg) => instance::create_instance(arg),
+                InstanceKind::Junction(arg) => junction::create_junction(arg),
+            },
         },
     }
 }
