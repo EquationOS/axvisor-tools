@@ -91,6 +91,7 @@ dependencies = [
  "log",
  "memory_addr",
  "page_table_multiarch",
+ "pi_memory_layout",
  "serde",
  "toml",
 ]
@@ -292,10 +293,10 @@ checksum = "97b3888a4aecf77e811145cadf6eef5901f4782c53886191b2f693f24761847c"
 [[package]]
 name = "linux-libc-auxv"
 version = "0.3.0"
-source = "git+https://github.com/EquationOS/linux-libc-auxv.git#6446d3c0b788a93db590393bde22568fe620bfae"
 dependencies = [
  "aligned-vec",
  "bitflags 2.9.1",
+ "log",
  "thiserror",
 ]
 
@@ -353,6 +354,13 @@ name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+
+[[package]]
+name = "pi_memory_layout"
+version = "0.1.0"
+dependencies = [
+ "aligned-vec",
+]
 
 [[package]]
 name = "plain"

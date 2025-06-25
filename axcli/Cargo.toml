@@ -17,6 +17,13 @@ linux-libc-auxv = { git = "https://github.com/EquationOS/linux-libc-auxv.git" }
 memory_addr = "0.3"
 page_table_multiarch = "0.5"
 axhvc = { git = "https://github.com/arceos-hypervisor/axhvc.git" }
+pi_memory_layout = { git = "https://github.com/EquationOS/pi-memory-layout.git" }
 
 [patch."https://github.com/arceos-hypervisor/axhvc.git"]
 axhvc = { path = "../../../crates/axhvc" }
+
+[patch."https://github.com/EquationOS/linux-libc-auxv.git"]
+linux-libc-auxv = { path = "../../../crates/linux-libc-auxv" }
+
+[patch."https://github.com/EquationOS/pi-memory-layout.git"]
+pi_memory_layout = { path = "../../../crates/pi_memory_layout" }

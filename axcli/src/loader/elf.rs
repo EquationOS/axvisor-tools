@@ -1,11 +1,9 @@
 use core::panic;
-use std::collections::HashSet;
 use std::ffi::CString;
 use std::fmt::Debug;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::ptr::null_mut;
 use std::str::FromStr;
 
 use goblin::elf::Elf;
@@ -16,7 +14,6 @@ use linux_libc_auxv::{AuxVar, AuxVarFlags, StackLayoutBuilder, StackLayoutRef};
 const STACK_SIZE: usize = 1024 * 1024 * 8;
 const PIE_BASE: usize = 0x40000000;
 const LDSO_BASE: usize = 0x7f0000000000;
-const LIB_BASE_START: usize = 0x6000000000;
 
 unsafe fn mmap_segment(base: usize, ph: &goblin::elf::ProgramHeader, data: &[u8]) {
     let vaddr = base + ph.p_vaddr as usize;
@@ -122,15 +119,15 @@ unsafe fn mmap_elf<P: AsRef<Path> + Debug>(
         // interp_path = Some(interp_str.to_string());
         info!("[*] Interpreter: {:?}", interp_path);
 
-        // info!(
-        //     "[*] Clearing PT_INTERP segment at 0x{:x}, size {}",
-        //     interp_addr, size
-        // );
-        // std::ptr::write_bytes(interp_addr as *mut u8, 0, size);
-        // warn!(
-        //     "[*] Cleared PT_INTERP segment at 0x{:x}, size {}",
-        //     interp_addr, size
-        // );
+        info!(
+            "[*] Clearing PT_INTERP segment at 0x{:x}, size {}",
+            interp_addr, size
+        );
+        std::ptr::write_bytes(interp_addr as *mut u8, 0, size);
+        warn!(
+            "[*] Cleared PT_INTERP segment at 0x{:x}, size {}",
+            interp_addr, size
+        );
     }
 
     for ph in elf
@@ -143,43 +140,6 @@ unsafe fn mmap_elf<P: AsRef<Path> + Debug>(
 
     println!("[*] Loaded ELF: {:?}", path);
     (elf, base, static_ref, interp_path)
-}
-
-fn find_needed_libs(elf: &Elf) -> Vec<String> {
-    let mut needed = vec![];
-    if let Some(dynamic) = &elf.dynamic {
-        let strtab = &elf.dynstrtab;
-        for dyn_entry in dynamic
-            .dyns
-            .iter()
-            .filter(|d| d.d_tag == goblin::elf::dynamic::DT_NEEDED)
-        {
-            let name = strtab.get_at(dyn_entry.d_val as usize).unwrap_or("unknown");
-            needed.push(name.to_string());
-        }
-    }
-    warn!("[*] Found needed libraries: {:?}", needed);
-    needed
-}
-
-unsafe fn load_needed_recursively(
-    elf: &Elf,
-    base_dir: &str,
-    loaded: &mut HashSet<String>,
-    mut base_addr: usize,
-) {
-    for lib in find_needed_libs(elf) {
-        if loaded.contains(&lib) {
-            continue;
-        }
-        let path = format!("{}/{}", base_dir, lib);
-        info!("[*] Loading needed library: {}", path);
-        let (lib_elf, _, _, _) = mmap_elf(&path, base_addr);
-        info!("[*] Loaded DT_NEEDED: {}", lib);
-        loaded.insert(lib.clone());
-        base_addr += 0x2000000; // Bump base per lib
-        load_needed_recursively(&lib_elf, base_dir, loaded, base_addr);
-    }
 }
 
 #[unsafe(no_mangle)]
@@ -271,7 +231,6 @@ pub(super) fn load_junction(junc_args: &[String], app_args: &[String]) {
         v
     };
 
-    // let envp = vec![CString::new("LD_LIBRARY_PATH=glibc").unwrap()];
     let envp = vec![];
 
     let junc_path = junc_args[0].clone();
@@ -296,15 +255,6 @@ pub(super) fn load_junction(junc_args: &[String], app_args: &[String]) {
 
         let is_junc_pie = junc_elf.header.e_type == goblin::elf::header::ET_DYN;
         let junc_base = if is_junc_pie { Some(junc_base) } else { None };
-
-        // 🔁 自动加载所有 DT_NEEDED 依赖库
-        // let mut loaded_set = HashSet::new();
-        // load_needed_recursively(
-        //     &junc_elf,
-        //     "/lib/x86_64-linux-gnu/",
-        //     &mut loaded_set,
-        //     LIB_BASE_START,
-        // );
 
         let stack = setup_stack(argv_full, envp, junc_base, &junc_elf, ldso_base);
         let ld_entry = ldso_base + ldso_elf.entry as usize;

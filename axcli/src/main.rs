@@ -1,7 +1,10 @@
 mod hvc;
 mod instance;
-mod junction;
 mod shared_pages;
+
+/// Just for test and debug purpose.
+/// A User-level executor to boot ELF.
+mod loader;
 
 use clap::{Args, Parser, Subcommand};
 
@@ -32,6 +35,8 @@ enum CLISubCmd {
         #[command(subcommand)]
         subcmd: InstanceSubCmd,
     },
+    /// Subcommands related to the a local test loader.
+    Loader(ExecuteArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -59,8 +64,8 @@ enum InstanceSubCmd {
 
 #[derive(Subcommand, Debug)]
 enum InstanceKind {
-    Instance(InstanceCreateArgs),
-    Junction(JunctionArgs),
+    Static(InstanceCreateArgs),
+    Load(ExecuteArgs),
 }
 
 #[derive(Debug, Args)]
@@ -78,9 +83,9 @@ struct InstanceCreateArgs {
 
 #[derive(Parser, Debug)]
 #[command(trailing_var_arg = true)]
-struct JunctionArgs {
+struct ExecuteArgs {
     #[arg(required = true)]
-    junction_args: Vec<String>,
+    exec_args: Vec<String>,
 }
 
 fn main() {
@@ -99,9 +104,10 @@ fn main() {
             InstanceSubCmd::List => todo!(),
             InstanceSubCmd::Init => instance::init_shim(),
             InstanceSubCmd::Create(kind) => match kind {
-                InstanceKind::Instance(arg) => instance::create_instance(arg),
-                InstanceKind::Junction(arg) => junction::create_junction(arg),
+                InstanceKind::Static(arg) => instance::create_instance(arg),
+                InstanceKind::Load(arg) => instance::load_junction(arg),
             },
         },
+        CLISubCmd::Loader(args) => loader::local_create_junction(args),
     }
 }

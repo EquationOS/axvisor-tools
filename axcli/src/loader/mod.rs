@@ -1,6 +1,6 @@
 mod elf;
 
-use crate::JunctionArgs;
+use crate::ExecuteArgs;
 
 fn split_args(junction_args: &[String]) -> (Vec<String>, Vec<String>) {
     // Split the junction_args into two parts:
@@ -16,24 +16,15 @@ fn split_args(junction_args: &[String]) -> (Vec<String>, Vec<String>) {
     }
 }
 
-pub fn create_junction(args: JunctionArgs) {
-    info!("Create junction with args: {:?}", args.junction_args);
-    let (junction_args, app_args) = split_args(&args.junction_args);
+/// A User-level executor to boot ELF.
+/// Just for test and debug purpose.
+pub fn local_create_junction(args: ExecuteArgs) {
+    info!("Create junction with args: {:?}", args.exec_args);
+    let (junction_args, app_args) = split_args(&args.exec_args);
     println!("junction_run args: {:?}", junction_args);
     println!("target app args: {:?}", app_args);
 
     elf::load_junction(&junction_args, &app_args);
-
-    // Here you would implement the logic to create a junction
-    // based on the provided arguments.
-    // This is a placeholder for the actual implementation.
-
-    // For example, you might parse the arguments and call a hypervisor function:
-    // let result = hvc_create_junction(args.junction_args);
-
-    // if result < 0 {
-    //     panic!("Failed to create junction: {}", result);
-    // }
 
     info!("Junction created successfully");
 }
