@@ -42,6 +42,12 @@ pub fn create_instance(args: InstanceCreateArgs) {
 pub fn load_junction(args: ExecuteArgs) {
     use pi_memory_layout::{ArgsLayoutBuilder, ArgsLayoutRef};
 
+    let instance_id = crate::ioctl::ioctl_create_instance()
+        .expect("Failed to create instance for dynamic loading");
+
+    info!("Create instance success, instance ID = [{}]", instance_id);
+    return;
+
     // We need to copy execution metadate to axvisor to start the loader instance.
     let mut args_builder = ArgsLayoutBuilder::new();
     for arg in &args.exec_args {

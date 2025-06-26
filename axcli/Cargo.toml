@@ -27,3 +27,6 @@ linux-libc-auxv = { path = "../../../crates/linux-libc-auxv" }
 
 [patch."https://github.com/EquationOS/pi-memory-layout.git"]
 pi_memory_layout = { path = "../../../crates/pi_memory_layout" }
+
+[build-dependencies]
+bindgen = "0.72"

@@ -1,6 +1,7 @@
 mod hvc;
 mod instance;
 mod shared_pages;
+mod ioctl;
 
 /// Just for test and debug purpose.
 /// A User-level executor to boot ELF.
