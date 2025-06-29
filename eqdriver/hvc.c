@@ -2,6 +2,10 @@
 
 #include "includes/hvc.h"
 
+int hvc_call(
+	__u64 code, __u64 arg1, __u64 arg2, __u64 arg3, __u64 arg4, __u64 arg5,
+	__u64 arg6);
+
 /**
  * x86 version of the hypercall function
  * Refer to:
@@ -20,7 +24,15 @@ int hvc_call(
 	return result;
 }
 
-int hvc_create_instance(__u64 instance_type, __u64 mapping_type)
+int hvc_create_instance(
+	__u64 instance_type, __u64 mapping_type, __u64 shm_base_ptr)
 {
-	return hvc_call(HCreateInstance, instance_type, mapping_type, 0, 0, 0, 0);
+	return hvc_call(
+		HCreateInstance, instance_type, mapping_type, shm_base_ptr, 0, 0, 0);
+}
+
+int hvc_load_mmap(
+	__u64 instance_id, __u64 gva, __u64 gpa, __u64 len, __u64 flags, __u64 prot)
+{
+	return hvc_call(HLoadMMap, instance_id, gva, gpa, len, flags, prot);
 }

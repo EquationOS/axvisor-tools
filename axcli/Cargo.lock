@@ -453,6 +453,7 @@ name = "pi_memory_layout"
 version = "0.1.0"
 dependencies = [
  "aligned-vec",
+ "linux-libc-auxv",
 ]
 
 [[package]]

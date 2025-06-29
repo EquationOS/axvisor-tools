@@ -34,6 +34,7 @@ static int __init equqtion_init(void)
 
 static void __exit equation_exit(void)
 {
+	instances_exit();
 	exit_eqmanagement_device();
 	INFO("Exiting Equation driver, welcome back!\n");
 }

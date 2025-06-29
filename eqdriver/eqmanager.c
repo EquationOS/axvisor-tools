@@ -25,6 +25,7 @@ eqmanager_ioctl(struct file *file, unsigned int ioctl, unsigned long arg)
 {
 	int ret = 0;
 	eq_create_instance_arg_t create_arg;
+	eq_remove_instance_arg_t remove_arg;
 
 	switch (ioctl)
 	{
@@ -37,8 +38,6 @@ eqmanager_ioctl(struct file *file, unsigned int ioctl, unsigned long arg)
 			return -EFAULT;
 		}
 
-		INFO("EQ_CREATE_INSTANCE id %lld type %lld\n", create_arg.instance_id, create_arg.instance_type);
-
 		ret = create_instance(&create_arg);
 		if (ret < 0)
 		{
@@ -46,14 +45,29 @@ eqmanager_ioctl(struct file *file, unsigned int ioctl, unsigned long arg)
 			return ret;
 		}
 
-		create_arg.instance_id = 123; // Simulate instance ID assignment
-
 		if (copy_to_user(
 				(__u64 __user *)arg, &create_arg,
 				sizeof(eq_create_instance_arg_t)))
 		{
 			ERROR("Failed to instance ID to user space\n");
 			return -EFAULT;
+		}
+
+		break;
+	case EQ_REMOVE_INSTANCE:
+		if (copy_from_user(
+				&remove_arg, (__u64 __user *)arg,
+				sizeof(eq_remove_instance_arg_t)))
+		{
+			ERROR("Failed to remove arg from user space\n");
+			return -EFAULT;
+		}
+
+		ret = remove_instance(&remove_arg);
+		if (ret < 0)
+		{
+			ERROR("Failed to remove instance: %d\n", ret);
+			return ret;
 		}
 
 		break;

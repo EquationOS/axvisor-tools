@@ -15,7 +15,7 @@ const STACK_SIZE: usize = 1024 * 1024 * 8;
 const PIE_BASE: usize = 0x40000000;
 const LDSO_BASE: usize = 0x7f0000000000;
 
-unsafe fn mmap_segment(base: usize, ph: &goblin::elf::ProgramHeader, data: &[u8]) {
+unsafe fn mmap_segment(base: usize, ph: &goblin::elf::ProgramHeader, data: &[u8], fd: Option<i32>) {
     let vaddr = base + ph.p_vaddr as usize;
     let memsz = ph.p_memsz as usize;
     let filesz = ph.p_filesz as usize;
@@ -29,20 +29,34 @@ unsafe fn mmap_segment(base: usize, ph: &goblin::elf::ProgramHeader, data: &[u8]
     let end_addr = (vaddr + memsz + 0xfff) & !0xfff;
     let size = end_addr - aligned_addr;
 
+    let (fd, flags) = if let Some(fd) = fd {
+        (fd, MAP_SHARED | MAP_FIXED)
+    } else {
+        // If no file descriptor is provided, use -1 for anonymous mapping
+        (-1, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED)
+    };
+
     trace!(
-        "[*] Mapping segment: vaddr={:#x}, size={:#x}, prot={:#x}, offset={:#x}, memsz={:#x}, filesz={:#x}",
-        vaddr, size, prot, offset, memsz, filesz
+        "[*] Mapping fd {} segment: vaddr={:#x}, size={:#x}, prot={:#x}, offset={:#x}, memsz={:#x}, filesz={:#x}", 
+        fd, vaddr, size, prot, offset, memsz, filesz
     );
 
     let ret = mmap(
         aligned_addr as *mut c_void,
         size,
         PROT_READ | PROT_WRITE,
-        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
-        -1,
+        flags,
+        fd,
         0,
     );
     assert_ne!(ret, MAP_FAILED);
+
+    if ret as usize == 0 {
+        info!("This is exactly what we want, mmap returned 0");
+        return;
+    } else {
+        info!("Get ret from mmap: {:#p}", ret);
+    }
 
     std::ptr::copy_nonoverlapping(
         data[offset..offset + filesz].as_ptr(),
@@ -74,11 +88,12 @@ unsafe fn mprotect_segment(base: usize, ph: &goblin::elf::ProgramHeader) {
     assert_eq!(mprotect_ret, 0, "Failed to set memory protection");
 }
 
-unsafe fn mmap_elf<P: AsRef<Path> + Debug>(
+pub unsafe fn mmap_elf<P: AsRef<Path> + Debug>(
     path: P,
     base: usize,
+    fd: Option<i32>,
 ) -> (Elf<'static>, usize, &'static [u8], Option<PathBuf>) {
-    info!("[*] Loading ELF: {:?}", path);
+    info!("[*] Loading ELF: {:?}, fd {:?}", path, fd);
     let mut file = File::open(&path).expect("Failed to open ELF");
     let mut data = Vec::new();
     file.read_to_end(&mut data).unwrap();
@@ -96,7 +111,7 @@ unsafe fn mmap_elf<P: AsRef<Path> + Debug>(
         .iter()
         .filter(|ph| ph.p_type == goblin::elf::program_header::PT_LOAD)
     {
-        mmap_segment(base, ph, static_ref);
+        mmap_segment(base, ph, static_ref, fd);
     }
 
     if let Some(interp_ph) = elf
@@ -220,26 +235,22 @@ unsafe fn setup_stack(
     sp as *mut c_void
 }
 
-pub(super) fn load_junction(junc_args: &[String], app_args: &[String]) {
+pub(super) fn load_junction(app_args: &[String]) {
     let argv_full = {
         let mut v = vec![];
-        v.extend(junc_args.iter().map(|s| CString::new(s.as_str()).unwrap()));
-        if !app_args.is_empty() {
-            v.push(CString::new("--").unwrap());
-            v.extend(app_args.iter().map(|s| CString::new(s.as_str()).unwrap()));
-        }
+        v.extend(app_args.iter().map(|s| CString::new(s.as_str()).unwrap()));
         v
     };
 
     let envp = vec![];
 
-    let junc_path = junc_args[0].clone();
+    let app_path = app_args[0].clone();
 
     unsafe {
-        let (junc_elf, junc_base, _, interp_path) = mmap_elf(junc_path.as_str(), PIE_BASE);
+        let (junc_elf, junc_base, _, interp_path) = mmap_elf(app_path.as_str(), PIE_BASE, None);
 
         let (ldso_elf, ldso_base) = if let Some(interp_path) = interp_path {
-            let (ldso_elf, ldso_base, _, path) = mmap_elf(&interp_path, LDSO_BASE);
+            let (ldso_elf, ldso_base, _, path) = mmap_elf(&interp_path, LDSO_BASE, None);
             if let Some(path) = path {
                 panic!(
                     "[*] Found interpreter: {:?} for interp {:?}",

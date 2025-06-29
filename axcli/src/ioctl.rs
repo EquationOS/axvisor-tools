@@ -52,6 +52,7 @@ pub fn ioctl_create_instance() -> Result<usize, String> {
     let mut arg = eq_create_instance_arg_t {
         instance_id: 0xdeadbeef, // 0 means the kernel will assign an ID
         instance_type: 1,        // 1 for dynamic loading instance
+        mapping_type: 1,         // 1 for CoarseGrainedSegmentation2M
     };
 
     let ret = unsafe { libc::ioctl(fd, EQ_CREATE_INSTANCE as libc::c_ulong, &mut arg as *mut _) };
@@ -70,4 +71,31 @@ pub fn ioctl_create_instance() -> Result<usize, String> {
     info!("Instance created successfully, ID: {}", arg.instance_id);
 
     Ok(arg.instance_id as usize)
+}
+
+pub fn ioctl_remove_instance(instance_id: u64) -> Result<(), String> {
+    let fd = unsafe { libc::open(EQ_DEVICE_NAME.as_ptr() as *const c_char, libc::O_RDWR) };
+
+    if fd < 0 {
+        return Err(format!(
+            "Failed to open {}, error {}",
+            EQ_DEVICE_NAME.to_string_lossy(),
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let mut arg = eq_remove_instance_arg_t { instance_id };
+
+    let ret = unsafe { libc::ioctl(fd, EQ_REMOVE_INSTANCE as libc::c_ulong, &mut arg as *mut _) };
+
+    if ret < 0 {
+        return Err(format!(
+            "Failed to remove instance {}: {}",
+            instance_id,
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    info!("Instance {} removed successfully", instance_id);
+    Ok(())
 }

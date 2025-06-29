@@ -1,4 +1,4 @@
-mod elf;
+pub(crate) mod elf;
 
 use crate::ExecuteArgs;
 
@@ -18,13 +18,10 @@ fn split_args(junction_args: &[String]) -> (Vec<String>, Vec<String>) {
 
 /// A User-level executor to boot ELF.
 /// Just for test and debug purpose.
-pub fn local_create_junction(args: ExecuteArgs) {
-    info!("Create junction with args: {:?}", args.exec_args);
-    let (junction_args, app_args) = split_args(&args.exec_args);
-    println!("junction_run args: {:?}", junction_args);
-    println!("target app args: {:?}", app_args);
+pub fn local_execute(args: ExecuteArgs) {
+    info!("Create APP with args: {:?}", args.exec_args);
 
-    elf::load_junction(&junction_args, &app_args);
+    elf::load_junction(&args.exec_args);
 
-    info!("Junction created successfully");
+    panic!("Should not reach here, local_execute should not return");
 }

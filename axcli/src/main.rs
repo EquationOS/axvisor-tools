@@ -1,7 +1,7 @@
 mod hvc;
 mod instance;
-mod shared_pages;
 mod ioctl;
+mod shared_pages;
 
 /// Just for test and debug purpose.
 /// A User-level executor to boot ELF.
@@ -61,6 +61,11 @@ enum InstanceSubCmd {
     /// Create a new instance.
     #[command(subcommand)]
     Create(InstanceKind),
+    Remove {
+        /// Instance ID to remove.
+        #[arg(short, long)]
+        instance_id: i32,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -108,7 +113,8 @@ fn main() {
                 InstanceKind::Static(arg) => instance::create_instance(arg),
                 InstanceKind::Load(arg) => instance::load_junction(arg),
             },
+            InstanceSubCmd::Remove { instance_id } => instance::remove_instance(instance_id as _),
         },
-        CLISubCmd::Loader(args) => loader::local_create_junction(args),
+        CLISubCmd::Loader(args) => loader::local_execute(args),
     }
 }
