@@ -29,11 +29,15 @@ unsafe fn mmap_segment(base: usize, ph: &goblin::elf::ProgramHeader, data: &[u8]
     let end_addr = (vaddr + memsz + 0xfff) & !0xfff;
     let size = end_addr - aligned_addr;
 
-    let (fd, flags) = if let Some(fd) = fd {
-        (fd, MAP_SHARED | MAP_FIXED)
+    let (fd, prot, flags) = if let Some(fd) = fd {
+        (fd, prot, MAP_SHARED | MAP_FIXED)
     } else {
         // If no file descriptor is provided, use -1 for anonymous mapping
-        (-1, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED)
+        (
+            -1,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+        )
     };
 
     trace!(
@@ -41,14 +45,7 @@ unsafe fn mmap_segment(base: usize, ph: &goblin::elf::ProgramHeader, data: &[u8]
         fd, vaddr, size, prot, offset, memsz, filesz
     );
 
-    let ret = mmap(
-        aligned_addr as *mut c_void,
-        size,
-        PROT_READ | PROT_WRITE,
-        flags,
-        fd,
-        0,
-    );
+    let ret = mmap(aligned_addr as *mut c_void, size, prot, flags, fd, 0);
     assert_ne!(ret, MAP_FAILED);
 
     if ret as usize == 0 {

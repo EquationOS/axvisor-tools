@@ -102,6 +102,7 @@ static int instance_mmap(struct file *file, struct vm_area_struct *vma)
 	int ret = 0;
 	unsigned long pfn_start;
 	unsigned long size;
+	unsigned long prot = pgprot_val(vma->vm_page_prot);
 
 	u64 base_addr = 0;
 	unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
@@ -139,10 +140,13 @@ static int instance_mmap(struct file *file, struct vm_area_struct *vma)
 
 	size = vma->vm_end - vma->vm_start;
 
-	// First, hvc to sync the mapping with the Instance.
+	INFO("vm_flags: 0x%lx, vm_page_prot: 0x%lx\n", vma->vm_flags, prot);
+
+	// First, hvc to sync the mapping with the Instance guest addrspace in
+	// AxVisor.
 	ret = hvc_load_mmap(
 		instance_id, vma->vm_start, base_addr, size, (__u64)vma->vm_flags,
-		pgprot_val(vma->vm_page_prot));
+		prot);
 	if (ret < 0)
 	{
 		ERROR(
@@ -152,6 +156,13 @@ static int instance_mmap(struct file *file, struct vm_area_struct *vma)
 	}
 
 	pfn_start = (base_addr >> PAGE_SHIFT) + vma->vm_pgoff;
+	// Set RW permissions for the mapping.
+	// This is necessary for the ELF loader in axcli to write to the
+	// memory region.
+	// The correct permission will be set by `mprotect` in axcli after the
+	// loading is done.
+	prot |= _PAGE_RW;
+	vma->vm_page_prot = __pgprot(prot);
 
 	INFO(
 		"[remap_pfn_range] virt:0x%lx phy: 0x%lx, offset: 0x%lx, size: 0x%lx "

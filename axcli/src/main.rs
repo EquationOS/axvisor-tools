@@ -1,5 +1,7 @@
 mod hvc;
 mod instance;
+#[allow(non_camel_case_types)]
+#[allow(unused)]
 mod ioctl;
 mod shared_pages;
 
