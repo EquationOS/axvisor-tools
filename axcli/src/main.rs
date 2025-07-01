@@ -59,8 +59,9 @@ enum InstanceSubCmd {
     /// Init instance runtime environment.
     Init,
     /// Create a new instance.
-    #[command(subcommand)]
-    Create(InstanceKind),
+    Create(InstanceCreateArgs),
+    /// Execute a instance by ELF file alone with its arguments.
+    Execute(ExecuteArgs),
     Remove {
         /// Instance ID to remove.
         #[arg(short, long)]
@@ -68,15 +69,9 @@ enum InstanceSubCmd {
     },
 }
 
-#[derive(Subcommand, Debug)]
-enum InstanceKind {
-    Static(InstanceCreateArgs),
-    Load(ExecuteArgs),
-}
-
 #[derive(Debug, Args)]
 struct InstanceCreateArgs {
-    /// Path to the ELF file or binary file.
+    /// Path to the binary file.
     #[arg(short, long)]
     pub file_path: String,
     /// Instance type, 0 for LibOS, 1 for kernel.
@@ -109,10 +104,8 @@ fn main() {
         CLISubCmd::Instance { subcmd } => match subcmd {
             InstanceSubCmd::List => todo!(),
             InstanceSubCmd::Init => instance::init_shim(),
-            InstanceSubCmd::Create(kind) => match kind {
-                InstanceKind::Static(arg) => instance::create_instance(arg),
-                InstanceKind::Load(arg) => instance::load_junction(arg),
-            },
+            InstanceSubCmd::Create(args) => instance::create_instance(args),
+            InstanceSubCmd::Execute(args) => instance::execute(args),
             InstanceSubCmd::Remove { instance_id } => instance::remove_instance(instance_id as _),
         },
         CLISubCmd::Loader(args) => loader::local_execute(args),

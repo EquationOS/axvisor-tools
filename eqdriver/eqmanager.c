@@ -63,7 +63,7 @@ eqmanager_ioctl(struct file *file, unsigned int ioctl, unsigned long arg)
 			return -EFAULT;
 		}
 
-		ret = remove_instance(&remove_arg);
+		ret = remove_instance((int)remove_arg.instance_id);
 		if (ret < 0)
 		{
 			ERROR("Failed to remove instance: %d\n", ret);

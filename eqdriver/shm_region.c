@@ -193,3 +193,12 @@ void release_shm_region(eqshm_t *region, struct list_head *region_list)
 		kfree(region);
 	}
 }
+
+/**
+ * Clearup the eqshm region even if it is not empty.
+ */
+void cleanup_shm_region(eqshm_t *region, struct list_head *region_list)
+{
+	list_del(&region->list);
+	kfree(region);
+}

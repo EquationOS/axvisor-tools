@@ -31,3 +31,4 @@ int is_shm_region_full(eqshm_t *region);
 
 eqshm_t *allocate_new_shm_region(struct list_head *region_list, void *base);
 void release_shm_region(eqshm_t *region, struct list_head *region_list);
+void cleanup_shm_region(eqshm_t *region, struct list_head *region_list);

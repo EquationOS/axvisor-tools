@@ -1,5 +1,4 @@
 use core::panic;
-use std::ffi::CString;
 use std::fmt::Debug;
 use std::fs::File;
 use std::io::Read;
@@ -11,7 +10,8 @@ use libc::*;
 
 use linux_libc_auxv::{AuxVar, AuxVarFlags, StackLayoutBuilder, StackLayoutRef};
 
-const STACK_SIZE: usize = 1024 * 1024 * 8;
+// const STACK_SIZE: usize = 1024 * 1024 * 8;
+const STACK_SIZE: usize = 0x1000 * 4; // 16KB stack size
 const PIE_BASE: usize = 0x40000000;
 const LDSO_BASE: usize = 0x7f0000000000;
 
@@ -88,7 +88,7 @@ unsafe fn mprotect_segment(base: usize, ph: &goblin::elf::ProgramHeader) {
     assert_eq!(mprotect_ret, 0, "Failed to set memory protection");
 }
 
-pub unsafe fn mmap_elf<P: AsRef<Path> + Debug>(
+unsafe fn mmap_elf<P: AsRef<Path> + Debug>(
     path: P,
     base: usize,
     fd: Option<i32>,
@@ -157,20 +157,51 @@ pub unsafe fn mmap_elf<P: AsRef<Path> + Debug>(
     (elf, base, static_ref, interp_path)
 }
 
-#[unsafe(no_mangle)]
-unsafe fn setup_stack(
-    argv: Vec<CString>,
-    envp: Vec<CString>,
-    elf_base: Option<usize>,
-    elf: &Elf,
-    ldso_base: usize,
-) -> *mut c_void {
+unsafe fn setup_raw_stack(fd: Option<i32>) -> *mut c_void {
+    let (fd, flags) = if let Some(fd) = fd {
+        (fd, MAP_SHARED | MAP_FIXED)
+    } else {
+        // If no file descriptor is provided, use -1 for anonymous mapping
+        (-1, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED)
+    };
+
     let stack = mmap(
         0x60000_0000 as *mut c_void, // Start of the stack
         STACK_SIZE,
         PROT_READ | PROT_WRITE,
-        MAP_PRIVATE | MAP_ANONYMOUS,
-        -1,
+        flags,
+        fd,
+        0,
+    );
+    assert_ne!(stack, MAP_FAILED);
+    info!("[*] Allocated raw stack at: {:#p}", stack);
+    let stack_top = stack as usize + STACK_SIZE;
+    stack_top as *mut c_void
+}
+
+#[unsafe(no_mangle)]
+unsafe fn setup_stack_with_args(
+    argv: &Vec<String>,
+    envp: &Vec<String>,
+    elf: &Elf,
+    entry: *mut u8,
+    phdr: *mut u8,
+    ldso_base: *mut u8,
+    fd: Option<i32>,
+) -> *mut c_void {
+    let (fd, flags) = if let Some(fd) = fd {
+        (fd, MAP_SHARED | MAP_FIXED)
+    } else {
+        // If no file descriptor is provided, use -1 for anonymous mapping
+        (-1, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED)
+    };
+
+    let stack = mmap(
+        0x60000_0000 as *mut c_void, // Start of the stack
+        STACK_SIZE,
+        PROT_READ | PROT_WRITE,
+        flags,
+        fd,
         0,
     );
     assert_ne!(stack, MAP_FAILED);
@@ -179,21 +210,12 @@ unsafe fn setup_stack(
 
     let mut stack_builder = StackLayoutBuilder::new();
     for s in argv.iter() {
-        stack_builder.add_argv(s.clone().into_string().expect("Invalid CString"));
+        stack_builder.add_argv(s.clone());
     }
 
     for s in envp.iter() {
-        stack_builder.add_envv(s.clone().into_string().expect("Invalid CString"));
+        stack_builder.add_envv(s.clone());
     }
-
-    let (entry, phdr) = if let Some(elf_base) = elf_base {
-        (
-            elf_base + elf.entry as usize,
-            elf_base + elf.header.e_phoff as usize,
-        )
-    } else {
-        (elf.entry as usize, elf.header.e_phoff as usize)
-    };
 
     let mut random_bytes = [0u8; 16];
     for (index, byte) in random_bytes.iter_mut().enumerate() {
@@ -201,13 +223,13 @@ unsafe fn setup_stack(
     }
 
     stack_builder.add_auxv(AuxVar::Pagesz(4096)); // 4KB page size
-    stack_builder.add_auxv(AuxVar::Phdr(phdr as *mut u8));
+    stack_builder.add_auxv(AuxVar::Phdr(phdr));
     stack_builder.add_auxv(AuxVar::Phent(elf.header.e_phentsize as usize));
     stack_builder.add_auxv(AuxVar::Phnum(elf.header.e_phnum as usize));
-    stack_builder.add_auxv(AuxVar::Entry(entry as *mut u8));
+    stack_builder.add_auxv(AuxVar::Entry(entry));
     stack_builder.add_auxv(AuxVar::Flags(AuxVarFlags::NOT_PRESERVE_ARGV0));
     stack_builder.add_auxv(AuxVar::Random(random_bytes));
-    stack_builder.add_auxv(AuxVar::Base(ldso_base as *mut u8)); // Base address for ld.so
+    stack_builder.add_auxv(AuxVar::Base(ldso_base)); // Base address for ld.so
 
     let (sp, stack_size) = stack_builder.build_on_stack(stack_top);
 
@@ -235,51 +257,72 @@ unsafe fn setup_stack(
     sp as *mut c_void
 }
 
-pub(super) fn load_junction(app_args: &[String]) {
-    let argv_full = {
-        let mut v = vec![];
-        v.extend(app_args.iter().map(|s| CString::new(s.as_str()).unwrap()));
-        v
-    };
+pub unsafe fn load_app(args: &Vec<String>, envs: &Vec<String>, fd: Option<i32>) -> (usize, usize) {
+    if args.is_empty() {
+        panic!("No application path provided");
+    }
 
-    let envp = vec![];
+    let app_path = &args[0];
 
-    let app_path = app_args[0].clone();
+    info!("[*] Loading application: {}", app_path);
 
-    unsafe {
-        let (junc_elf, junc_base, _, interp_path) = mmap_elf(app_path.as_str(), PIE_BASE, None);
+    let app_path = args[0].clone();
 
-        let (ldso_elf, ldso_base) = if let Some(interp_path) = interp_path {
-            let (ldso_elf, ldso_base, _, path) = mmap_elf(&interp_path, LDSO_BASE, None);
-            if let Some(path) = path {
-                panic!(
-                    "[*] Found interpreter: {:?} for interp {:?}",
-                    path, interp_path
-                );
-            }
-            (ldso_elf, ldso_base)
+    let (app_elf, app_base, _, interp_path) = unsafe { mmap_elf(app_path.as_str(), PIE_BASE, fd) };
+
+    let (entry, stack) = if let Some(interp_path) = interp_path {
+        let (ldso_elf, ldso_base, _, path) = unsafe { mmap_elf(&interp_path, LDSO_BASE, fd) };
+        if let Some(path) = path {
+            panic!(
+                "[*] Found interpreter: {:?} for interp {:?}",
+                path, interp_path
+            );
+        }
+        warn!("ldso_base: 0x{:x}, junc_base: 0x{:x}", ldso_base, app_base);
+
+        let is_junc_pie = app_elf.header.e_type == goblin::elf::header::ET_DYN;
+
+        let (entry, phdr) = if is_junc_pie {
+            (
+                app_base + app_elf.entry as usize,
+                app_base + app_elf.header.e_phoff as usize,
+            )
         } else {
-            panic!("[*] No interpreter found in junction ELF");
+            (app_elf.entry as usize, app_elf.header.e_phoff as usize)
         };
 
-        warn!("ldso_base: 0x{:x}, junc_base: 0x{:x}", ldso_base, junc_base);
+        let stack = unsafe {
+            setup_stack_with_args(
+                args,
+                envs,
+                &app_elf,
+                entry as *mut u8,
+                phdr as *mut u8,
+                ldso_base as *mut u8,
+                fd,
+            )
+        };
+        (ldso_base + ldso_elf.entry as usize, stack as usize)
+    } else {
+        let stack = unsafe { setup_raw_stack(fd) };
 
-        let is_junc_pie = junc_elf.header.e_type == goblin::elf::header::ET_DYN;
-        let junc_base = if is_junc_pie { Some(junc_base) } else { None };
+        (app_base + app_elf.entry as usize, stack as usize)
+    };
+    (entry, stack)
+}
 
-        let stack = setup_stack(argv_full, envp, junc_base, &junc_elf, ldso_base);
-        let ld_entry = ldso_base + ldso_elf.entry as usize;
+pub(super) fn execute_app(app_args: &Vec<String>) {
+    let envp = vec![];
 
-        println!(
-            "[*] Jumping to ld.so entry: 0x{:x}, stack {:#x}",
-            ld_entry, stack as usize
-        );
+    let (entry, stack) = unsafe { load_app(app_args, &envp, None) };
 
+    println!("[*] Jumping to entry: 0x{:x}, stack {:#x}", entry, stack);
+    unsafe {
         core::arch::asm! {
             "mov rsp, {0}",
             "jmp {1}",
             in(reg) stack,
-            in(reg) ld_entry,
+            in(reg) entry,
             options(noreturn)
         }
     }

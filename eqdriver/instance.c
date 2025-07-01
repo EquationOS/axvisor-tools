@@ -130,6 +130,13 @@ static int instance_mmap(struct file *file, struct vm_area_struct *vma)
 	base_addr = (__u64)allocate_contiguous_shm_pages(
 		instance_vdev->current_shm, requested_page_count);
 
+	if (base_addr == 0)
+	{
+		WARNING(
+			"Failed to allocate %d pages for instance %d, [0x%lx, 0x%lx)\n",
+			requested_page_count, instance_id, vma->vm_start, vma->vm_end);
+	}
+
 	size = vma->vm_end - vma->vm_start;
 
 	// First, hvc to sync the mapping with the Instance.
@@ -147,7 +154,7 @@ static int instance_mmap(struct file *file, struct vm_area_struct *vma)
 	pfn_start = (base_addr >> PAGE_SHIFT) + vma->vm_pgoff;
 
 	INFO(
-		"[remap_pfn_mmap] virt:0x%lx phy: 0x%lx, offset: 0x%lx, size: 0x%lx "
+		"[remap_pfn_range] virt:0x%lx phy: 0x%lx, offset: 0x%lx, size: 0x%lx "
 		"(%d pages)\n",
 		vma->vm_start, pfn_start << PAGE_SHIFT, offset, size,
 		requested_page_count);
@@ -217,9 +224,34 @@ int create_instance(eq_create_instance_arg_t *arg)
 		ret = -EINVAL;
 		goto err_free_shm_base;
 	}
+	// Set the instance ID in the argument structure,
+	// which will be copied back to user space.
+	// This is necessary for the user space to know the assigned instance ID.
 	arg->instance_id = (uint64_t)instance_id;
 
 	instance_vdev = &instances_array[arg->instance_id];
+
+	if (instance_vdev->active)
+	{
+		// The instance is already active, but AxVisor still assigned this
+		// instance ID, which means that the instance has been removed
+		// but not yet cleaned up.
+		INFO(
+			"Instance %d is already active, but it was removed, reusing it\n",
+			instance_id);
+		// Reset the instance vdev to reuse it.
+		remove_instance(instance_id);
+	}
+
+	if (instance_vdev->active)
+	{
+		ERROR(
+			"Instance %d is already active, cannot create a new one\n",
+			instance_id);
+		ret = -EEXIST;
+		goto err_free_shm_base;
+	}
+
 	instance_vdev->id = instance_id;
 	instance_vdev->active = true;
 
@@ -268,9 +300,8 @@ err_free_shm_base:
 	return ret;
 }
 
-int remove_instance(eq_remove_instance_arg_t *arg)
+int remove_instance(int instance_id)
 {
-	int instance_id = (int)arg->instance_id;
 	eq_instance_vdev_t *instance_vdev;
 	int ret = 0;
 
@@ -313,6 +344,14 @@ int unregister_instance_dev(eq_instance_vdev_t *vdev)
 		ERROR("Instance %s is not active\n", vdev->name);
 		return -ENODEV;
 	}
+
+	// Traverse and release shared memory regions
+	eqshm_t *shm, *tmp;
+	list_for_each_entry_safe(shm, tmp, &vdev->shm_list_head, list)
+	{
+		cleanup_shm_region(shm, &vdev->shm_list_head);
+	}
+
 	misc_deregister(&vdev->misc);
 	vdev->active = false;
 	INFO(
