@@ -12,6 +12,7 @@ env_logger = "0.11.3"
 log = "0.4.21"
 goblin = "0.10.0"
 
+equation_defs = { git = "https://github.com/EquationOS/equation_defs.git" }
 linux-libc-auxv = { git = "https://github.com/EquationOS/linux-libc-auxv.git" }
 
 memory_addr = "0.3"
@@ -27,6 +28,13 @@ linux-libc-auxv = { path = "../../../crates/linux-libc-auxv" }
 
 [patch."https://github.com/EquationOS/pi-memory-layout.git"]
 pi_memory_layout = { path = "../../../crates/pi_memory_layout" }
+
+[patch."https://github.com/EquationOS/equation_defs.git"]
+equation_defs = { path = "../../../crates/equation_defs" }
+
+[patch.crates-io]
+memory_addr = { path = "../../../crates/memory_addr/memory_addr" }
+bitmaps = { path = "../../../crates/bitmaps" }
 
 [build-dependencies]
 bindgen = "0.72"

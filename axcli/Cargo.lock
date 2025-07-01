@@ -30,6 +30,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "allocator"
+version = "0.1.1"
+source = "git+https://github.com/arceos-org/allocator.git?tag=v0.1.1#1d5b7a1b4fd8db4c9c9cea4e6012d15d42e2bf40"
+dependencies = [
+ "bitmap-allocator",
+ "cfg-if",
+ "rlsf",
+]
+
+[[package]]
 name = "anstream"
 version = "0.6.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -86,6 +96,7 @@ dependencies = [
  "bindgen",
  "clap",
  "env_logger",
+ "equation_defs",
  "goblin",
  "libc",
  "linux-libc-auxv",
@@ -116,6 +127,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "base64"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e1b586273c5702936fe7b7d6896644d8be71e6314cfe09d3167c95f712589e8"
+
+[[package]]
 name = "bindgen"
 version = "0.72.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -132,7 +149,7 @@ dependencies = [
  "regex",
  "rustc-hash",
  "shlex",
- "syn",
+ "syn 2.0.87",
 ]
 
 [[package]]
@@ -152,6 +169,19 @@ name = "bitflags"
 version = "2.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1b8e56985ec62d17e9c1001dc89c88ecd7dc08e47eba5ec7c29c7b5eeecde967"
+
+[[package]]
+name = "bitmap-allocator"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5553d824a3564e1c242975cfc962d15e6299bfa4a90c44c14208673c16df51f3"
+dependencies = [
+ "bit_field",
+]
+
+[[package]]
+name = "bitmaps"
+version = "3.2.1"
 
 [[package]]
 name = "cexpr"
@@ -210,7 +240,7 @@ dependencies = [
  "heck",
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.87",
 ]
 
 [[package]]
@@ -224,6 +254,12 @@ name = "colorchoice"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b6a852b24ab71dffc585bcb46eaf7959d175cb865a7152e35b348d1b2960422"
+
+[[package]]
+name = "const-default"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b396d1f76d455557e1218ec8066ae14bba60b4b36ecd55577ba979f5db7ecaa"
 
 [[package]]
 name = "critical-section"
@@ -267,6 +303,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "equation_defs"
+version = "0.1.0"
+dependencies = [
+ "allocator",
+ "axhvc",
+ "bit_field",
+ "bitmap-allocator",
+ "bitmaps",
+ "cfg-if",
+ "log",
+ "memory_addr",
+ "x86",
+]
+
+[[package]]
 name = "equator"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -283,7 +334,7 @@ checksum = "44f23cf4b44bfce11a86ace86f8a73ffdec849c9fd00a386a53d278bd9e81fb3"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.87",
 ]
 
 [[package]]
@@ -392,8 +443,6 @@ checksum = "78ca9ab1a0babb1e7d5695e3530886289c18cf2f87ec19a575a0abdce112e3a3"
 [[package]]
 name = "memory_addr"
 version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5438b8df0f13e16e1f46140de247695a95952a5a4479e47197a8711bf1063373"
 
 [[package]]
 name = "minimal-lexical"
@@ -469,7 +518,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "64d1ec885c64d0457d564db4ec299b2dae3f9c02808b8ad9c3a089c591b18033"
 dependencies = [
  "proc-macro2",
- "syn",
+ "syn 2.0.87",
 ]
 
 [[package]]
@@ -547,6 +596,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8188909339ccc0c68cfb5a04648313f09621e8b87dc03095454f1a11f6c5d436"
 
 [[package]]
+name = "rlsf"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "222fb240c3286247ecdee6fa5341e7cdad0ffdf8e7e401d9937f2d58482a20bf"
+dependencies = [
+ "cfg-if",
+ "const-default",
+ "libc",
+ "svgbobdoc",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -575,7 +636,7 @@ checksum = "22fc4f90c27b57691bbaf11d8ecc7cfbfe98a4da6dbe60226115d322aa80c06e"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.87",
 ]
 
 [[package]]
@@ -595,7 +656,7 @@ checksum = "e0cd7e117be63d3c3678776753929474f3b04a43a080c744d6b0ae2a8c28e222"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.87",
 ]
 
 [[package]]
@@ -618,6 +679,30 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
+
+[[package]]
+name = "svgbobdoc"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2c04b93fc15d79b39c63218f15e3fdffaa4c227830686e3b7c5f41244eb3e50"
+dependencies = [
+ "base64",
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
+ "unicode-width",
+]
+
+[[package]]
+name = "syn"
+version = "1.0.109"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b64191b275b66ffe2469e8af2c1cfe3bafa67b529ead792a6d0160888b4237"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
 
 [[package]]
 name = "syn"
@@ -647,7 +732,7 @@ checksum = "7f7cf42b4507d8ea322120659672cf1b9dbb93f8f2d4ecfd6e51350ff5b17a1d"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.87",
 ]
 
 [[package]]
@@ -695,6 +780,12 @@ name = "unicode-ident"
 version = "1.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3354b9ac3fae1ff6755cb6db53683adb661634f67557942dea4facebec0fee4b"
+
+[[package]]
+name = "unicode-width"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
 
 [[package]]
 name = "utf8parse"

@@ -7,9 +7,6 @@ use crate::loader;
 use crate::shared_pages::{copy_content_to_shared_pages, free_shared_pages};
 use crate::{ExecuteArgs, InstanceCreateArgs};
 
-const PIE_BASE: usize = 0x40000000;
-const LDSO_BASE: usize = 0x7f0000000000;
-
 const EQINSTANCE_DEV_PREFIX: &str = "/dev/eqinstance_";
 
 pub fn create_instance(args: InstanceCreateArgs) {

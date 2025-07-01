@@ -10,10 +10,12 @@ use libc::*;
 
 use linux_libc_auxv::{AuxVar, AuxVarFlags, StackLayoutBuilder, StackLayoutRef};
 
-// const STACK_SIZE: usize = 1024 * 1024 * 8;
-const STACK_SIZE: usize = 0x1000 * 4; // 16KB stack size
-const PIE_BASE: usize = 0x40000000;
-const LDSO_BASE: usize = 0x7f0000000000;
+use equation_defs::{USER_LDSO_BASE_VA, USER_PIE_BASE_VA, USER_STACK_SIZE, USER_STACK_TOP_VA};
+
+// // const STACK_SIZE: usize = 1024 * 1024 * 8;
+// const STACK_SIZE: usize = 0x1000 * 4; // 16KB stack size
+// const PIE_BASE: usize = 0x40000000;
+// const LDSO_BASE: usize = 0x7f0000000000;
 
 unsafe fn mmap_segment(base: usize, ph: &goblin::elf::ProgramHeader, data: &[u8], fd: Option<i32>) {
     let vaddr = base + ph.p_vaddr as usize;
@@ -163,8 +165,8 @@ unsafe fn setup_raw_stack(fd: Option<i32>) -> *mut c_void {
     };
 
     let stack = mmap(
-        0x60000_0000 as *mut c_void, // Start of the stack
-        STACK_SIZE,
+        (USER_STACK_TOP_VA - USER_STACK_SIZE) as *mut c_void, // Start of the stack
+        USER_STACK_SIZE,
         PROT_READ | PROT_WRITE,
         flags,
         fd,
@@ -172,7 +174,8 @@ unsafe fn setup_raw_stack(fd: Option<i32>) -> *mut c_void {
     );
     assert_ne!(stack, MAP_FAILED);
     info!("[*] Allocated raw stack at: {:#p}", stack);
-    let stack_top = stack as usize + STACK_SIZE;
+    let stack_top = stack as usize + USER_STACK_SIZE;
+    assert_eq!(stack_top, USER_STACK_TOP_VA, "Stack top mismatch");
     stack_top as *mut c_void
 }
 
@@ -194,8 +197,8 @@ unsafe fn setup_stack_with_args(
     };
 
     let stack = mmap(
-        0x60000_0000 as *mut c_void, // Start of the stack
-        STACK_SIZE,
+        (USER_STACK_TOP_VA - USER_STACK_SIZE) as *mut c_void, // Start of the stack
+        USER_STACK_SIZE,
         PROT_READ | PROT_WRITE,
         flags,
         fd,
@@ -203,7 +206,8 @@ unsafe fn setup_stack_with_args(
     );
     assert_ne!(stack, MAP_FAILED);
 
-    let stack_top = stack as usize + STACK_SIZE;
+    let stack_top = stack as usize + USER_STACK_SIZE;
+    assert_eq!(stack_top, USER_STACK_TOP_VA);
 
     let mut stack_builder = StackLayoutBuilder::new();
     for s in argv.iter() {
@@ -265,10 +269,12 @@ pub unsafe fn load_app(args: &Vec<String>, envs: &Vec<String>, fd: Option<i32>) 
 
     let app_path = args[0].clone();
 
-    let (app_elf, app_base, _, interp_path) = unsafe { mmap_elf(app_path.as_str(), PIE_BASE, fd) };
+    let (app_elf, app_base, _, interp_path) =
+        unsafe { mmap_elf(app_path.as_str(), USER_PIE_BASE_VA, fd) };
 
     let (entry, stack) = if let Some(interp_path) = interp_path {
-        let (ldso_elf, ldso_base, _, path) = unsafe { mmap_elf(&interp_path, LDSO_BASE, fd) };
+        let (ldso_elf, ldso_base, _, path) =
+            unsafe { mmap_elf(&interp_path, USER_LDSO_BASE_VA, fd) };
         if let Some(path) = path {
             panic!(
                 "[*] Found interpreter: {:?} for interp {:?}",
