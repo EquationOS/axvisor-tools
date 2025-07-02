@@ -1,9 +1,15 @@
+//! CommandLine Interface and host daemon process for Equation OS.
+
 mod hvc;
 mod instance;
+mod shared_pages;
+
+#[allow(static_mut_refs)]
+mod proxy;
+
 #[allow(non_camel_case_types)]
 #[allow(unused)]
 mod ioctl;
-mod shared_pages;
 
 /// Just for test and debug purpose.
 /// A User-level executor to boot ELF.

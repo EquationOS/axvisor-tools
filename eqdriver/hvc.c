@@ -25,10 +25,10 @@ int hvc_call(
 }
 
 int hvc_create_instance(
-	__u64 instance_type, __u64 mapping_type, __u64 shm_base_ptr)
+	__u64 instance_type, __u64 mapping_type, __u64 shm_base_ptr, __u64 scf_queue_base_ptr)
 {
 	return hvc_call(
-		HCreateInstance, instance_type, mapping_type, shm_base_ptr, 0, 0, 0);
+		HCreateInstance, instance_type, mapping_type, shm_base_ptr, scf_queue_base_ptr, 0, 0);
 }
 
 int hvc_load_mmap(

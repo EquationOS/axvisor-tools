@@ -202,3 +202,18 @@ void cleanup_shm_region(eqshm_t *region, struct list_head *region_list)
 	list_del(&region->list);
 	kfree(region);
 }
+
+eqscf_queue_region_t *get_scf_queue_region_by_host_pid(
+	struct list_head *scf_region_list, uint64_t host_pid)
+{
+	for (eqscf_queue_region_t *region = list_first_entry_or_null(
+			 scf_region_list, eqscf_queue_region_t, list);
+		 region != NULL; region = list_next_entry(region, list))
+	{
+		if (region->host_pid == host_pid)
+		{
+			return region; // Found the SCF queue region for the given PID
+		}
+	}
+	return NULL; // Not found
+}

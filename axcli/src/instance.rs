@@ -4,6 +4,7 @@ use libc::c_void;
 
 use crate::hvc::{hvc_create_instance, hvc_init_shim, hvc_setup_instance};
 use crate::loader;
+use crate::proxy;
 use crate::shared_pages::{copy_content_to_shared_pages, free_shared_pages};
 use crate::{ExecuteArgs, InstanceCreateArgs};
 
@@ -69,6 +70,8 @@ pub fn execute(args: ExecuteArgs) {
         );
     }
 
+    proxy::setup_syscall_proxy_queue_buffer(instance_fd);
+
     // Set EQTEST environment variable
     let envs = vec!["EQTEST=1".to_string()];
 
@@ -87,7 +90,7 @@ pub fn execute(args: ExecuteArgs) {
 
     // In the next step, this process will turn into a proxy process of the junction instance,
     // which handles the system calls which can not be handled by the axvisor directly.
-    unimplemented!("The process will now turn into a proxy process for the junction instance. This is not implemented yet.");
+    proxy::poll();
 }
 
 pub fn remove_instance(instance_id: u64) {

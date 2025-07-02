@@ -92,12 +92,14 @@ dependencies = [
 name = "axcli"
 version = "0.1.0"
 dependencies = [
+ "axerrno",
  "axhvc",
  "bindgen",
  "clap",
  "env_logger",
  "equation_defs",
  "goblin",
+ "lazyinit",
  "libc",
  "linux-libc-auxv",
  "log",
@@ -314,6 +316,7 @@ dependencies = [
  "cfg-if",
  "log",
  "memory_addr",
+ "syscalls",
  "x86",
 ]
 
@@ -402,6 +405,12 @@ checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
 dependencies = [
  "either",
 ]
+
+[[package]]
+name = "lazyinit"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17f03abfebdaaf0fad16790237a0348baf84886d3ade460db13bae59e614a180"
 
 [[package]]
 name = "libc"
@@ -714,6 +723,12 @@ dependencies = [
  "quote",
  "unicode-ident",
 ]
+
+[[package]]
+name = "syscalls"
+version = "0.6.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43d0e35dc7d73976a53c7e6d7d177ef804a0c0ee774ec77bcc520c2216fd7cbe"
 
 [[package]]
 name = "thiserror"

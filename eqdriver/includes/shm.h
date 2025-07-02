@@ -8,6 +8,8 @@
 
 #define UINT64_MAX (~(uint64_t)0)
 
+#define SCF_MAGIC_NUMBER (0x45534346) // "ESCF"
+
 #define SHM_REGION_SIZE (0x40000000) // 1 GB shared memory region size
 #define MAX_SHM_PAGES                                                          \
 	(SHM_REGION_SIZE / PAGE_SIZE) // Maximum number of 4KB pages in the region
@@ -21,10 +23,22 @@ typedef struct eqshm
 	struct list_head list;
 } eqshm_t;
 
+typedef struct eqscf_queue_region
+{
+	uint64_t pid;
+	uint64_t host_pid;
+	uint64_t base_gpa;
+	uint64_t size;
+	struct list_head list;
+} eqscf_queue_region_t;
+
 void *allocate_shm_page(eqshm_t *region);
 void *allocate_contiguous_shm_pages(eqshm_t *region, int page_num);
 void free_shm_page(eqshm_t *region, void *page);
 void free_contiguous_shm_pages(eqshm_t *region, void *page, int page_num);
+
+eqscf_queue_region_t *
+get_scf_queue_region_by_host_pid(struct list_head *scf_region_list, uint64_t pid);
 
 int is_shm_region_empty(eqshm_t *region);
 int is_shm_region_full(eqshm_t *region);
