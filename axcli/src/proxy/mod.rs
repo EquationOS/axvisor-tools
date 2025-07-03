@@ -1,5 +1,7 @@
 mod daemon;
 
+mod fs;
+
 pub use daemon::poll;
 
 use lazyinit::LazyInit;
@@ -9,6 +11,8 @@ use equation_defs::scf::{ScfDescriptor, SyscallQueueBufferMetadata, SCF_QUEUE_BU
 use equation_defs::{SCF_QUEUE_BUFF_BASE_VA, SCF_QUEUE_BUFF_SIZE};
 
 static mut SYSCALL_QUEUE_BUFFER: LazyInit<SyscallQueueBuffer> = LazyInit::new();
+
+static mut INSTANCE_FD: i32 = -1;
 
 pub struct SyscallQueueBuffer {
     capacity_mask: u16,
@@ -89,10 +93,14 @@ pub fn setup_syscall_proxy_queue_buffer(instance_fd: i32) {
         std::io::Error::last_os_error()
     );
 
+    unsafe {
+        INSTANCE_FD = instance_fd;
+    }
+
     let meta = SyscallQueueBufferMetadata::construct_mut();
 
-	// Check if the magic number is valid.
-	// This may trigger a page_fault if the memory is not mapped correctly.
+    // Check if the magic number is valid.
+    // This may trigger a page_fault if the memory is not mapped correctly.
     assert!(
         meta.is_valid(),
         "Invalid magic number for syscall queue buffer"
@@ -101,6 +109,13 @@ pub fn setup_syscall_proxy_queue_buffer(instance_fd: i32) {
     let desc = meta.descriptor_table();
     let req_ring = meta.request_ring();
     let rsp_ring = meta.response_ring();
+
+    info!(
+        "Mapped syscall queue buffer at {:#p}, size: {:#x}, capacity: {}",
+        syscall_queue_base,
+        SCF_QUEUE_BUFF_SIZE,
+        meta.capacity()
+    );
 
     unsafe {
         SYSCALL_QUEUE_BUFFER.init_once(SyscallQueueBuffer {

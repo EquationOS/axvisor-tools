@@ -348,6 +348,13 @@ int create_instance(eq_create_instance_arg_t *arg)
 	INIT_LIST_HEAD(&init_scf->list);
 	list_add_tail(&init_scf->list, &instance_vdev->scf_region_head);
 
+	INFO(
+		"Initialized SCF queue region for instance %d process %lld, base_gpa: "
+		"0x%llx, size 0x%llx"
+		"host pid: %d (%s)\n",
+		instance_id, init_scf->pid, init_scf->base_gpa, init_scf->size, pid,
+		comm);
+
 	// Initialize the shared memory list head.
 	INIT_LIST_HEAD(&instance_vdev->shm_list_head);
 
