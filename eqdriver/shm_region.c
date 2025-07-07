@@ -1,4 +1,5 @@
 #include "includes/shm.h"
+#include "includes/utils.h"
 
 /**
  * Find the first free bit in the bitmap and return its position.
@@ -60,20 +61,25 @@ void free_shm_page(eqshm_t *region, void *page)
 
 /**
  * Allocate multiple contiguous 4KB pages from the eqshm region.
- * Returns the base address of the allocated pages or NULL if allocation fails.
+ * Returns the base address of the allocated pages or the largest contiguous
+ * block found. If no pages are available, returns NULL.
  */
-void *allocate_contiguous_shm_pages(eqshm_t *region, int page_num)
+void *allocate_contiguous_shm_pages(
+	eqshm_t *region, int page_num, int *allocated_pages)
 {
 	if (page_num <= 0)
 	{
+		*allocated_pages = 0;
 		return NULL; // Invalid number of pages
 	}
 
 	int start_pos = -1;
 	int count = 0;
+	int max_start_pos = -1;
+	int max_count = 0;
 
 	// Search for contiguous free pages
-	for (int i = 0; i < 8 * 64; i++)
+	for (int i = 0; i < BITMAP_SIZE * 64; i++)
 	{
 		int bitmap_idx = i / 64;
 		int bit_idx = i % 64;
@@ -85,6 +91,11 @@ void *allocate_contiguous_shm_pages(eqshm_t *region, int page_num)
 				start_pos = i; // Start of the contiguous block
 			}
 			count++;
+			if (count > max_count)
+			{
+				max_count = count;
+				max_start_pos = start_pos;
+			}
 			if (count == page_num)
 			{
 				break; // Found enough contiguous pages
@@ -96,18 +107,24 @@ void *allocate_contiguous_shm_pages(eqshm_t *region, int page_num)
 		}
 	}
 
-	if (count < page_num)
+	if (max_count == 0)
 	{
-		return NULL; // Not enough contiguous pages available
+		*allocated_pages = 0;
+		return NULL; // No free pages available
 	}
 
+	// Use the largest contiguous block found if page_num is not available
+	int pages_to_allocate = (count == page_num) ? page_num : max_count;
+	start_pos = (count == page_num) ? start_pos : max_start_pos;
+
 	// Mark the pages as allocated
-	for (int i = 0; i < page_num; i++)
+	for (int i = 0; i < pages_to_allocate; i++)
 	{
 		int pos = start_pos + i;
 		region->bitmaps[pos / 64] |= (1ULL << (pos % 64));
 	}
 
+	*allocated_pages = pages_to_allocate;
 	return region->base +
 		   start_pos *
 			   PAGE_SIZE; // Calculate the base address of the allocated pages
@@ -166,15 +183,30 @@ int is_shm_region_full(eqshm_t *region)
 /**
  * Allocate a new eqshm region if the current region is full.
  */
-eqshm_t *allocate_new_shm_region(struct list_head *region_list, void *base)
+eqshm_t *allocate_new_page_cache_region(
+	struct list_head *region_list, void *base, uint64_t size)
 {
-	eqshm_t *new_region = kzalloc(sizeof(eqshm_t), GFP_KERNEL);
+	eqshm_t *new_region;
+
+	if (!base || size == 0 || size > MAX_SHM_REGION_SIZE ||
+		size % PAGE_SIZE != 0)
+	{
+		ERROR(
+			"Invalid parameters for new eqshm region: base=%p, size=%llx\n",
+			base, size);
+		return NULL; // Invalid parameters
+	}
+
+	new_region = kzalloc(sizeof(eqshm_t), GFP_KERNEL);
+
 	if (!new_region)
 	{
+		ERROR("Failed to allocate memory for new eqshm region\n");
 		return NULL; // Allocation failed
 	}
 
 	new_region->base = base;
+	new_region->size = size; // Set the size of the region
 	memset(new_region->bitmaps, 0, sizeof(new_region->bitmaps));
 	INIT_LIST_HEAD(&new_region->list);
 	list_add_tail(&new_region->list, region_list);
@@ -185,7 +217,7 @@ eqshm_t *allocate_new_shm_region(struct list_head *region_list, void *base)
 /**
  * Release the eqshm region if all pages are free.
  */
-void release_shm_region(eqshm_t *region, struct list_head *region_list)
+void release_page_cache_region(eqshm_t *region, struct list_head *region_list)
 {
 	if (is_shm_region_empty(region))
 	{
@@ -197,7 +229,7 @@ void release_shm_region(eqshm_t *region, struct list_head *region_list)
 /**
  * Clearup the eqshm region even if it is not empty.
  */
-void cleanup_shm_region(eqshm_t *region, struct list_head *region_list)
+void cleanup_page_cache_region(eqshm_t *region, struct list_head *region_list)
 {
 	list_del(&region->list);
 	kfree(region);

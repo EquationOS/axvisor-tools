@@ -97,11 +97,32 @@ struct ExecuteArgs {
     exec_args: Vec<String>,
 }
 
+use libc::{c_void, sigaction, siginfo_t, SA_SIGINFO, SIGBUS};
+use std::ptr;
+
+extern "C" fn sigbus_handler(_sig: i32, info: *mut siginfo_t, _: *mut c_void) {
+    unsafe {
+        eprintln!("Caught SIGBUS at address: {:?}", (*info).si_addr());
+        std::process::exit(1);
+    }
+}
+
+fn install_sigbus_handler() {
+    unsafe {
+        let mut sa: sigaction = std::mem::zeroed();
+        sa.sa_sigaction = sigbus_handler as usize;
+        sa.sa_flags = SA_SIGINFO;
+        sigaction(SIGBUS, &sa, ptr::null_mut());
+    }
+}
+
 fn main() {
     // configure logger and set log level
     env_logger::Builder::new()
         .filter_level(log::LevelFilter::Trace)
         .init();
+
+    install_sigbus_handler();
 
     let cli = CLI::parse();
     match cli.subcmd {

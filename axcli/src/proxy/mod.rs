@@ -1,6 +1,8 @@
 mod daemon;
 
 mod fs;
+#[allow(unused)]
+mod mm;
 
 pub use daemon::poll;
 
@@ -72,7 +74,14 @@ impl SyscallQueueBuffer {
     }
 }
 
+/// Setup the sysycall queue buffer for SCF (system call forwarding).
+/// This function maps the syscall queue buffer into this daemon process's address space,
+/// It will also set the global `INSTANCE_FD` to the provided `instance_fd`.
 pub fn setup_syscall_proxy_queue_buffer(instance_fd: i32) {
+    unsafe {
+        INSTANCE_FD = instance_fd;
+    }
+
     let syscall_queue_base = unsafe {
         mmap(
             SCF_QUEUE_BUFF_BASE_VA as *mut c_void,
@@ -92,10 +101,6 @@ pub fn setup_syscall_proxy_queue_buffer(instance_fd: i32) {
         "Failed to map syscall queue buffer: {}",
         std::io::Error::last_os_error()
     );
-
-    unsafe {
-        INSTANCE_FD = instance_fd;
-    }
 
     let meta = SyscallQueueBufferMetadata::construct_mut();
 

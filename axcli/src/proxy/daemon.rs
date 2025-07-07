@@ -21,8 +21,18 @@ pub fn poll() {
     }
 }
 
+macro_rules! color_text {
+    ($text:expr, $color:expr) => {{
+        format_args!("\x1b[{}m{}\x1b[0m", $color, $text)
+    }};
+}
+
 fn handle_syscall(syscall_id: Sysno, args: &[u64; 6]) -> LinuxResult<u64> {
-    warn!("Handling syscall: {:?}, args: {:x?}", syscall_id, args);
+    warn!(
+        "Handling syscall: {:?}, args: {:x?}",
+        color_text!(format_args!("{syscall_id:?}"), 35),
+        args
+    );
     match syscall_id {
         // Handle specific syscalls here
         Sysno::write => fs::proxy_write(args[0], args[1], args[2]),

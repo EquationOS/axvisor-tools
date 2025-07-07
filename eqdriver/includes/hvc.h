@@ -9,8 +9,8 @@ enum hvc_fid
 };
 
 int hvc_create_instance(
-	__u64 instance_type, __u64 mapping_type, __u64 shm_base_ptr,
-	__u64 scf_queue_base_ptr);
+	__u64 instance_type, __u64 mapping_type, __u64 pg_pool_base_ptr,
+	__u64 pg_pool_size_ptr, __u64 scf_queue_base_ptr, __u64 scf_queue_size_ptr);
 int hvc_load_mmap(
 	__u64 instance_id, __u64 gva, __u64 gpa, __u64 len, __u64 flags,
 	__u64 prot);

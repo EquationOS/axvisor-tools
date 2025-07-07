@@ -185,11 +185,27 @@ pub fn proxy_mmap(
         addr, length, prot, flags, fd, offset
     );
 
+    let mut file_len;
     // Check if the file descriptor exists in the FD_LIST,
     // we only handle mmap for file descriptors that are already registered
     // in the FD_LIST.
     if let Some(path) = FD_LIST.lock().unwrap().get(&(fd as i32)) {
         info!("File descriptor {} corresponds to path: {}", fd, path);
+
+        // Update the file length to prevent memcpy from reading beyond the file size.
+        let file = std::fs::File::open(path).map_err(|e| {
+            error!("Failed to open file {}: {}", path, e);
+            LinuxError::ENOENT
+        })?;
+        let file_size = file
+            .metadata()
+            .map_err(|e| {
+                error!("Failed to get metadata for file {}: {}", path, e);
+                LinuxError::ENOENT
+            })?
+            .len();
+
+        file_len = file_size;
     } else {
         warn!("File descriptor {} not found in FD_LIST", fd);
         return Err(LinuxError::ENOENT);
@@ -200,16 +216,11 @@ pub fn proxy_mmap(
             0 as *mut libc::c_void, // null
             length as usize,
             libc::PROT_READ,
-            flags as i32,
+            flags as i32 & !libc::MAP_FIXED, // Remove MAP_FIXED to avoid conflicts
             fd as i32,
             offset as libc::off_t,
         )
     };
-
-    debug!(
-        "Host file memory mapped at: {:#x} for fd: {}, length: {}",
-        host_file_mem as u64, fd, length
-    );
 
     if host_file_mem == libc::MAP_FAILED {
         error!(
@@ -219,6 +230,11 @@ pub fn proxy_mmap(
         return Ok(libc::MAP_FAILED as u64);
     }
 
+    debug!(
+        "Host file memory mapped at: {:#x} for fd: {}, length: {}, offset {:#x}",
+        host_file_mem as u64, fd, length, offset
+    );
+
     // We do not actually mmap to the file here,
     // instead, we mmap the requested virtual address to the page cache,
     // and copy the file content to the page cache that we maintain.
@@ -227,11 +243,20 @@ pub fn proxy_mmap(
             addr as *mut libc::c_void,
             length as usize,
             prot as i32,
-            flags as i32,
+            libc::MAP_SHARED | libc::MAP_FIXED,
             INSTANCE_FD,
-            offset as libc::off_t,
+            0, // We use 0 offset for the instance FD
         )
     };
+
+    if file_len < offset {
+        error!(
+            "Offset {:#x} is greater than file length {}, cannot mmap",
+            offset, file_len
+        );
+        return Err(LinuxError::EINVAL);
+    }
+    file_len -= offset; // Adjust file_len to account for the offset
 
     if ret == libc::MAP_FAILED {
         error!(
@@ -241,16 +266,45 @@ pub fn proxy_mmap(
         return Ok(libc::MAP_FAILED as u64);
     }
 
-    debug!("Memory mapped at: {:#x} for length: {}", ret as u64, length);
-
-    unsafe {
-        libc::memcpy(ret as *mut libc::c_void, host_file_mem, length as usize);
-    }
+    let copied_length = if file_len < length { file_len } else { length };
 
     debug!(
-        "Copied {} bytes from host file memory {:#x} to mapped memory {:#x}",
-        length, host_file_mem as u64, ret as u64
+        "Memory mapped at: {:#x}, copied length: {}",
+        ret as u64, copied_length
     );
+
+    unsafe {
+        libc::memcpy(
+            ret as *mut libc::c_void,
+            host_file_mem,
+            copied_length as usize,
+        );
+    }
+    debug!(
+        "Copied {:#x}({}) bytes from host file memory {:#x} to mapped memory [{:#x}~{:#x}]",
+        copied_length,
+        copied_length,
+        host_file_mem as u64,
+        ret as u64,
+        ret as u64 + copied_length as u64
+    );
+
+    if copied_length < length {
+        // If the file is shorter than the requested length, zero out the remaining bytes
+        let remaining_length = length - copied_length;
+        let zero_ptr = (ret as usize + copied_length as usize) as *mut libc::c_void;
+        debug!(
+            "Zeroing out remaining {:#x}({}) bytes at [{:#x}~{:#x}]",
+            remaining_length,
+            remaining_length,
+            zero_ptr as u64,
+            zero_ptr as u64 + remaining_length as u64
+        );
+
+        unsafe {
+            libc::memset(zero_ptr, 0, remaining_length as usize);
+        }
+    }
 
     unsafe {
         libc::munmap(host_file_mem, length as usize);
