@@ -35,6 +35,7 @@ version = "0.1.1"
 source = "git+https://github.com/arceos-org/allocator.git?tag=v0.1.1#1d5b7a1b4fd8db4c9c9cea4e6012d15d42e2bf40"
 dependencies = [
  "bitmap-allocator",
+ "buddy_system_allocator",
  "cfg-if",
  "rlsf",
 ]
@@ -186,6 +187,12 @@ name = "bitmaps"
 version = "3.2.1"
 
 [[package]]
+name = "buddy_system_allocator"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7913f22349ffcfc6ca0ca9a656ec26cfbba538ed49c31a273dff2c5d1ea83d9"
+
+[[package]]
 name = "cexpr"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -317,6 +324,7 @@ dependencies = [
  "cfg-if",
  "log",
  "memory_addr",
+ "page_table_multiarch",
  "syscalls",
  "x86",
 ]
@@ -479,8 +487,6 @@ checksum = "300e4bdb6b46b592948e700ea1ef24a4296491f6a0ee722b258040abd15a3714"
 [[package]]
 name = "page_table_entry"
 version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c097d641745a066856a26eed6e486d4430bb3e32c94f1203ea09c63239b360a0"
 dependencies = [
  "aarch64-cpu",
  "bitflags 2.9.1",
@@ -491,8 +497,6 @@ dependencies = [
 [[package]]
 name = "page_table_multiarch"
 version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4647889585d29762d747be0916d6d28db72967a697d142be86f187a6b496832a"
 dependencies = [
  "log",
  "memory_addr",

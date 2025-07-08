@@ -258,6 +258,23 @@ unsafe fn setup_stack_with_args(
     sp as *mut c_void
 }
 
+/// Load an ELF application and its interpreter (if any) into local/shared memory.
+/// This function will map the ELF segments into memory, set up the stack with arguments and environment variables,
+/// and return the entry point and stack pointer.
+/// If the ELF is a Position Independent Executable (PIE), it will be mapped at the specified base address.
+/// If an interpreter is specified, it will also be mapped and its entry point will be returned.
+/// The function will panic if the application path is not provided or if any mapping fails.
+///
+/// ## Arguments
+/// - `args`: A vector of strings containing the application path and its arguments.
+/// - `envs`: A vector of strings containing the environment variables.
+/// - `fd`: An optional file descriptor for shared memory mapping.
+///     - If `None`, anonymous mapping will be used (local execution, for debug purposes).
+///     - If `Some(fd)`, the segments will be mapped to the shared memory region
+///       associated with the file descriptor (for execution in axvisor).
+/// ## Returns
+/// - A tuple containing the entry point address and the stack pointer address.
+///
 pub unsafe fn load_app(args: &Vec<String>, envs: &Vec<String>, fd: Option<i32>) -> (usize, usize) {
     if args.is_empty() {
         panic!("No application path provided");
@@ -314,7 +331,7 @@ pub unsafe fn load_app(args: &Vec<String>, envs: &Vec<String>, fd: Option<i32>) 
     (entry, stack)
 }
 
-pub(super) fn execute_app(app_args: &Vec<String>) {
+pub(super) fn local_execute_app(app_args: &Vec<String>) {
     let envp = vec![];
 
     let (entry, stack) = unsafe { load_app(app_args, &envp, None) };

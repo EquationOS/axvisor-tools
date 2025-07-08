@@ -37,6 +37,7 @@ equation_defs = { path = "../../../crates/equation_defs" }
 [patch.crates-io]
 memory_addr = { path = "../../../crates/memory_addr/memory_addr" }
 bitmaps = { path = "../../../crates/bitmaps" }
+page_table_multiarch = { path = "../../../crates/page_table_multiarch/page_table_multiarch" }
 
 [build-dependencies]
 bindgen = "0.72"

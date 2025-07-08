@@ -2,7 +2,8 @@ use std::ffi::CStr;
 
 use libc::c_void;
 
-use crate::hvc::{hvc_create_instance, hvc_init_shim, hvc_setup_instance};
+use crate::hvc::{hvc_create_instance, hvc_init_shim};
+use crate::ioctl::ioctl_setup_instance;
 use crate::loader;
 use crate::proxy;
 use crate::shared_pages::{copy_content_to_shared_pages, free_shared_pages};
@@ -82,11 +83,8 @@ pub fn execute(args: ExecuteArgs) {
     // and set up the stack.
     info!("Entry point: {:#x}, Stack top: {:#x}", entry, stack);
 
-    let ret = hvc_setup_instance(instance_id as u64, entry as u64, stack as u64);
-
-    if ret < 0 {
-        panic!("Failed to setup instance: {}", ret);
-    }
+    ioctl_setup_instance(instance_id as u64, entry as u64, stack as u64)
+        .expect("Failed to setup instance");
 
     // In the next step, this process will turn into a proxy process of the junction instance,
     // which handles the system calls which can not be handled by the axvisor directly.

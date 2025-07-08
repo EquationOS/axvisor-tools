@@ -17,13 +17,27 @@ typedef struct eq_instance_vdev
 {
 	struct miscdevice misc;
 	char name[64];
-	// Instance ID, unique identifier for the instance
+	/// @brief Unique identifier for the instance.
+	/// This ID is assigned by the hypervisor and is used to identify the
+	/// instance.
 	int id;
+	/// @brief Active status of the instance.
+	/// If true, this `eq_instance_vdev_t` is active and can be used.
+	/// If false, this `eq_instance_vdev_t` is not active and cannot be used.
 	bool active;
-
+	/// @brief Running status of the instance.
+	/// - 0: Just created, not running yet.
+	/// - 1: Setting up, not running yet.
+	/// - 2: Running, the instance is running.
+	int status;
+	/// @brief A linked list of SCF queue regions for this instance.
+	/// This list contains `eqscf_queue_region_t` structures, which represent
+	/// the SCF queue regions for this instance.
 	struct list_head scf_region_head;
-
-	struct list_head pgcache_list_head; // Head of the page cache memory list
+	/// @brief A linked list of page cache memory regions for this instance.
+	/// This list contains `eqshm_t` structures, which represent the page cache
+	/// memory regions for this instance.
+	struct list_head pgcache_list_head;
 	// current pos of eqshm_t in the list
 	eqshm_t *current_pgcache_pool;
 } eq_instance_vdev_t;
@@ -145,6 +159,10 @@ static int instance_scf_buf_mmap(struct file *file, struct vm_area_struct *vma)
 	return ret;
 }
 
+/// @brief Map the shared memory region for the instance.
+/// This function will be called when `axcli` calls `mmap` on the instance fd
+/// ("/dev/eqinstance_<instance_id>").
+/// It will allocate the shared memory pages and map them to the user space.
 static int instance_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	eq_instance_vdev_t *instance_vdev = file->private_data;
@@ -170,6 +188,16 @@ static int instance_mmap(struct file *file, struct vm_area_struct *vma)
 	{
 		ERROR("Instance %s is not active\n", instance_vdev->name);
 		return -ENODEV;
+	}
+
+	if (instance_vdev->status != STATUS_SETTING_UP &&
+		instance_vdev->status != STATUS_RUNNING)
+	{
+		ERROR(
+			"Instance %s with ID %d is not in a valid state for mmap, "
+			"current status: %d\n",
+			instance_vdev->name, instance_id, instance_vdev->status);
+		return -EBUSY;
 	}
 
 	// Check alignment and size
@@ -272,17 +300,53 @@ static int instance_mmap(struct file *file, struct vm_area_struct *vma)
 		// size = vma->vm_end - vma->vm_start;
 		size = pages_mapping << PAGE_SHIFT;
 
-		// First, hvc to sync the mapping with the Instance guest addrspace in
-		// AxVisor.
-		ret = hvc_load_mmap(
-			instance_id, mapping_vaddr_base, base_addr, size,
-			(__u64)vma->vm_flags, prot);
-		if (ret < 0)
+		if (instance_vdev->status == STATUS_SETTING_UP)
 		{
-			ERROR(
-				"%s: hvc_sync_mmap failed for instance %d, error code: %d\n",
-				__func__, instance_id, ret);
-			return ret;
+			// If the instance is in the setting up state, we need to
+			// sync the mapping with the Instance guest addrspace in AxVisor.
+			// This is necessary for the AxVisor to know about the
+			// memory mapping of the instance.
+			INFO(
+				"Instance %s with ID %d is in setting up state, syncing mmap\n",
+				instance_vdev->name, instance_id);
+			// hvc to sync the mapping with the Instance guest addrspace
+			ret = hvc_load_mmap(
+				instance_id, mapping_vaddr_base, base_addr, size,
+				(__u64)vma->vm_flags, prot);
+			if (ret < 0)
+			{
+				ERROR(
+					"%s: hvc_sync_mmap failed for instance %d, error code: "
+					"%d\n",
+					__func__, instance_id, ret);
+				return ret;
+			}
+		}
+		else if (instance_vdev->status == STATUS_RUNNING)
+		{
+			// If the instance is in the running state, we don't need to
+			// sync the mapping with the Instance guest addrspace in AxVisor.
+			// It's the shim that handles the `mmap` syscall and do the mapping
+			// in the guest address space stored in `ProcessInnerRegion`.
+			// So we just need to call `hvc_sync_page_cache_region` to sync the
+			// page cache region with the AxVisor.
+			INFO(
+				"Instance %s with ID %d is in running state, syncing page "
+				"cache "
+				"region\n",
+				instance_vdev->name, instance_id);
+			// hvc to sync the page cache region with the AxVisor
+			ret = hvc_sync_page_cache_region(
+				instance_id, mapping_vaddr_base, base_addr, size,
+				(__u64)vma->vm_flags, prot);
+			if (ret < 0)
+			{
+				ERROR(
+					"%s: hvc_sync_page_cache_region failed for instance %d, "
+					"error code: %d\n",
+					__func__, instance_id, ret);
+				return ret;
+			}
 		}
 
 		pfn_start = (base_addr >> PAGE_SHIFT);
@@ -415,6 +479,7 @@ int create_instance(eq_create_instance_arg_t *arg)
 
 	instance_vdev->id = instance_id;
 	instance_vdev->active = true;
+	instance_vdev->status = STATUS_CREATED;
 
 	// Initialize the SCF queue region list head.
 	INIT_LIST_HEAD(&instance_vdev->scf_region_head);
@@ -480,10 +545,58 @@ int create_instance(eq_create_instance_arg_t *arg)
 		"Created instance %s with ID %d\n", instance_vdev->name,
 		instance_vdev->id);
 
+	// Update the status of the instance: Created, waiting for setup.
+	instance_vdev->status = STATUS_SETTING_UP;
+
 err_free_shm_base:
 	kfree(page_cache_base);
 
 	return ret;
+}
+
+int setup_instance(eq_setup_instance_arg_t *arg)
+{
+	eq_instance_vdev_t *instance_vdev;
+	int ret = 0;
+
+	if (arg->instance_id < 0 || arg->instance_id >= MAX_EQ_INSTANCES_NUM)
+	{
+		ERROR("Invalid instance ID %llu\n", arg->instance_id);
+		return -EINVAL;
+	}
+
+	instance_vdev = &instances_array[arg->instance_id];
+
+	if (!instance_vdev->active)
+	{
+		ERROR(
+			"Instance %s with ID %lld is not active\n", instance_vdev->name,
+			arg->instance_id);
+		return -ENODEV;
+	}
+
+	if (instance_vdev->status != STATUS_SETTING_UP)
+	{
+		ERROR(
+			"Instance %s with ID %lld is not in setting up state, current "
+			"status: "
+			"%d\n",
+			instance_vdev->name, arg->instance_id, instance_vdev->status);
+		return -EBUSY;
+	}
+
+	ret = hvc_setup_instance(arg->instance_id, arg->entry, arg->stack);
+	if (ret < 0)
+	{
+		ERROR(
+			"Failed to setup instance %s with ID %lld, error code: %d\n",
+			instance_vdev->name, arg->instance_id, ret);
+		return ret;
+	}
+
+	instance_vdev->status = STATUS_RUNNING;
+
+	return 0;
 }
 
 int remove_instance(int instance_id)

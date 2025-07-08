@@ -38,3 +38,15 @@ int hvc_load_mmap(
 {
 	return hvc_call(HLoadMMap, instance_id, gva, gpa, len, flags, prot);
 }
+
+int hvc_sync_page_cache_region(
+	__u64 instance_id, __u64 gva, __u64 gpa, __u64 len, __u64 flags, __u64 prot)
+{
+	return hvc_call(
+		HSyncPageCacheRegion, instance_id, gva, gpa, len, flags, prot);
+}
+
+int hvc_setup_instance(__u64 instance_id, __u64 entry, __u64 stack)
+{
+	return hvc_call(HSetupInstance, instance_id, entry, stack, 0, 0, 0);
+}

@@ -26,6 +26,7 @@ eqmanager_ioctl(struct file *file, unsigned int ioctl, unsigned long arg)
 	int ret = 0;
 	eq_create_instance_arg_t create_arg;
 	eq_remove_instance_arg_t remove_arg;
+	eq_setup_instance_arg_t setup_arg;
 
 	switch (ioctl)
 	{
@@ -54,6 +55,26 @@ eqmanager_ioctl(struct file *file, unsigned int ioctl, unsigned long arg)
 		}
 
 		break;
+	case EQ_SETUP_INSTANCE:
+	{
+
+		if (copy_from_user(
+				&setup_arg, (__u64 __user *)arg,
+				sizeof(eq_setup_instance_arg_t)))
+		{
+			ERROR("Failed to setup arg from user space\n");
+			return -EFAULT;
+		}
+		ret = setup_instance(&setup_arg);
+		if (ret < 0)
+		{
+			ERROR("Failed to setup instance: %d\n", ret);
+			return ret;
+		}
+
+		break;
+	}
+
 	case EQ_REMOVE_INSTANCE:
 		if (copy_from_user(
 				&remove_arg, (__u64 __user *)arg,

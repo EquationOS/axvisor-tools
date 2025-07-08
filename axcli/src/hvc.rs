@@ -63,20 +63,3 @@ pub fn hvc_create_instance(
         0,
     )
 }
-
-pub fn hvc_setup_instance(instance_id: u64, entry: u64, stack: u64) -> isize {
-    info!(
-        "[*] Setting up instance with ID: {}, entry: {:#x}, stack: {:#x}",
-        instance_id, entry, stack
-    );
-
-    trigger_hypercall(
-        HyperCallCode::HSetupInstance,
-        instance_id,
-        entry,
-        stack,
-        0,
-        0,
-        0,
-    )
-}

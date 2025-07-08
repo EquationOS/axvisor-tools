@@ -35,10 +35,11 @@ const fn iow<T>(ty: u32, nr: u32) -> u64 {
 
 const EQ_CREATE_INSTANCE: u64 = iow::<eq_create_instance_arg_t>(0, 0);
 const EQ_REMOVE_INSTANCE: u64 = iow::<eq_remove_instance_arg_t>(0, 1);
+const EQ_SETUP_INSTANCE: u64 = iow::<eq_setup_instance_arg_t>(0, 2);
 
 const EQ_DEVICE_NAME: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"/dev/eqmanager\0") };
 
-pub fn ioctl_create_instance() -> Result<usize, String> {
+fn open_eqmanager_dev() -> Result<libc::c_int, String> {
     let fd = unsafe { libc::open(EQ_DEVICE_NAME.as_ptr() as *const c_char, libc::O_RDWR) };
 
     if fd < 0 {
@@ -48,6 +49,12 @@ pub fn ioctl_create_instance() -> Result<usize, String> {
             std::io::Error::last_os_error()
         ));
     }
+
+    Ok(fd)
+}
+
+pub fn ioctl_create_instance() -> Result<usize, String> {
+    let fd = open_eqmanager_dev()?;
 
     let mut arg = eq_create_instance_arg_t {
         instance_id: 0xdeadbeef, // 0 means the kernel will assign an ID
@@ -71,6 +78,29 @@ pub fn ioctl_create_instance() -> Result<usize, String> {
     info!("Instance created successfully, ID: {}", arg.instance_id);
 
     Ok(arg.instance_id as usize)
+}
+
+pub fn ioctl_setup_instance(instance_id: u64, entry: u64, stack: u64) -> Result<(), String> {
+    let fd = open_eqmanager_dev()?;
+
+    let mut arg = eq_setup_instance_arg_t {
+        instance_id,
+        entry,
+        stack,
+    };
+
+    let ret = unsafe { libc::ioctl(fd, EQ_SETUP_INSTANCE as libc::c_ulong, &mut arg as *mut _) };
+
+    if ret < 0 {
+        return Err(format!(
+            "Failed to setup instance {}: {}",
+            instance_id,
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    info!("Instance {} setup successfully", instance_id);
+    Ok(())
 }
 
 pub fn ioctl_remove_instance(instance_id: u64) -> Result<(), String> {
