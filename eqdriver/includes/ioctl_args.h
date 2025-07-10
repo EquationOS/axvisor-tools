@@ -11,6 +11,9 @@
 
 #define MAX_EQ_INSTANCES_NUM (64)
 
+#define MMAP_SCF_MAGIC_NUMBER (0x45534346) // "ESCF"
+#define MMAP_PAGE_CACHE_MAGIC_NUMBER (0x45504350) // "EPCP"
+
 typedef struct eq_create_instance_arg
 {
 	uint64_t instance_id;	// Instance ID, set by kernel driver.
@@ -19,13 +22,6 @@ typedef struct eq_create_instance_arg
 							// one-to-one mapping
 } eq_create_instance_arg_t;
 
-typedef struct eq_setup_instance_arg
-{
-	uint64_t instance_id; // Instance ID
-	uint64_t entry; // Entry point of the instance, parse from ELF file.
-	uint64_t stack; // Initial stack pointer of the instance.
-} eq_setup_instance_arg_t;
-
 typedef struct eq_remove_instance_arg
 {
 	uint64_t instance_id; // Instance ID
@@ -33,4 +29,3 @@ typedef struct eq_remove_instance_arg
 
 #define EQ_CREATE_INSTANCE _IOW(0, 0, eq_create_instance_arg_t)
 #define EQ_REMOVE_INSTANCE _IOW(0, 1, eq_remove_instance_arg_t)
-#define EQ_SETUP_INSTANCE _IOW(0, 2, eq_setup_instance_arg_t)

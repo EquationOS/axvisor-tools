@@ -10,7 +10,6 @@
 
 int create_instance(eq_create_instance_arg_t *arg);
 int remove_instance(int instance_id);
-int setup_instance(eq_setup_instance_arg_t *arg);
 
 void instances_init(void);
 void instances_exit(void);

@@ -2,9 +2,9 @@ use std::ffi::CStr;
 
 use libc::c_void;
 
-use crate::hvc::{hvc_create_instance, hvc_init_shim};
-use crate::ioctl::ioctl_setup_instance;
-use crate::loader;
+use pi_memory_layout::{ArgsLayoutBuilder, ArgsLayoutRef};
+
+use crate::hvc::{hvc_create_instance, hvc_init_shim, hvc_setup_instance};
 use crate::proxy;
 use crate::shared_pages::{copy_content_to_shared_pages, free_shared_pages};
 use crate::{ExecuteArgs, InstanceCreateArgs};
@@ -46,7 +46,9 @@ pub fn create_instance(args: InstanceCreateArgs) {
     free_shared_pages(&mut shared_pages);
 }
 
+/// Remote execute in a instance setup by AxVisor.
 pub fn execute(args: ExecuteArgs) {
+    // First, create the instance through ioctl, eqdriver will trigger the hvc to create the instance.
     let instance_id = crate::ioctl::ioctl_create_instance()
         .expect("Failed to create instance for dynamic loading");
 
@@ -71,20 +73,52 @@ pub fn execute(args: ExecuteArgs) {
         );
     }
 
-    proxy::setup_syscall_proxy_queue_buffer(instance_fd);
+    proxy::setup_proxy_daemon(instance_fd);
 
+    // We need to copy execution metadate to axvisor to start the loader instance.
+    let mut args_builder = ArgsLayoutBuilder::new();
+    // Arguments, arg[0] is the executable file.
+    for arg in &args.exec_args {
+        args_builder.add_argv(arg);
+    }
     // Set EQTEST environment variable
-    let envs = vec!["EQTEST=1".to_string()];
+    args_builder.add_envv("EQTEST=1");
 
-    let (entry, stack) =
-        unsafe { loader::elf::load_app(&args.exec_args, &envs, Some(instance_fd)) };
+    let args_layout = args_builder.build();
 
-    // At this point, we have loaded the application, the ldso,
-    // and set up the stack.
-    info!("Entry point: {:#x}, Stack top: {:#x}", entry, stack);
+    if true {
+        // Print the stack layout for debugging purposes
+        let layout = ArgsLayoutRef::new(args_layout.as_ref(), None);
 
-    ioctl_setup_instance(instance_id as u64, entry as u64, stack as u64)
-        .expect("Failed to setup instance");
+        for (i, arg) in unsafe { layout.argv_iter() }.enumerate() {
+            println!("  [{i}] {}", arg.to_str().unwrap());
+        }
+        for (i, env) in unsafe { layout.envv_iter() }.enumerate() {
+            println!("  [env {i}] {}", env.to_str().unwrap());
+        }
+        for auxv in unsafe { layout.auxv_iter() } {
+            println!("  [auxv] {:?}", auxv);
+        }
+    }
+
+    // Copy the stack layout to axvisor through shared pages
+    // page by page.
+    let mut shared_pages: Vec<*mut c_void> = Vec::new();
+    copy_content_to_shared_pages(&mut shared_pages, args_layout.as_ref());
+
+    let res = hvc_setup_instance(
+        instance_id as _,
+        args_layout.len() as u64,
+        shared_pages.as_ptr() as u64,
+        shared_pages.len() as u64,
+    );
+    if res < 0 {
+        panic!("Failed to setup instance: {}", res);
+    }
+
+    info!("Setup instance success, instance ID = [{}]", instance_id);
+
+    free_shared_pages(&mut shared_pages);
 
     // In the next step, this process will turn into a proxy process of the junction instance,
     // which handles the system calls which can not be handled by the axvisor directly.

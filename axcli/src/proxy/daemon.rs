@@ -1,9 +1,10 @@
 use axerrno::{LinuxError, LinuxResult};
 
+use equation_defs::purple_text;
 use equation_defs::scf::Sysno;
 
 use crate::proxy::fs;
-use crate::proxy::SyscallQueueBuffer;
+use crate::proxy::scf::SyscallQueueBuffer;
 
 pub fn poll() {
     let scf = SyscallQueueBuffer::get();
@@ -29,11 +30,11 @@ macro_rules! color_text {
 
 fn handle_syscall(syscall_id: Sysno, args: &[u64; 6]) -> LinuxResult<u64> {
     warn!(
-        "Handling syscall: {:?}, args: {:x?}",
-        color_text!(format_args!("{syscall_id:?}"), 35),
+        "===Handling syscall: {:?}, args: {:x?}",
+        purple_text!(format_args!("{syscall_id:?}")),
         args
     );
-    match syscall_id {
+    let res = match syscall_id {
         // Handle specific syscalls here
         Sysno::write => fs::proxy_write(args[0], args[1], args[2]),
         Sysno::read => fs::proxy_read(args[0], args[1], args[2]),
@@ -47,5 +48,13 @@ fn handle_syscall(syscall_id: Sysno, args: &[u64; 6]) -> LinuxResult<u64> {
             error!("Unhandled syscall ID: {:?}", syscall_id);
             return Err(LinuxError::ENOSYS);
         }
-    }
+    };
+
+    warn!(
+        "===Syscall: {:?} returned: {:?}",
+        purple_text!(format_args!("{syscall_id:?}")),
+        res
+    );
+
+    res
 }

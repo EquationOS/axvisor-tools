@@ -10,7 +10,6 @@
 #include "includes/eqmanager.h"
 #include "includes/hvc.h"
 #include "includes/instance.h"
-#include "includes/shm.h"
 #include "includes/utils.h"
 
 typedef struct eq_instance_vdev
@@ -30,16 +29,12 @@ typedef struct eq_instance_vdev
 	/// - 1: Setting up, not running yet.
 	/// - 2: Running, the instance is running.
 	int status;
-	/// @brief A linked list of SCF queue regions for this instance.
-	/// This list contains `eqscf_queue_region_t` structures, which represent
-	/// the SCF queue regions for this instance.
-	struct list_head scf_region_head;
-	/// @brief A linked list of page cache memory regions for this instance.
-	/// This list contains `eqshm_t` structures, which represent the page cache
-	/// memory regions for this instance.
-	struct list_head pgcache_list_head;
-	// current pos of eqshm_t in the list
-	eqshm_t *current_pgcache_pool;
+
+	uint64_t scf_region_base_gpa;
+	uint64_t scf_region_size;
+
+	uint64_t page_cache_pool_base_gpa;
+	uint64_t page_cache_pool_size;
 } eq_instance_vdev_t;
 
 static eq_instance_vdev_t instances_array[MAX_EQ_INSTANCES_NUM];
@@ -114,90 +109,20 @@ static int instance_dev_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-static int instance_scf_buf_mmap(struct file *file, struct vm_area_struct *vma)
-{
-	eq_instance_vdev_t *instance_vdev = file->private_data;
-	int ret = 0;
-	pid_t pid = task_pid_nr(current);
-	const char *comm = current->comm;
-	eqscf_queue_region_t *scf_region;
-	unsigned long pfn_start, size;
-
-	INFO(
-		"[%s] called by PID %d (%s) for instance %s", __func__, pid, comm,
-		instance_vdev->name);
-	INFO(
-		"vma start: 0x%lx, end: 0x%lx, pgoff: 0x%lx\n", vma->vm_start,
-		vma->vm_end, vma->vm_pgoff);
-
-	scf_region =
-		get_scf_queue_region_by_host_pid(&instance_vdev->scf_region_head, pid);
-
-	if (!scf_region)
-	{
-		ERROR(
-			"SCF queue region for PID %d (%s) not found in instance %s\n", pid,
-			comm, instance_vdev->name);
-		return -ENODEV;
-	}
-	pfn_start = scf_region->base_gpa >> PAGE_SHIFT;
-	size = scf_region->size;
-
-	INFO(
-		"[%s] SCF queue region for PID %d (%s) found in instance %s, "
-		"base_gpa: 0x%llx, size: 0x%lx\n",
-		__func__, pid, comm, instance_vdev->name, scf_region->base_gpa, size);
-
-	ret =
-		remap_pfn_range(vma, vma->vm_start, pfn_start, size, vma->vm_page_prot);
-
-	if (ret)
-		ERROR(
-			"%s: remap_pfn_range failed at [0x%lx  0x%lx]\n", __func__,
-			vma->vm_start, vma->vm_end);
-
-	return ret;
-}
-
 /// @brief Map the shared memory region for the instance.
 /// This function will be called when `axcli` calls `mmap` on the instance fd
 /// ("/dev/eqinstance_<instance_id>").
-/// It will allocate the shared memory pages and map them to the user space.
 static int instance_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	eq_instance_vdev_t *instance_vdev = file->private_data;
 	int ret = 0;
-	unsigned long pfn_start;
-	unsigned long size;
-	unsigned long prot = pgprot_val(vma->vm_page_prot);
-	unsigned long mapping_vaddr_base;
-
-	__u64 base_addr = 0;
-	unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
-	int requested_page_count = 0;
-	int pages_to_be_mapped = 0;
-	int pages_mapped = 0;
-	int pages_mapping;
-	int pages_allocated = 0;
-	int round = 0;
-	eqshm_t *page_cache_pool = NULL;
-
 	int instance_id = instance_vdev->id;
+	unsigned long pfn_start, mmap_size;
 
 	if (!instance_vdev->active)
 	{
 		ERROR("Instance %s is not active\n", instance_vdev->name);
 		return -ENODEV;
-	}
-
-	if (instance_vdev->status != STATUS_SETTING_UP &&
-		instance_vdev->status != STATUS_RUNNING)
-	{
-		ERROR(
-			"Instance %s with ID %d is not in a valid state for mmap, "
-			"current status: %d\n",
-			instance_vdev->name, instance_id, instance_vdev->status);
-		return -EBUSY;
 	}
 
 	// Check alignment and size
@@ -209,174 +134,78 @@ static int instance_mmap(struct file *file, struct vm_area_struct *vma)
 		return -EINVAL;
 	}
 
+	mmap_size = vma->vm_end - vma->vm_start;
+
 	// Check if the offset is the SCF magic number.
 	// If so, we will map the SCF queue region.
 	// This is a special case for SCF queue regions.
-	if (vma->vm_pgoff == SCF_MAGIC_NUMBER)
+	if (vma->vm_pgoff == MMAP_SCF_MAGIC_NUMBER)
 	{
-		return instance_scf_buf_mmap(file, vma);
-	}
-
-	// Count pages number.
-	requested_page_count = (vma->vm_end - vma->vm_start) >> PAGE_SHIFT;
-
-	pages_to_be_mapped = requested_page_count;
-	pages_mapped = 0;
-	mapping_vaddr_base = vma->vm_start;
-	INFO(
-		"[%s] called by PID %d (%s) for instance %s,", __func__,
-		task_pid_nr(current), current->comm, instance_vdev->name);
-	INFO(
-		" [0x%lx, 0x%lx), offset: 0x%lx vm_pgoff 0x%lx page_num %d\n",
-		vma->vm_start, vma->vm_end, offset, vma->vm_pgoff, pages_to_be_mapped);
-
-	INFO("vm_flags: 0x%lx, vm_page_prot: 0x%lx\n", vma->vm_flags, prot);
-
-	// Set RW permissions for the mapping.
-	// This is necessary for the ELF loader in axcli to write to the
-	// memory region.
-	// The correct permission will be set by `mprotect` in axcli after the
-	// loading is done.
-	prot |= _PAGE_RW;
-	vma->vm_page_prot = __pgprot(prot);
-
-	while (pages_to_be_mapped > 0)
-	{
-		INFO(
-			"round [%d] allocating %d pages for vaddr [0x%lx~0x%lx]\n", round,
-			pages_to_be_mapped, mapping_vaddr_base,
-			mapping_vaddr_base + (pages_to_be_mapped << PAGE_SHIFT));
-		base_addr = (__u64)allocate_contiguous_shm_pages(
-			instance_vdev->current_pgcache_pool, pages_to_be_mapped,
-			&pages_allocated);
-
-		if (base_addr == 0)
-		{
-			if (pages_allocated == 0)
-			{
-				INFO(
-					"Extending page cache pool at [%llx~%llx)\n",
-					(__u64)instance_vdev->current_pgcache_pool->base +
-						instance_vdev->current_pgcache_pool->size,
-					(__u64)instance_vdev->current_pgcache_pool->base +
-						instance_vdev->current_pgcache_pool->size +
-						instance_vdev->current_pgcache_pool->size);
-
-				// Allocate a new page cache memory region.
-				page_cache_pool = allocate_new_page_cache_region(
-					&instance_vdev->pgcache_list_head,
-					(void *)(instance_vdev->current_pgcache_pool->base +
-							 instance_vdev->current_pgcache_pool->size),
-					instance_vdev->current_pgcache_pool->size);
-				if (!page_cache_pool)
-				{
-					ERROR(
-						"Failed to allocate shared memory region for instance "
-						"%d\n",
-						instance_id);
-					ret = -ENOMEM;
-					goto mmap_err;
-				}
-				instance_vdev->current_pgcache_pool = page_cache_pool;
-				continue;
-			}
-			else
-			{
-				WARNING(
-					"Failed to allocate %d pages for instance %d, [0x%lx, "
-					"0x%lx)\n",
-					pages_to_be_mapped, instance_id, mapping_vaddr_base,
-					vma->vm_end);
-				ret = -ENOMEM;
-				goto mmap_err;
-			}
-		}
-		pages_mapping = pages_allocated;
-
-		INFO(
-			"round [%d] allocated %d pages at 0x%llx, vaddr 0x%lx\n", round,
-			pages_mapping, base_addr, mapping_vaddr_base);
-
-		// size = vma->vm_end - vma->vm_start;
-		size = pages_mapping << PAGE_SHIFT;
-
-		if (instance_vdev->status == STATUS_SETTING_UP)
-		{
-			// If the instance is in the setting up state, we need to
-			// sync the mapping with the Instance guest addrspace in AxVisor.
-			// This is necessary for the AxVisor to know about the
-			// memory mapping of the instance.
-			INFO(
-				"Instance %s with ID %d is in setting up state, syncing mmap\n",
-				instance_vdev->name, instance_id);
-			// hvc to sync the mapping with the Instance guest addrspace
-			ret = hvc_load_mmap(
-				instance_id, mapping_vaddr_base, base_addr, size,
-				(__u64)vma->vm_flags, prot);
-			if (ret < 0)
-			{
-				ERROR(
-					"%s: hvc_sync_mmap failed for instance %d, error code: "
-					"%d\n",
-					__func__, instance_id, ret);
-				return ret;
-			}
-		}
-		else if (instance_vdev->status == STATUS_RUNNING)
-		{
-			// If the instance is in the running state, we don't need to
-			// sync the mapping with the Instance guest addrspace in AxVisor.
-			// It's the shim that handles the `mmap` syscall and do the mapping
-			// in the guest address space stored in `ProcessInnerRegion`.
-			// So we just need to call `hvc_sync_page_cache_region` to sync the
-			// page cache region with the AxVisor.
-			INFO(
-				"Instance %s with ID %d is in running state, syncing page "
-				"cache "
-				"region\n",
-				instance_vdev->name, instance_id);
-			// hvc to sync the page cache region with the AxVisor
-			ret = hvc_sync_page_cache_region(
-				instance_id, mapping_vaddr_base, base_addr, size,
-				(__u64)vma->vm_flags, prot);
-			if (ret < 0)
-			{
-				ERROR(
-					"%s: hvc_sync_page_cache_region failed for instance %d, "
-					"error code: %d\n",
-					__func__, instance_id, ret);
-				return ret;
-			}
-		}
-
-		pfn_start = (base_addr >> PAGE_SHIFT);
-
-		INFO(
-			"[remap_pfn_range] virt:0x%lx pfn_start: 0x%lx, offset: 0x%lx, "
-			"size: "
-			"0x%lx (%d pages) flags 0x%lx\n",
-			mapping_vaddr_base, pfn_start, offset, size, pages_mapping,
-			vma->vm_flags);
-
-		ret = remap_pfn_range(
-			vma, mapping_vaddr_base, pfn_start, size, vma->vm_page_prot);
-
-		if (ret)
+		if (mmap_size > instance_vdev->scf_region_size)
 		{
 			ERROR(
-				"%s: remap_pfn_range failed at [0x%lx- 0x%lx] end = 0x%lx. ret "
-				"%d\n",
-				__func__, mapping_vaddr_base, mapping_vaddr_base + size,
-				vma->vm_end, ret);
+				"SCF queue region size 0x%llx is smaller than requested mmap "
+				"size "
+				"0x%lx\n",
+				instance_vdev->scf_region_size, mmap_size);
+			return -EINVAL;
 		}
-
-		pages_to_be_mapped -= pages_mapping;
-		pages_mapped += pages_mapping;
-		mapping_vaddr_base += size;
-		round++;
+		pfn_start = instance_vdev->scf_region_base_gpa >> PAGE_SHIFT;
+		INFO(
+			"[%s] Instance [%d] SCF queue region in instance %s, "
+			"va[0x%lx-0x%lx] size 0x%lx\n",
+			__func__, instance_id, instance_vdev->name, vma->vm_start,
+			vma->vm_end, vma->vm_end - vma->vm_start);
+		INFO(
+			"[%s] Instance [%d] SCF queue region in instance %s, "
+			"map to gpa: [0x%llx~0x%llx] size: 0x%llx\n",
+			__func__, instance_id, instance_vdev->name,
+			instance_vdev->scf_region_base_gpa,
+			instance_vdev->scf_region_base_gpa + instance_vdev->scf_region_size,
+			instance_vdev->scf_region_size);
+	}
+	else if (vma->vm_pgoff == MMAP_PAGE_CACHE_MAGIC_NUMBER)
+	{
+		if (mmap_size > instance_vdev->page_cache_pool_size)
+		{
+			ERROR(
+				"Page cache pool size 0x%llx is smaller than requested mmap "
+				"size "
+				"0x%lx\n",
+				instance_vdev->page_cache_pool_size, mmap_size);
+			return -EINVAL;
+		}
+		pfn_start = instance_vdev->page_cache_pool_base_gpa >> PAGE_SHIFT;
+		INFO(
+			"[%s] Instance [%d] Page cache pool in instance %s, "
+			"va[0x%lx-0x%lx] size 0x%lx\n",
+			__func__, instance_id, instance_vdev->name, vma->vm_start,
+			vma->vm_end, vma->vm_end - vma->vm_start);
+		INFO(
+			"[%s] Instance [%d] Page cache pool in instance %s, "
+			"map to gpa: [0x%llx~0x%llx] size: 0x%llx\n",
+			__func__, instance_id, instance_vdev->name,
+			instance_vdev->page_cache_pool_base_gpa,
+			instance_vdev->page_cache_pool_base_gpa +
+				instance_vdev->page_cache_pool_size,
+			instance_vdev->page_cache_pool_size);
 	}
 
-mmap_err:
+	INFO(
+		"[%s] Instance [%d] remap_pfn_range: va[0x%lx-0x%lx], pgoff 0x%lx\n",
+		__func__, instance_id, vma->vm_start, vma->vm_end, vma->vm_pgoff);
+	INFO(
+		"[%s] Instance [%d] remap_pfn_range: pfn_start 0x%lx,mmap_size 0x%lx\n",
+		__func__, instance_id, pfn_start, mmap_size);
+
+	ret = remap_pfn_range(
+		vma, vma->vm_start, pfn_start, mmap_size, vma->vm_page_prot);
+
+	if (ret)
+		ERROR(
+			"%s: remap_pfn_range failed at [0x%lx  0x%lx]\n", __func__,
+			vma->vm_start, vma->vm_end);
+
 	return ret;
 }
 
@@ -394,51 +223,53 @@ int create_instance(eq_create_instance_arg_t *arg)
 	int instance_id;
 	int ret = 0;
 	eq_instance_vdev_t *instance_vdev;
-	eqshm_t *page_cache_pool;
-	phys_addr_t pg_cache_base_ptr_gpa, scf_queue_base_ptr_gpa;
-	phys_addr_t pg_cache_size_ptr_gpa, scf_queue_size_ptr_gpa;
-	eqscf_queue_region_t *init_scf;
-	__u64 *page_cache_base = kmalloc(sizeof(__u64), GFP_KERNEL);
-	__u64 *page_cache_size = kmalloc(sizeof(__u64), GFP_KERNEL);
-	__u64 *scf_queue_base = kmalloc(sizeof(__u64), GFP_KERNEL);
-	__u64 *scf_queue_size = kmalloc(sizeof(__u64), GFP_KERNEL);
+	__u64 *scf_queue_base, *scf_queue_size;
+	__u64 *page_cache_base, *page_cache_size;
+	phys_addr_t scf_queue_base_ptr_gpa, scf_queue_size_ptr_gpa;
+	phys_addr_t page_cache_base_ptr_gpa, page_cache_size_ptr_gpa;
 
-	pid_t pid = task_pid_nr(current);
-	const char *comm = current->comm;
+	// pid_t pid = task_pid_nr(current);
+	// const char *comm = current->comm;
 
-	INFO("[mmap] called by PID %d (%s)\n", pid, comm);
+	scf_queue_base = kmalloc(sizeof(__u64), GFP_KERNEL);
+	scf_queue_size = kmalloc(sizeof(__u64), GFP_KERNEL);
+	page_cache_base = kmalloc(sizeof(__u64), GFP_KERNEL);
+	page_cache_size = kmalloc(sizeof(__u64), GFP_KERNEL);
 
-	pg_cache_base_ptr_gpa = virt_to_phys(page_cache_base);
+	if (!scf_queue_base || !scf_queue_size || !page_cache_base ||
+		!page_cache_size)
+	{
+		ERROR("Failed to allocate memory\n");
+		ret = -ENOMEM;
+		return ret;
+	}
+
 	scf_queue_base_ptr_gpa = virt_to_phys(scf_queue_base);
-	pg_cache_size_ptr_gpa = virt_to_phys(page_cache_size);
 	scf_queue_size_ptr_gpa = virt_to_phys(scf_queue_size);
-
-	if (!page_cache_base)
-		return -ENOMEM;
-
-	INFO(
-		"page_cache_base gva @ %p, gpa @ %llx\n", page_cache_base,
-		(unsigned long long)pg_cache_base_ptr_gpa);
+	page_cache_base_ptr_gpa = virt_to_phys(page_cache_base);
+	page_cache_size_ptr_gpa = virt_to_phys(page_cache_size);
 
 	// Create a new instance through the hypervisor call.
 	instance_id = hvc_create_instance(
-		arg->instance_type, arg->mapping_type, pg_cache_base_ptr_gpa,
-		pg_cache_size_ptr_gpa, scf_queue_base_ptr_gpa, scf_queue_size_ptr_gpa);
+		arg->instance_type, arg->mapping_type, scf_queue_base_ptr_gpa,
+		scf_queue_size_ptr_gpa, page_cache_base_ptr_gpa,
+		page_cache_size_ptr_gpa);
 
 	INFO(
-		"Creating instance with type %llu, mapping type %llu,"
-		"page_cache_pool base @ 0x%llx, size 0x%llx, "
-		"scf queue base @ 0x%llx, size 0x%llx,\n",
-		arg->instance_type, arg->mapping_type, *page_cache_base,
-		*page_cache_size, *scf_queue_base, *scf_queue_size);
+		"Creating instance with type %llu, mapping type %llu\n"
+		"scf queue base @ 0x%llx, size 0x%llx\n"
+		"page cache base @ 0x%llx, size 0x%llx\n",
+		arg->instance_type, arg->mapping_type, *scf_queue_base, *scf_queue_size,
+		*page_cache_base, *page_cache_size);
 
 	if (instance_id < 0)
 	{
 		ERROR(
-			"Failed to create instance through hypervisor, error code: %d\n",
+			"Failed to create instance through hypervisor, error code: "
+			"%d\n",
 			instance_id);
 		ret = instance_id;
-		goto err_free_shm_base;
+		goto err_free;
 	}
 
 	if (instance_id >= MAX_EQ_INSTANCES_NUM)
@@ -447,11 +278,12 @@ int create_instance(eq_create_instance_arg_t *arg)
 			"Instance ID %d exceeds maximum allowed instances %d\n",
 			instance_id, MAX_EQ_INSTANCES_NUM);
 		ret = -EINVAL;
-		goto err_free_shm_base;
+		goto err_free;
 	}
 	// Set the instance ID in the argument structure,
 	// which will be copied back to user space.
-	// This is necessary for the user space to know the assigned instance ID.
+	// This is necessary for the user space to know the assigned instance
+	// ID.
 	arg->instance_id = (uint64_t)instance_id;
 
 	instance_vdev = &instances_array[arg->instance_id];
@@ -462,7 +294,8 @@ int create_instance(eq_create_instance_arg_t *arg)
 		// instance ID, which means that the instance has been removed
 		// but not yet cleaned up.
 		INFO(
-			"Instance %d is already active, but it was removed, reusing it\n",
+			"Instance %d is already active, but it was removed, reusing "
+			"it\n",
 			instance_id);
 		// Reset the instance vdev to reuse it.
 		remove_instance(instance_id);
@@ -474,53 +307,17 @@ int create_instance(eq_create_instance_arg_t *arg)
 			"Instance %d is already active, cannot create a new one\n",
 			instance_id);
 		ret = -EEXIST;
-		goto err_free_shm_base;
+		goto err_free;
 	}
 
 	instance_vdev->id = instance_id;
 	instance_vdev->active = true;
 	instance_vdev->status = STATUS_CREATED;
 
-	// Initialize the SCF queue region list head.
-	INIT_LIST_HEAD(&instance_vdev->scf_region_head);
-	init_scf = kzalloc(sizeof(eqscf_queue_region_t), GFP_KERNEL);
-	if (!init_scf)
-	{
-		ERROR(
-			"Failed to allocate eqscf_queue_region_t for instance %d\n",
-			instance_id);
-		ret = -ENOMEM;
-		goto err_free_shm_base;
-	}
-	init_scf->base_gpa = *scf_queue_base;
-	init_scf->pid = 1;
-	init_scf->host_pid = pid;
-	init_scf->size = *scf_queue_size;
-	INIT_LIST_HEAD(&init_scf->list);
-	list_add_tail(&init_scf->list, &instance_vdev->scf_region_head);
-
-	INFO(
-		"Initialized SCF queue region for instance %d process %lld, base_gpa: "
-		"0x%llx, size 0x%llx"
-		"host pid: %d (%s)\n",
-		instance_id, init_scf->pid, init_scf->base_gpa, init_scf->size, pid,
-		comm);
-
-	// Initialize the page cache memory list head.
-	INIT_LIST_HEAD(&instance_vdev->pgcache_list_head);
-	// Allocate the first page cache memory region.
-	page_cache_pool = allocate_new_page_cache_region(
-		&instance_vdev->pgcache_list_head, (void *)*page_cache_base,
-		*page_cache_size);
-	if (!page_cache_pool)
-	{
-		ERROR(
-			"Failed to allocate shared memory region for instance %d\n",
-			instance_id);
-		ret = -ENOMEM;
-		goto err_free_shm_base;
-	}
-	instance_vdev->current_pgcache_pool = page_cache_pool;
+	instance_vdev->scf_region_base_gpa = *scf_queue_base;
+	instance_vdev->scf_region_size = *scf_queue_size;
+	instance_vdev->page_cache_pool_base_gpa = *page_cache_base;
+	instance_vdev->page_cache_pool_size = *page_cache_size;
 
 	snprintf(
 		instance_vdev->name, sizeof(instance_vdev->name), "%s%d",
@@ -538,7 +335,7 @@ int create_instance(eq_create_instance_arg_t *arg)
 			"%d\n",
 			instance_vdev->name, instance_vdev->id, ret);
 		instance_vdev->active = false;
-		goto err_free_shm_base;
+		goto err_free;
 	}
 
 	INFO(
@@ -548,55 +345,13 @@ int create_instance(eq_create_instance_arg_t *arg)
 	// Update the status of the instance: Created, waiting for setup.
 	instance_vdev->status = STATUS_SETTING_UP;
 
-err_free_shm_base:
+err_free:
+	kfree(scf_queue_base);
+	kfree(scf_queue_size);
 	kfree(page_cache_base);
+	kfree(page_cache_size);
 
 	return ret;
-}
-
-int setup_instance(eq_setup_instance_arg_t *arg)
-{
-	eq_instance_vdev_t *instance_vdev;
-	int ret = 0;
-
-	if (arg->instance_id < 0 || arg->instance_id >= MAX_EQ_INSTANCES_NUM)
-	{
-		ERROR("Invalid instance ID %llu\n", arg->instance_id);
-		return -EINVAL;
-	}
-
-	instance_vdev = &instances_array[arg->instance_id];
-
-	if (!instance_vdev->active)
-	{
-		ERROR(
-			"Instance %s with ID %lld is not active\n", instance_vdev->name,
-			arg->instance_id);
-		return -ENODEV;
-	}
-
-	if (instance_vdev->status != STATUS_SETTING_UP)
-	{
-		ERROR(
-			"Instance %s with ID %lld is not in setting up state, current "
-			"status: "
-			"%d\n",
-			instance_vdev->name, arg->instance_id, instance_vdev->status);
-		return -EBUSY;
-	}
-
-	ret = hvc_setup_instance(arg->instance_id, arg->entry, arg->stack);
-	if (ret < 0)
-	{
-		ERROR(
-			"Failed to setup instance %s with ID %lld, error code: %d\n",
-			instance_vdev->name, arg->instance_id, ret);
-		return ret;
-	}
-
-	instance_vdev->status = STATUS_RUNNING;
-
-	return 0;
 }
 
 int remove_instance(int instance_id)
@@ -642,22 +397,6 @@ int unregister_instance_dev(eq_instance_vdev_t *vdev)
 	{
 		ERROR("Instance %s is not active\n", vdev->name);
 		return -ENODEV;
-	}
-
-	// Traverse and release shared memory regions
-	eqshm_t *page_cache_pool, *tmp;
-	list_for_each_entry_safe(
-		page_cache_pool, tmp, &vdev->pgcache_list_head, list)
-	{
-		cleanup_page_cache_region(page_cache_pool, &vdev->pgcache_list_head);
-	}
-
-	// Traverse and release SCF queue regions
-	eqscf_queue_region_t *scf_region, *tmp_scf;
-	list_for_each_entry_safe(scf_region, tmp_scf, &vdev->scf_region_head, list)
-	{
-		list_del(&scf_region->list);
-		kfree(scf_region);
 	}
 
 	misc_deregister(&vdev->misc);

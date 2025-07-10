@@ -63,3 +63,25 @@ pub fn hvc_create_instance(
         0,
     )
 }
+
+pub fn hvc_setup_instance(
+    instance_id: u64,
+    file_size: u64,
+    shared_pages_base: u64,
+    shared_pages_num: u64,
+) -> isize {
+    info!(
+        "[*] Setting up instance ID: {}, file size: {}, shared pages base: {:#x}, num: {}",
+        instance_id, file_size, shared_pages_base, shared_pages_num
+    );
+
+    trigger_hypercall(
+        HyperCallCode::HSetupInstance,
+        instance_id,
+        file_size,
+        shared_pages_base,
+        shared_pages_num,
+        0,
+        0,
+    )
+}

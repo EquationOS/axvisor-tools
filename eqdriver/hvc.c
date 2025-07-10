@@ -25,28 +25,11 @@ int hvc_call(
 }
 
 int hvc_create_instance(
-	__u64 instance_type, __u64 mapping_type, __u64 pg_pool_base_ptr,
-	__u64 pg_pool_size_ptr, __u64 scf_queue_base_ptr, __u64 scf_queue_size_ptr)
+	__u64 instance_type, __u64 mapping_type, __u64 scf_queue_base_ptr,
+	__u64 scf_queue_size_ptr, __u64 page_cache_base_ptr,
+	__u64 page_cache_size_ptr)
 {
 	return hvc_call(
-		HCreateInstance, instance_type, mapping_type, pg_pool_base_ptr,
-		pg_pool_size_ptr, scf_queue_base_ptr, scf_queue_size_ptr);
-}
-
-int hvc_load_mmap(
-	__u64 instance_id, __u64 gva, __u64 gpa, __u64 len, __u64 flags, __u64 prot)
-{
-	return hvc_call(HLoadMMap, instance_id, gva, gpa, len, flags, prot);
-}
-
-int hvc_sync_page_cache_region(
-	__u64 instance_id, __u64 gva, __u64 gpa, __u64 len, __u64 flags, __u64 prot)
-{
-	return hvc_call(
-		HSyncPageCacheRegion, instance_id, gva, gpa, len, flags, prot);
-}
-
-int hvc_setup_instance(__u64 instance_id, __u64 entry, __u64 stack)
-{
-	return hvc_call(HSetupInstance, instance_id, entry, stack, 0, 0, 0);
+		HCreateInstance, instance_type, mapping_type, scf_queue_base_ptr,
+		scf_queue_size_ptr, page_cache_base_ptr, page_cache_size_ptr);
 }
