@@ -96,6 +96,12 @@ pub fn setup_syscall_proxy_queue_buffer() {
 
     let meta = SyscallQueueBufferMetadata::construct_mut();
 
+    while !meta.is_valid() {
+        // Wait for the metadata to be valid
+        warn!("Syscall queue buffer metadata is not valid, retrying...");
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+
     // Check if the magic number is valid.
     // This may trigger a page_fault if the memory is not mapped correctly.
     assert!(

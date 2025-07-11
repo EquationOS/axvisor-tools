@@ -73,8 +73,6 @@ pub fn execute(args: ExecuteArgs) {
         );
     }
 
-    proxy::setup_proxy_daemon(instance_fd);
-
     // We need to copy execution metadate to axvisor to start the loader instance.
     let mut args_builder = ArgsLayoutBuilder::new();
     // Arguments, arg[0] is the executable file.
@@ -119,6 +117,8 @@ pub fn execute(args: ExecuteArgs) {
     info!("Setup instance success, instance ID = [{}]", instance_id);
 
     free_shared_pages(&mut shared_pages);
+
+    proxy::setup_proxy_daemon(instance_fd);
 
     // In the next step, this process will turn into a proxy process of the junction instance,
     // which handles the system calls which can not be handled by the axvisor directly.
