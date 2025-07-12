@@ -1,8 +1,9 @@
 use std::{collections::BTreeMap, sync::Mutex};
 
 use axerrno::{LinuxError, LinuxResult};
+use libc::MAP_PRIVATE;
 
-use super::INSTANCE_FD;
+use equation_defs::{PAGE_CACHE_POOL_BASE_VA, PAGE_CACHE_POOL_SIZE};
 
 static FD_LIST: Mutex<BTreeMap<i32, String>> = Mutex::new(BTreeMap::new());
 
@@ -19,7 +20,19 @@ pub fn proxy_access(path_ptr: u64, mode: u64) -> LinuxResult<u64> {
     Ok(unsafe { libc::access(path_ptr as *const i8, mode as i32) } as u64)
 }
 
-pub fn proxy_openat(dirfd: u64, pathname_ptr: u64, flags: u64, mode: u64) -> LinuxResult<u64> {
+/// Proxy the `openat` syscall to handle file opening operations,
+/// I made a little extension to the original `openat` syscall,
+/// it can also handle the `stat` operation by passing a pointer to a `stat`
+/// structure as the last argument.
+///
+/// If the 5th argument `stat_ptr` is not 0, it will fill the `stat` structure with the file information.
+pub fn proxy_openat_with_stat(
+    dirfd: u64,
+    pathname_ptr: u64,
+    flags: u64,
+    mode: u64,
+    stat_ptr: u64,
+) -> LinuxResult<u64> {
     // Convert the pathname pointer to a Rust string
     let pathname = unsafe {
         let cstr = std::ffi::CStr::from_ptr(pathname_ptr as *const i8);
@@ -45,6 +58,11 @@ pub fn proxy_openat(dirfd: u64, pathname_ptr: u64, flags: u64, mode: u64) -> Lin
         info!("Opened file descriptor {} for path: {}", fd, pathname);
         // Store the file descriptor and its path in the FD_LIST
         FD_LIST.lock().unwrap().insert(fd, pathname);
+
+        // If stat_ptr is provided, fill the stat structure
+        if stat_ptr != 0 {
+            proxy_fstat(fd as _, stat_ptr)?;
+        }
     } else {
         error!(
             "Failed to open file at path: {}, fd: {}, error {}",
@@ -172,18 +190,45 @@ pub fn proxy_read(fd: u64, buf_ptr: u64, count: u64) -> LinuxResult<u64> {
     Ok(ret as u64)
 }
 
-pub fn proxy_mmap(
+/// Proxy mmap syscall to copy file contents into the page cache region,
+/// yes, I reuse the arguments of the mmap syscall to pass the parameters,
+/// with the following meanings:
+/// - `addr`: The address in the page cache region where the file content should be copied to
+/// - `length`: The length of the file content to be copied
+/// - `wb_fd`: The file descriptor for writeback, if not used, set to 0
+/// - `wb_offset`: The offset in the writeback file, if not used, set to 0
+/// - `fd`: The file descriptor of the file to be copied
+/// - `offset`: The offset in the file to start copying from
+///
+pub fn proxy_mmap_into_pagecache(
     addr: u64,
     length: u64,
-    prot: u64,
-    flags: u64,
+    wb_fd: u64,     // prot
+    wb_offset: u64, // flags
     fd: u64,
     offset: u64,
 ) -> LinuxResult<u64> {
     info!(
-        "Proxying mmap syscall for addr: {:#x}, length: {:#x}, prot: {:#x}, flags: {:#x}, fd: {}, offset: {:#x}",
-        addr, length, prot, flags, fd, offset
+        "Proxying mmap syscall for addr: {:#x}, length: {:#x}, wb_fd: {:#x}, wb_offset: {:#x}, fd: {}, offset: {:#x}",
+        addr, length, wb_fd, wb_offset, fd, offset
     );
+
+    if wb_fd != 0 {
+        warn!("Writeback {length} Bytes from {addr:#x} to {wb_fd} at offset {wb_offset:#x}, not supported yet");
+        return Err(LinuxError::ENOSYS);
+    }
+
+    if !(PAGE_CACHE_POOL_BASE_VA..PAGE_CACHE_POOL_BASE_VA + PAGE_CACHE_POOL_SIZE)
+        .contains(&(addr as usize))
+    {
+        error!(
+            "Address {:#x} is not within the page cache pool region [{:#x}~{:#x}]",
+            addr,
+            PAGE_CACHE_POOL_BASE_VA,
+            PAGE_CACHE_POOL_BASE_VA + PAGE_CACHE_POOL_SIZE
+        );
+        return Err(LinuxError::EINVAL);
+    }
 
     let mut file_len;
     // Check if the file descriptor exists in the FD_LIST,
@@ -216,16 +261,33 @@ pub fn proxy_mmap(
             0 as *mut libc::c_void, // null
             length as usize,
             libc::PROT_READ,
-            flags as i32 & !libc::MAP_FIXED, // Remove MAP_FIXED to avoid conflicts
+            MAP_PRIVATE,
             fd as i32,
             offset as libc::off_t,
         )
     };
 
+    if offset == 0 {
+        let header = goblin::elf::Elf::parse_header(unsafe {
+            std::slice::from_raw_parts(host_file_mem as *const u8, length as usize)
+        });
+        warn!("Parsed ELF header: {:#x?}", header);
+    }
+
+    debug!(
+        "Mmaped {} bytes from fd: {}, buf_ptr: {:p}, content [{:?}]",
+        length,
+        fd,
+        host_file_mem,
+        escape_c_string_style(unsafe {
+            std::slice::from_raw_parts(host_file_mem as *const u8, 20)
+        })
+    );
+
     if host_file_mem == libc::MAP_FAILED {
         error!(
-        "Proxying mmap syscall for addr: {:#x}, length: {:#x}, prot: {:#x}, flags: {:#x}, fd: {}, offset: {:#x} failed with error: {}",
-        addr, length, prot, flags, fd, offset, std::io::Error::last_os_error()
+        "Proxying mmap syscall for addr: {:#x}, length: {:#x}, fd: {}, offset: {:#x} failed with error: {}",
+        addr, length, fd, offset, std::io::Error::last_os_error()
         );
         return Ok(libc::MAP_FAILED as u64);
     }
@@ -235,19 +297,7 @@ pub fn proxy_mmap(
         host_file_mem as u64, fd, length, offset
     );
 
-    // We do not actually mmap to the file here,
-    // instead, we mmap the requested virtual address to the page cache,
-    // and copy the file content to the page cache that we maintain.
-    let ret = unsafe {
-        libc::mmap(
-            addr as *mut libc::c_void,
-            length as usize,
-            prot as i32,
-            libc::MAP_SHARED | libc::MAP_FIXED,
-            INSTANCE_FD,
-            0, // We use 0 offset for the instance FD
-        )
-    };
+    // Now, copy the content from the host memory to the page cache region at the given address.
 
     if file_len < offset {
         error!(
@@ -258,41 +308,33 @@ pub fn proxy_mmap(
     }
     file_len -= offset; // Adjust file_len to account for the offset
 
-    if ret == libc::MAP_FAILED {
-        error!(
-            "mmap failed with error: {}",
-            std::io::Error::last_os_error()
-        );
-        return Ok(libc::MAP_FAILED as u64);
-    }
-
     let copied_length = if file_len < length { file_len } else { length };
 
     debug!(
-        "Memory mapped at: {:#x}, copied length: {}",
-        ret as u64, copied_length
+        "Page cache pool vaddr at: {:#x}, copied length: {}",
+        addr, copied_length
     );
 
     unsafe {
         libc::memcpy(
-            ret as *mut libc::c_void,
+            addr as *mut libc::c_void,
             host_file_mem,
             copied_length as usize,
         );
     }
     debug!(
-        "Copied {:#x}({}) bytes from host file memory {:#x} to mapped memory [{:#x}~{:#x}]",
+        "Copied {:#x}({}) bytes from host file memory {:#x} to page cache pool [{:#x}~{:#x}]",
         copied_length,
         copied_length,
         host_file_mem as u64,
-        ret as u64,
-        ret as u64 + copied_length as u64
+        addr as u64,
+        addr as u64 + copied_length as u64
     );
 
     if copied_length < length {
         // If the file is shorter than the requested length, zero out the remaining bytes
         let remaining_length = length - copied_length;
-        let zero_ptr = (ret as usize + copied_length as usize) as *mut libc::c_void;
+        let zero_ptr = (addr as usize + copied_length as usize) as *mut libc::c_void;
         debug!(
             "Zeroing out remaining {:#x}({}) bytes at [{:#x}~{:#x}]",
             remaining_length,
@@ -310,7 +352,20 @@ pub fn proxy_mmap(
         libc::munmap(host_file_mem, length as usize);
     }
 
-    Ok(ret as u64)
+    use equation_defs::page_cache::checksum::calculate_checksum;
+
+    let checksum = calculate_checksum(unsafe {
+        core::slice::from_raw_parts(addr as *const u8, length as usize)
+    });
+
+    debug!(
+        "Calculated checksum for mmap region [{:#x}~{:#x}] is {:#x}",
+        addr as u64,
+        addr as u64 + length as u64,
+        checksum
+    );
+
+    Ok(checksum as u64)
 }
 
 pub fn proxy_pread64(fd: u64, buf_ptr: u64, count: u64, offset: u64) -> LinuxResult<u64> {

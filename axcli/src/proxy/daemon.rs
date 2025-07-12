@@ -39,10 +39,12 @@ fn handle_syscall(syscall_id: Sysno, args: &[u64; 6]) -> LinuxResult<u64> {
         Sysno::write => fs::proxy_write(args[0], args[1], args[2]),
         Sysno::read => fs::proxy_read(args[0], args[1], args[2]),
         Sysno::access => fs::proxy_access(args[0], args[1]),
-        Sysno::openat => fs::proxy_openat(args[0], args[1], args[2], args[3]),
+        Sysno::openat => fs::proxy_openat_with_stat(args[0], args[1], args[2], args[3], args[4]),
         Sysno::fstat => fs::proxy_fstat(args[0], args[1]),
         Sysno::close => fs::proxy_close(args[0]),
-        Sysno::mmap => fs::proxy_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
+        Sysno::mmap => {
+            fs::proxy_mmap_into_pagecache(args[0], args[1], args[2], args[3], args[4], args[5])
+        }
         Sysno::pread64 => fs::proxy_pread64(args[0], args[1], args[2], args[3]),
         _ => {
             error!("Unhandled syscall ID: {:?}", syscall_id);

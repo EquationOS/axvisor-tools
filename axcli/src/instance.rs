@@ -120,9 +120,9 @@ pub fn execute(args: ExecuteArgs) {
 
     proxy::setup_proxy_daemon(instance_fd);
 
-    // In the next step, this process will turn into a proxy process of the junction instance,
+    // In the next step, this process will turn into a daemon proxy process of the junction instance,
     // which handles the system calls which can not be handled by the axvisor directly.
-    proxy::poll();
+    proxy::daemon::poll();
 }
 
 pub fn remove_instance(instance_id: u64) {

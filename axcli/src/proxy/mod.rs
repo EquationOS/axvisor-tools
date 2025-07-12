@@ -1,4 +1,4 @@
-mod daemon;
+pub mod daemon;
 
 mod fs;
 #[allow(unused)]
@@ -6,8 +6,6 @@ mod mm;
 
 mod page_cache;
 mod scf;
-
-pub use daemon::poll;
 
 static mut INSTANCE_FD: i32 = -1;
 
