@@ -1,6 +1,6 @@
 use core::panic;
 
-use goblin::{elf::Elf, pe::debug};
+use goblin::elf::Elf;
 use libc::*;
 
 use linux_libc_auxv::{AuxVar, AuxVarFlags, StackLayoutBuilder, StackLayoutRef};
@@ -12,7 +12,7 @@ use equation_defs::{USER_LDSO_BASE_VA, USER_PIE_BASE_VA, USER_STACK_SIZE, USER_S
 // const PIE_BASE: usize = 0x40000000;
 // const LDSO_BASE: usize = 0x7f0000000000;
 
-unsafe fn mmap_segment(base: usize, ph: &goblin::elf::ProgramHeader, fd: i32) {
+unsafe fn mmap_segment(base: usize, ph: &goblin::elf::ProgramHeader, elf_data: &[u8], fd: i32) {
     let vaddr = base + ph.p_vaddr as usize;
     let memsz = ph.p_memsz as usize;
     let filesz = ph.p_filesz as usize;
@@ -27,8 +27,6 @@ unsafe fn mmap_segment(base: usize, ph: &goblin::elf::ProgramHeader, fd: i32) {
     let end_addr = (vaddr + memsz + 0xfff) & !0xfff;
     let size = end_addr - aligned_addr;
 
-    let (fd, prot, flags) = (fd, prot | PROT_WRITE, MAP_PRIVATE | MAP_FIXED);
-
     debug!(
         "[*] Mapping fd {} segment: vaddr={:#x}, prot={:#x}, offset={:#x}, memsz={:#x}, filesz={:#x}",
         fd, vaddr, prot, offset, memsz, filesz
@@ -41,10 +39,10 @@ unsafe fn mmap_segment(base: usize, ph: &goblin::elf::ProgramHeader, fd: i32) {
     let ret = mmap(
         aligned_addr as *mut c_void,
         size,
-        prot as c_int,
-        flags as c_int,
-        fd,
-        aligned_offset as i64,
+        (prot | PROT_WRITE) as c_int,
+        (MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED) as c_int,
+        -1,
+        0,
     );
     assert_ne!(ret, MAP_FAILED);
 
@@ -52,6 +50,12 @@ unsafe fn mmap_segment(base: usize, ph: &goblin::elf::ProgramHeader, fd: i32) {
         ret as usize, aligned_addr,
         "mmap returned unexpected address: expected {:#x}, got {:#x}",
         aligned_addr, ret as usize
+    );
+
+    std::ptr::copy_nonoverlapping(
+        elf_data[offset..offset + filesz].as_ptr(),
+        vaddr as *mut u8,
+        filesz,
     );
 
     if memsz > filesz {
@@ -146,7 +150,7 @@ unsafe fn mmap_elf(path: &str, base: usize) -> (Elf<'static>, usize, Option<Stri
         .iter()
         .filter(|ph| ph.p_type == goblin::elf::program_header::PT_LOAD)
     {
-        unsafe { mmap_segment(base, ph, fd) };
+        unsafe { mmap_segment(base, ph, elf_data, fd) };
     }
 
     if let Some(interp_ph) = elf
@@ -267,21 +271,6 @@ unsafe fn setup_stack_with_args(
     let (sp, stack_size) = stack_builder.build_on_stack(stack_top);
 
     info!("[*] Stack layout: @{:#x}, size: {:#x}", sp, stack_size);
-
-    let layout = StackLayoutRef::new(
-        unsafe { core::slice::from_raw_parts_mut(sp as *mut u8, stack_size) },
-        None,
-    );
-
-    for (i, arg) in unsafe { layout.argv_iter() }.enumerate() {
-        info!("  [{i}] {}", arg.to_str().unwrap());
-    }
-    for (i, env) in unsafe { layout.envv_iter() }.enumerate() {
-        info!("  [env {i}] {}", env.to_str().unwrap());
-    }
-    for auxv in unsafe { layout.auxv_iter() } {
-        info!("  [auxv] {:?}", auxv);
-    }
 
     let layout = StackLayoutRef::new(
         unsafe { core::slice::from_raw_parts_mut(sp as *mut u8, stack_size) },
