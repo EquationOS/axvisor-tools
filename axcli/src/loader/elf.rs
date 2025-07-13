@@ -1,11 +1,6 @@
 use core::panic;
-use std::fmt::Debug;
-use std::fs::File;
-use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
-use goblin::elf::Elf;
+use goblin::{elf::Elf, pe::debug};
 use libc::*;
 
 use linux_libc_auxv::{AuxVar, AuxVarFlags, StackLayoutBuilder, StackLayoutRef};
@@ -17,7 +12,7 @@ use equation_defs::{USER_LDSO_BASE_VA, USER_PIE_BASE_VA, USER_STACK_SIZE, USER_S
 // const PIE_BASE: usize = 0x40000000;
 // const LDSO_BASE: usize = 0x7f0000000000;
 
-unsafe fn mmap_segment(base: usize, ph: &goblin::elf::ProgramHeader, data: &[u8], fd: Option<i32>) {
+unsafe fn mmap_segment(base: usize, ph: &goblin::elf::ProgramHeader, fd: i32) {
     let vaddr = base + ph.p_vaddr as usize;
     let memsz = ph.p_memsz as usize;
     let filesz = ph.p_filesz as usize;
@@ -28,40 +23,46 @@ unsafe fn mmap_segment(base: usize, ph: &goblin::elf::ProgramHeader, data: &[u8]
         | (if ph.is_executable() { PROT_EXEC } else { 0 });
 
     let aligned_addr = vaddr & !0xfff;
+    let aligned_offset = offset & !0xfff;
     let end_addr = (vaddr + memsz + 0xfff) & !0xfff;
     let size = end_addr - aligned_addr;
 
-    let (fd, prot, flags) = if let Some(fd) = fd {
-        (fd, prot, MAP_SHARED | MAP_FIXED)
-    } else {
-        // If no file descriptor is provided, use -1 for anonymous mapping
-        (
-            -1,
-            PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
-        )
-    };
+    let (fd, prot, flags) = (fd, prot | PROT_WRITE, MAP_PRIVATE | MAP_FIXED);
 
-    trace!(
-        "[*] Mapping fd {} segment: vaddr={:#x}, size={:#x}, prot={:#x}, offset={:#x}, memsz={:#x}, filesz={:#x}", 
-        fd, vaddr, size, prot, offset, memsz, filesz
+    debug!(
+        "[*] Mapping fd {} segment: vaddr={:#x}, prot={:#x}, offset={:#x}, memsz={:#x}, filesz={:#x}",
+        fd, vaddr, prot, offset, memsz, filesz
+    );
+    debug!(
+        "[*] Mapping segment: vaddr={:#x}, size={:#x}, offset={:#x}",
+        aligned_addr, size, aligned_offset
     );
 
-    let ret = mmap(aligned_addr as *mut c_void, size, prot, flags, fd, 0);
+    let ret = mmap(
+        aligned_addr as *mut c_void,
+        size,
+        prot as c_int,
+        flags as c_int,
+        fd,
+        aligned_offset as i64,
+    );
     assert_ne!(ret, MAP_FAILED);
 
-    if ret as usize == 0 {
-        info!("This is exactly what we want, mmap returned 0");
-        return;
-    } else {
-        info!("Get ret from mmap: {:#p}", ret);
-    }
-
-    std::ptr::copy_nonoverlapping(
-        data[offset..offset + filesz].as_ptr(),
-        vaddr as *mut u8,
-        filesz,
+    assert_eq!(
+        ret as usize, aligned_addr,
+        "mmap returned unexpected address: expected {:#x}, got {:#x}",
+        aligned_addr, ret as usize
     );
+
+    if memsz > filesz {
+        let zero_start = vaddr + filesz;
+        let zero_len = memsz - filesz;
+        debug!(
+            "[*] Zeroing out segment: start={:#x}, length={:#x}",
+            zero_start, zero_len
+        );
+        core::ptr::write_bytes(zero_start as *mut u8, 0, zero_len);
+    }
 }
 
 unsafe fn mprotect_segment(base: usize, ph: &goblin::elf::ProgramHeader) {
@@ -78,27 +79,62 @@ unsafe fn mprotect_segment(base: usize, ph: &goblin::elf::ProgramHeader) {
     let end_addr = (vaddr + memsz + 0xfff) & !0xfff;
     let size = end_addr - aligned_addr;
 
-    trace!(
+    debug!(
         "[*] Protecting segment: vaddr={:#x}, size={:#x}, prot={:#x}, offset={:#x}, memsz={:#x}, filesz={:#x}",
         vaddr, size, prot, offset, memsz, filesz
     );
 
-    let mprotect_ret = mprotect(aligned_addr as *mut c_void, size, prot);
+    let mprotect_ret = mprotect(aligned_addr as *mut c_void, size, prot as c_int);
     assert_eq!(mprotect_ret, 0, "Failed to set memory protection");
 }
 
-unsafe fn mmap_elf<P: AsRef<Path> + Debug>(
-    path: P,
-    base: usize,
-    fd: Option<i32>,
-) -> (Elf<'static>, usize, &'static [u8], Option<PathBuf>) {
-    info!("[*] Loading ELF: {:?}, fd {:?}", path, fd);
-    let mut file = File::open(&path).expect("Failed to open ELF");
-    let mut data = Vec::new();
-    file.read_to_end(&mut data).unwrap();
-    let boxed = data.into_boxed_slice();
-    let static_ref = Box::leak(boxed);
-    let elf = Elf::parse(static_ref).expect("Failed to parse ELF");
+unsafe fn mmap_elf(path: &str, base: usize) -> (Elf<'static>, usize, Option<String>) {
+    info!("[*] Loading ELF: {:?}", path);
+
+    let mut path_string: String = path.into();
+    if let Some(pos) = path_string.find('\0') {
+        assert_eq!(
+            pos,
+            path_string.len() - 1,
+            "strings must not contain interim NUL bytes"
+        );
+    }
+
+    if !path_string.ends_with('\0') {
+        path_string.push('\0');
+    }
+
+    let fd = openat(
+        AT_FDCWD,
+        path_string.as_ptr() as *const c_char,
+        O_RDONLY | O_CLOEXEC,
+    );
+    assert!(fd >= 2, "Failed to open ELF file: {path}, error code {fd}",);
+
+    let mut stat: stat = unsafe { core::mem::zeroed() };
+
+    let res = fstat(fd, &mut stat);
+    assert_eq!(res, 0, "Failed to fstat ELF file: {path}, error {res}");
+
+    let file_length = stat.st_size as usize;
+
+    let data = mmap(
+        0 as *mut c_void,
+        file_length,
+        PROT_READ as c_int,
+        MAP_PRIVATE as c_int,
+        fd as c_int,
+        0,
+    );
+
+    assert_ne!(data, MAP_FAILED, "Failed to mmap ELF file: {}", path);
+    info!(
+        "[*] Mapped ELF file: {} at address {:#x}",
+        path, data as usize
+    );
+    let elf_data = unsafe { core::slice::from_raw_parts(data as *const u8, file_length) };
+
+    let elf = Elf::parse(elf_data).expect("Failed to parse ELF");
 
     let is_pie = elf.header.e_type == goblin::elf::header::ET_DYN;
     let base = if is_pie { base } else { 0 };
@@ -110,7 +146,7 @@ unsafe fn mmap_elf<P: AsRef<Path> + Debug>(
         .iter()
         .filter(|ph| ph.p_type == goblin::elf::program_header::PT_LOAD)
     {
-        mmap_segment(base, ph, static_ref, fd);
+        unsafe { mmap_segment(base, ph, fd) };
     }
 
     if let Some(interp_ph) = elf
@@ -123,12 +159,12 @@ unsafe fn mmap_elf<P: AsRef<Path> + Debug>(
         let size = interp_ph.p_filesz as usize;
 
         // Print the interpreter string
-        let interp_str = std::str::from_utf8(
-            &static_ref[interp_ph.p_offset as usize..interp_ph.p_offset as usize + size - 1],
+        let interp_str = core::str::from_utf8(
+            &elf_data[interp_ph.p_offset as usize..interp_ph.p_offset as usize + size - 1],
         )
         .unwrap_or("<invalid>");
 
-        interp_path = Some(PathBuf::from_str(interp_str).unwrap());
+        interp_path = Some(String::from(interp_str));
 
         // interp_path = Some(interp_str.to_string());
         info!("[*] Interpreter: {:?}", interp_path);
@@ -137,7 +173,9 @@ unsafe fn mmap_elf<P: AsRef<Path> + Debug>(
             "[*] Clearing PT_INTERP segment at 0x{:x}, size {}",
             interp_addr, size
         );
-        std::ptr::write_bytes(interp_addr as *mut u8, 0, size);
+        unsafe {
+            core::ptr::write_bytes(interp_addr as *mut u8, 0, size);
+        }
         warn!(
             "[*] Cleared PT_INTERP segment at 0x{:x}, size {}",
             interp_addr, size
@@ -149,26 +187,24 @@ unsafe fn mmap_elf<P: AsRef<Path> + Debug>(
         .iter()
         .filter(|ph| ph.p_type == goblin::elf::program_header::PT_LOAD)
     {
-        mprotect_segment(base, ph);
+        unsafe { mprotect_segment(base, ph) };
     }
 
+    let res = close(fd);
+    assert_eq!(res, 0, "Failed to close ELF file: {path} error {res}");
+
     println!("[*] Loaded ELF: {:?}", path);
-    (elf, base, static_ref, interp_path)
+    (elf, base, interp_path)
 }
 
-unsafe fn setup_raw_stack(fd: Option<i32>) -> *mut c_void {
-    let (fd, flags) = if let Some(fd) = fd {
-        (fd, MAP_SHARED | MAP_FIXED)
-    } else {
-        // If no file descriptor is provided, use -1 for anonymous mapping
-        (-1, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED)
-    };
+unsafe fn setup_raw_stack() -> *mut c_void {
+    let (fd, flags) = (-1, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED);
 
     let stack = mmap(
         (USER_STACK_TOP_VA - USER_STACK_SIZE) as *mut c_void, // Start of the stack
         USER_STACK_SIZE,
-        PROT_READ | PROT_WRITE,
-        flags,
+        (PROT_READ | PROT_WRITE) as c_int,
+        flags as c_int,
         fd,
         0,
     );
@@ -187,14 +223,8 @@ unsafe fn setup_stack_with_args(
     entry: *mut u8,
     phdr: *mut u8,
     ldso_base: *mut u8,
-    fd: Option<i32>,
 ) -> *mut c_void {
-    let (fd, flags) = if let Some(fd) = fd {
-        (fd, MAP_SHARED | MAP_FIXED)
-    } else {
-        // If no file descriptor is provided, use -1 for anonymous mapping
-        (-1, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED)
-    };
+    let (fd, flags) = (-1, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED);
 
     let stack = mmap(
         (USER_STACK_TOP_VA - USER_STACK_SIZE) as *mut c_void, // Start of the stack
@@ -223,6 +253,8 @@ unsafe fn setup_stack_with_args(
         *byte = index as u8; // Fill with dummy data for now
     }
 
+    warn!("random_bytes: @{:#p}", &random_bytes);
+
     stack_builder.add_auxv(AuxVar::Pagesz(4096)); // 4KB page size
     stack_builder.add_auxv(AuxVar::Phdr(phdr));
     stack_builder.add_auxv(AuxVar::Phent(elf.header.e_phentsize as usize));
@@ -242,13 +274,28 @@ unsafe fn setup_stack_with_args(
     );
 
     for (i, arg) in unsafe { layout.argv_iter() }.enumerate() {
-        println!("  [{i}] {}", arg.to_str().unwrap());
+        info!("  [{i}] {}", arg.to_str().unwrap());
     }
     for (i, env) in unsafe { layout.envv_iter() }.enumerate() {
-        println!("  [env {i}] {}", env.to_str().unwrap());
+        info!("  [env {i}] {}", env.to_str().unwrap());
     }
     for auxv in unsafe { layout.auxv_iter() } {
-        println!("  [auxv] {:?}", auxv);
+        info!("  [auxv] {:?}", auxv);
+    }
+
+    let layout = StackLayoutRef::new(
+        unsafe { core::slice::from_raw_parts_mut(sp as *mut u8, stack_size) },
+        None,
+    );
+
+    for (i, arg) in unsafe { layout.argv_iter() }.enumerate() {
+        info!("  [{i}] {}", arg.to_str().unwrap());
+    }
+    for (i, env) in unsafe { layout.envv_iter() }.enumerate() {
+        info!("  [env {i}] {}", env.to_str().unwrap());
+    }
+    for auxv in unsafe { layout.auxv_iter() } {
+        info!("  [auxv] {:?}", auxv);
     }
 
     info!(
@@ -275,7 +322,7 @@ unsafe fn setup_stack_with_args(
 /// ## Returns
 /// - A tuple containing the entry point address and the stack pointer address.
 ///
-pub unsafe fn load_app(args: &Vec<String>, envs: &Vec<String>, fd: Option<i32>) -> (usize, usize) {
+pub unsafe fn load_app(args: &Vec<String>, envs: &Vec<String>) -> (usize, usize) {
     if args.is_empty() {
         panic!("No application path provided");
     }
@@ -286,12 +333,10 @@ pub unsafe fn load_app(args: &Vec<String>, envs: &Vec<String>, fd: Option<i32>) 
 
     let app_path = args[0].clone();
 
-    let (app_elf, app_base, _, interp_path) =
-        unsafe { mmap_elf(app_path.as_str(), USER_PIE_BASE_VA, fd) };
+    let (app_elf, app_base, interp_path) = unsafe { mmap_elf(app_path.as_str(), USER_PIE_BASE_VA) };
 
     let (entry, stack) = if let Some(interp_path) = interp_path {
-        let (ldso_elf, ldso_base, _, path) =
-            unsafe { mmap_elf(&interp_path, USER_LDSO_BASE_VA, fd) };
+        let (ldso_elf, ldso_base, path) = unsafe { mmap_elf(&interp_path, USER_LDSO_BASE_VA) };
         if let Some(path) = path {
             panic!(
                 "[*] Found interpreter: {:?} for interp {:?}",
@@ -319,12 +364,11 @@ pub unsafe fn load_app(args: &Vec<String>, envs: &Vec<String>, fd: Option<i32>) 
                 entry as *mut u8,
                 phdr as *mut u8,
                 ldso_base as *mut u8,
-                fd,
             )
         };
         (ldso_base + ldso_elf.entry as usize, stack as usize)
     } else {
-        let stack = unsafe { setup_raw_stack(fd) };
+        let stack = unsafe { setup_raw_stack() };
 
         (app_base + app_elf.entry as usize, stack as usize)
     };
@@ -334,9 +378,14 @@ pub unsafe fn load_app(args: &Vec<String>, envs: &Vec<String>, fd: Option<i32>) 
 pub(super) fn local_execute_app(app_args: &Vec<String>) {
     let envp = vec![];
 
-    let (entry, stack) = unsafe { load_app(app_args, &envp, None) };
+    let (entry, stack) = unsafe { load_app(app_args, &envp) };
 
-    println!("[*] Jumping to entry: 0x{:x}, stack {:#x}", entry, stack);
+    jumping(entry, stack)
+}
+
+#[no_mangle]
+fn jumping(entry: usize, stack: usize) -> ! {
+    println!("[*] Jumping to entry {:#x}, stack {:#x}", entry, stack);
     unsafe {
         core::arch::asm! {
             "mov rsp, {0}",

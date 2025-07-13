@@ -100,19 +100,46 @@ struct ExecuteArgs {
 use libc::{c_void, sigaction, siginfo_t, SA_SIGINFO, SIGBUS};
 use std::ptr;
 
-extern "C" fn sigbus_handler(_sig: i32, info: *mut siginfo_t, _: *mut c_void) {
+extern "C" fn sigbus_handler(_sig: i32, info: *mut siginfo_t, context: *mut c_void) {
     unsafe {
-        eprintln!("Caught SIGBUS at address: {:?}", (*info).si_addr());
+        let ucontext = &*(context as *mut libc::ucontext_t);
+        let pc = ucontext.uc_mcontext.gregs[libc::REG_RIP as usize];
+        eprintln!(
+            "Caught SIGBUS at address: {:?}, program counter: 0x{:x}",
+            (*info).si_addr(),
+            pc
+        );
         std::process::exit(1);
     }
 }
 
-fn install_sigbus_handler() {
+extern "C" fn sigsegv_handler(_sig: i32, info: *mut siginfo_t, context: *mut c_void) {
+    unsafe {
+        let ucontext = &*(context as *mut libc::ucontext_t);
+        let pc = ucontext.uc_mcontext.gregs[libc::REG_RIP as usize];
+        eprintln!(
+            "Caught SIGSEGV at address: {:?}, program counter: 0x{:x}",
+            (*info).si_addr(),
+            pc
+        );
+        std::process::exit(1);
+    }
+}
+
+fn install_signal_handlers() {
     unsafe {
         let mut sa: sigaction = std::mem::zeroed();
+
+        // Install SIGBUS handler
         sa.sa_sigaction = sigbus_handler as usize;
         sa.sa_flags = SA_SIGINFO;
         sigaction(SIGBUS, &sa, ptr::null_mut());
+
+        // Install SIGSEGV handler
+        sa = std::mem::zeroed();
+        sa.sa_sigaction = sigsegv_handler as usize;
+        sa.sa_flags = SA_SIGINFO;
+        sigaction(libc::SIGSEGV, &sa, ptr::null_mut());
     }
 }
 
@@ -122,7 +149,7 @@ fn main() {
         .filter_level(log::LevelFilter::Trace)
         .init();
 
-    install_sigbus_handler();
+    install_signal_handlers();
 
     let cli = CLI::parse();
     match cli.subcmd {
