@@ -146,7 +146,7 @@ fn install_signal_handlers() {
 fn main() {
     // configure logger and set log level
     env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Trace)
+        .filter_level(log::LevelFilter::Debug)
         .init();
 
     install_signal_handlers();

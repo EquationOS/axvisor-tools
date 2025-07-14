@@ -3,8 +3,8 @@ use axerrno::{LinuxError, LinuxResult};
 use equation_defs::purple_text;
 use equation_defs::scf::Sysno;
 
-use crate::proxy::{fs, misc};
 use crate::proxy::scf::SyscallQueueBuffer;
+use crate::proxy::{fs, misc};
 
 pub fn poll() {
     let scf = SyscallQueueBuffer::get();
@@ -29,7 +29,7 @@ macro_rules! color_text {
 }
 
 fn handle_syscall(syscall_id: Sysno, args: &[u64; 6]) -> LinuxResult<u64> {
-    warn!(
+    trace!(
         "===Handling syscall: {:?}, args: {:x?}",
         purple_text!(format_args!("{syscall_id:?}")),
         args
@@ -53,7 +53,7 @@ fn handle_syscall(syscall_id: Sysno, args: &[u64; 6]) -> LinuxResult<u64> {
         }
     };
 
-    warn!(
+    trace!(
         "===Syscall: {:?} returned: {:?}",
         purple_text!(format_args!("{syscall_id:?}")),
         res

@@ -14,7 +14,7 @@ pub fn proxy_access(path_ptr: u64, mode: u64) -> LinuxResult<u64> {
         cstr.to_string_lossy().into_owned()
     };
 
-    info!("Accessing path: \"{}\" mode: {:#x}", path, mode);
+    debug!("Accessing path: \"{}\" mode: {:#x}", path, mode);
 
     // Call the actual filesystem access function
     Ok(unsafe { libc::access(path_ptr as *const i8, mode as i32) } as u64)
@@ -39,7 +39,7 @@ pub fn proxy_openat_with_stat(
         cstr.to_string_lossy().into_owned()
     };
 
-    info!(
+    debug!(
         "Proxying openat syscall for dirfd: {:#x}, path: \"{}\", flags: {:#x}, mode: {:#x}",
         dirfd, pathname, flags, mode
     );
@@ -55,7 +55,7 @@ pub fn proxy_openat_with_stat(
     };
 
     if fd > 0 {
-        info!("Opened file descriptor {} for path: {}", fd, pathname);
+        trace!("Opened file descriptor {} for path: {}", fd, pathname);
         // Store the file descriptor and its path in the FD_LIST
         FD_LIST.lock().unwrap().insert(fd, pathname);
 
@@ -77,17 +77,27 @@ pub fn proxy_openat_with_stat(
 
 pub fn proxy_fstat(fd: u64, stat_ptr: u64) -> LinuxResult<u64> {
     // Check if the file descriptor exists in the FD_LIST
-    if let Some(path) = FD_LIST.lock().unwrap().get(&(fd as i32)) {
-        info!("File descriptor {} corresponds to path: {}", fd, path);
+    let path: String = if let Some(path) = FD_LIST.lock().unwrap().get(&(fd as i32)) {
+        trace!("File descriptor {} corresponds to path: {}", fd, path);
+        path.clone()
+    } else if (0..=2).contains(&(fd as i32)) {
+        // Special case for stdin, stdout, stderr
+        trace!(
+            "File descriptor {} is a special file (stdin/stdout/stderr)",
+            fd
+        );
+        match fd {
+            0 => String::from("stdin"),
+            1 => String::from("stdout"),
+            2 => String::from("stderr"),
+            _ => unreachable!(),
+        }
     } else {
         warn!("File descriptor {} not found in FD_LIST", fd);
         return Err(LinuxError::ENOENT);
-    }
+    };
 
-    info!(
-        "Proxying fstat syscall for fd: {}, stat_ptr: {:#x}",
-        fd, stat_ptr
-    );
+    debug!("Proxying fstat syscall for fd:{fd} \"{path}\" stat_ptr: {stat_ptr:#x}",);
 
     // Call the actual filesystem fstat function
     let ret = unsafe { libc::fstat(fd as i32, stat_ptr as *mut libc::stat) };
@@ -97,29 +107,35 @@ pub fn proxy_fstat(fd: u64, stat_ptr: u64) -> LinuxResult<u64> {
 
 pub fn proxy_close(fd: u64) -> LinuxResult<u64> {
     // Check if the file descriptor exists in the FD_LIST
-    if let Some(path) = FD_LIST.lock().unwrap().remove(&(fd as i32)) {
-        info!("Proxying close syscall for fd {} for path: {}", fd, path);
+    let path = if let Some(path) = FD_LIST.lock().unwrap().remove(&(fd as i32)) {
+        path
     } else {
         warn!("File descriptor {} not found in FD_LIST", fd);
         return Err(LinuxError::ENOENT);
-    }
+    };
 
     // Call the actual filesystem close function
     let ret = unsafe { libc::close(fd as i32) };
+
+    debug!(
+        "Proxying close syscall for fd: {}, path: \"{}\", result: {}",
+        fd, path, ret
+    );
 
     Ok(ret as u64)
 }
 
 pub fn proxy_write(fd: u64, buf_ptr: u64, count: u64) -> LinuxResult<u64> {
     // Check if the file descriptor exists in the FD_LIST
-    if let Some(path) = FD_LIST.lock().unwrap().get(&(fd as i32)) {
-        info!("File descriptor {} corresponds to path: {}", fd, path);
+    let path = if let Some(path) = FD_LIST.lock().unwrap().get(&(fd as i32)) {
+        trace!("File descriptor {} corresponds to path: {}", fd, path);
+        path.clone()
     } else {
         warn!("File descriptor {} not found in FD_LIST", fd);
         return Err(LinuxError::ENOENT);
-    }
+    };
 
-    info!(
+    trace!(
         "Proxying write syscall for fd: {}, buf_ptr: {:#x}, count: {}, content: {:?}",
         fd,
         buf_ptr,
@@ -130,7 +146,10 @@ pub fn proxy_write(fd: u64, buf_ptr: u64, count: u64) -> LinuxResult<u64> {
     // Call the actual filesystem write function
     let ret = unsafe { libc::write(fd as i32, buf_ptr as *const libc::c_void, count as usize) };
 
-    debug!("Wrote {} bytes to fd: {}, buf_ptr: {:#x}", ret, fd, buf_ptr);
+    debug!(
+        "Wrote {} bytes to fd:{}, path \"{path}\" buf_ptr: {:#x}",
+        ret, fd, buf_ptr
+    );
 
     if ret < 0 {
         error!(
@@ -157,22 +176,25 @@ fn escape_c_string_style(bytes: &[u8]) -> String {
 
 pub fn proxy_read(fd: u64, buf_ptr: u64, count: u64) -> LinuxResult<u64> {
     // Check if the file descriptor exists in the FD_LIST
-    if let Some(path) = FD_LIST.lock().unwrap().get(&(fd as i32)) {
-        info!("File descriptor {} corresponds to path: {}", fd, path);
+    let path = if let Some(path) = FD_LIST.lock().unwrap().get(&(fd as i32)) {
+        trace!("File descriptor {} corresponds to path: {}", fd, path);
+        path.clone()
     } else {
         warn!("File descriptor {} not found in FD_LIST", fd);
         return Err(LinuxError::ENOENT);
-    }
-    info!(
+    };
+    trace!(
         "Proxying read syscall for fd: {}, buf_ptr: {:#x}, count: {}",
-        fd, buf_ptr, count
+        fd,
+        buf_ptr,
+        count
     );
 
     // Call the actual filesystem read function
     let ret = unsafe { libc::read(fd as i32, buf_ptr as *mut libc::c_void, count as usize) };
 
     debug!(
-        "Read {} bytes from fd: {}, buf_ptr: {:#x}, content [{:?}]",
+        "Read {} bytes from fd:{} \"{path}\" buf_ptr:{:#x}, content [{:?}]",
         ret,
         fd,
         buf_ptr,
@@ -208,7 +230,7 @@ pub fn proxy_mmap_into_pagecache(
     fd: u64,
     offset: u64,
 ) -> LinuxResult<u64> {
-    info!(
+    trace!(
         "Proxying mmap syscall for addr: {:#x}, length: {:#x}, wb_fd: {:#x}, wb_offset: {:#x}, fd: {}, offset: {:#x}",
         addr, length, wb_fd, wb_offset, fd, offset
     );
@@ -235,8 +257,6 @@ pub fn proxy_mmap_into_pagecache(
     // we only handle mmap for file descriptors that are already registered
     // in the FD_LIST.
     if let Some(path) = FD_LIST.lock().unwrap().get(&(fd as i32)) {
-        info!("File descriptor {} corresponds to path: {}", fd, path);
-
         // Update the file length to prevent memcpy from reading beyond the file size.
         let file = std::fs::File::open(path).map_err(|e| {
             error!("Failed to open file {}: {}", path, e);
@@ -256,12 +276,11 @@ pub fn proxy_mmap_into_pagecache(
         return Err(LinuxError::ENOENT);
     }
 
-
     // If the passed `offset` is already greater than or equal to the file length,
     // we can just zero out the target frame in the page cache pool.
     if offset >= file_len {
         // Just zero the target frame in page cache pool.
-        debug!(
+        trace!(
             "Offset {:#x} is greater than or equal to file length {}, zeroing out page cache pool at {:#x} with length {:#x}",
             offset, file_len, addr, length
         );
@@ -271,13 +290,6 @@ pub fn proxy_mmap_into_pagecache(
         let checksum = calculate_checksum(unsafe {
             core::slice::from_raw_parts(addr as *const u8, length as usize)
         });
-
-        debug!(
-            "Calculated checksum for mmap region [{:#x}~{:#x}] is {:#x}",
-            addr as u64,
-            addr as u64 + length as u64,
-            checksum
-        );
 
         return Ok(checksum as u64);
     }
@@ -293,23 +305,6 @@ pub fn proxy_mmap_into_pagecache(
         )
     };
 
-    if offset == 0 {
-        let header = goblin::elf::Elf::parse_header(unsafe {
-            std::slice::from_raw_parts(host_file_mem as *const u8, length as usize)
-        });
-        warn!("Parsed ELF header: {:#x?}", header);
-    }
-
-    debug!(
-        "Mmaped {} bytes from fd: {}, buf_ptr: {:p}, content [{:?}]",
-        length,
-        fd,
-        host_file_mem,
-        escape_c_string_style(unsafe {
-            std::slice::from_raw_parts(host_file_mem as *const u8, 20)
-        })
-    );
-
     if host_file_mem == libc::MAP_FAILED {
         error!(
         "Proxying mmap syscall for addr: {:#x}, length: {:#x}, fd: {}, offset: {:#x} failed with error: {}",
@@ -317,11 +312,6 @@ pub fn proxy_mmap_into_pagecache(
         );
         return Ok(libc::MAP_FAILED as u64);
     }
-
-    debug!(
-        "Host file memory mapped at: {:#x} for fd: {}, length: {}, offset {:#x}",
-        host_file_mem as u64, fd, length, offset
-    );
 
     // Now, copy the content from the host memory to the page cache region at the given address.
 
@@ -336,11 +326,6 @@ pub fn proxy_mmap_into_pagecache(
 
     let copied_length = if file_len < length { file_len } else { length };
 
-    debug!(
-        "Page cache pool vaddr at: {:#x}, copied length: {}",
-        addr, copied_length
-    );
-
     unsafe {
         libc::memcpy(
             addr as *mut libc::c_void,
@@ -348,27 +333,11 @@ pub fn proxy_mmap_into_pagecache(
             copied_length as usize,
         );
     }
-    debug!(
-        "Copied {:#x}({}) bytes from host file memory {:#x} to page cache pool [{:#x}~{:#x}]",
-        copied_length,
-        copied_length,
-        host_file_mem as u64,
-        addr as u64,
-        addr as u64 + copied_length as u64
-    );
 
     if copied_length < length {
         // If the file is shorter than the requested length, zero out the remaining bytes
         let remaining_length = length - copied_length;
         let zero_ptr = (addr as usize + copied_length as usize) as *mut libc::c_void;
-        debug!(
-            "Zeroing out remaining {:#x}({}) bytes at [{:#x}~{:#x}]",
-            remaining_length,
-            remaining_length,
-            zero_ptr as u64,
-            zero_ptr as u64 + remaining_length as u64
-        );
-
         unsafe {
             libc::memset(zero_ptr, 0, remaining_length as usize);
         }
@@ -383,30 +352,25 @@ pub fn proxy_mmap_into_pagecache(
     let checksum = calculate_checksum(unsafe {
         core::slice::from_raw_parts(addr as *const u8, length as usize)
     });
-
-    debug!(
-        "Calculated checksum for mmap region [{:#x}~{:#x}] is {:#x}",
-        addr as u64,
-        addr as u64 + length as u64,
-        checksum
-    );
-
     Ok(checksum as u64)
 }
 
 pub fn proxy_pread64(fd: u64, buf_ptr: u64, count: u64, offset: u64) -> LinuxResult<u64> {
-    info!(
+    trace!(
         "Proxying pread64 syscall for fd: {}, buf_ptr: {:#x}, count: {}, offset: {:#x}",
-        fd, buf_ptr, count, offset
+        fd,
+        buf_ptr,
+        count,
+        offset
     );
 
     // Check if the file descriptor exists in the FD_LIST
-    if let Some(path) = FD_LIST.lock().unwrap().get(&(fd as i32)) {
-        info!("File descriptor {} corresponds to path: {}", fd, path);
+    let path = if let Some(path) = FD_LIST.lock().unwrap().get(&(fd as i32)) {
+        path.clone()
     } else {
         warn!("File descriptor {} not found in FD_LIST", fd);
         return Err(LinuxError::ENOENT);
-    }
+    };
 
     // Call the actual filesystem pread64 function
     let ret = unsafe {
@@ -417,6 +381,11 @@ pub fn proxy_pread64(fd: u64, buf_ptr: u64, count: u64, offset: u64) -> LinuxRes
             offset as libc::off_t,
         )
     };
+
+    debug!(
+        "Read {} bytes from fd:{}, path \"{}\" buf_ptr: {:#x}, offset: {:#x}",
+        ret, fd, path, buf_ptr, offset
+    );
 
     if ret < 0 {
         error!(
