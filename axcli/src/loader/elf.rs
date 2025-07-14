@@ -159,7 +159,6 @@ unsafe fn mmap_elf(path: &str, base: usize) -> (Elf<'static>, usize, Option<Stri
         .find(|ph| ph.p_type == goblin::elf::program_header::PT_INTERP)
     {
         warn!("[*] Found PT_INTERP segment: {:?}", interp_ph);
-        let interp_addr = base + interp_ph.p_vaddr as usize;
         let size = interp_ph.p_filesz as usize;
 
         // Print the interpreter string
@@ -169,21 +168,7 @@ unsafe fn mmap_elf(path: &str, base: usize) -> (Elf<'static>, usize, Option<Stri
         .unwrap_or("<invalid>");
 
         interp_path = Some(String::from(interp_str));
-
-        // interp_path = Some(interp_str.to_string());
         info!("[*] Interpreter: {:?}", interp_path);
-
-        info!(
-            "[*] Clearing PT_INTERP segment at 0x{:x}, size {}",
-            interp_addr, size
-        );
-        unsafe {
-            core::ptr::write_bytes(interp_addr as *mut u8, 0, size);
-        }
-        warn!(
-            "[*] Cleared PT_INTERP segment at 0x{:x}, size {}",
-            interp_addr, size
-        );
     }
 
     for ph in elf

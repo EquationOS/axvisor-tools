@@ -256,6 +256,32 @@ pub fn proxy_mmap_into_pagecache(
         return Err(LinuxError::ENOENT);
     }
 
+
+    // If the passed `offset` is already greater than or equal to the file length,
+    // we can just zero out the target frame in the page cache pool.
+    if offset >= file_len {
+        // Just zero the target frame in page cache pool.
+        debug!(
+            "Offset {:#x} is greater than or equal to file length {}, zeroing out page cache pool at {:#x} with length {:#x}",
+            offset, file_len, addr, length
+        );
+        unsafe {
+            libc::memset(addr as *mut libc::c_void, 0, length as usize);
+        }
+        let checksum = calculate_checksum(unsafe {
+            core::slice::from_raw_parts(addr as *const u8, length as usize)
+        });
+
+        debug!(
+            "Calculated checksum for mmap region [{:#x}~{:#x}] is {:#x}",
+            addr as u64,
+            addr as u64 + length as u64,
+            checksum
+        );
+
+        return Ok(checksum as u64);
+    }
+
     let host_file_mem = unsafe {
         libc::mmap(
             0 as *mut libc::c_void, // null

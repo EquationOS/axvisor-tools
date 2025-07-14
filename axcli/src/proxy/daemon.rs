@@ -3,7 +3,7 @@ use axerrno::{LinuxError, LinuxResult};
 use equation_defs::purple_text;
 use equation_defs::scf::Sysno;
 
-use crate::proxy::fs;
+use crate::proxy::{fs, misc};
 use crate::proxy::scf::SyscallQueueBuffer;
 
 pub fn poll() {
@@ -46,6 +46,7 @@ fn handle_syscall(syscall_id: Sysno, args: &[u64; 6]) -> LinuxResult<u64> {
             fs::proxy_mmap_into_pagecache(args[0], args[1], args[2], args[3], args[4], args[5])
         }
         Sysno::pread64 => fs::proxy_pread64(args[0], args[1], args[2], args[3]),
+        Sysno::getrandom => misc::sys_getrandom(args[0], args[1], args[2]),
         _ => {
             error!("Unhandled syscall ID: {:?}", syscall_id);
             return Err(LinuxError::ENOSYS);
