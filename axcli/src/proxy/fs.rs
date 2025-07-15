@@ -14,7 +14,7 @@ pub fn proxy_access(path_ptr: u64, mode: u64) -> LinuxResult<u64> {
         cstr.to_string_lossy().into_owned()
     };
 
-    debug!("Accessing path: \"{}\" mode: {:#x}", path, mode);
+    debug!("Proxying access syscall for path: \"{}\" mode: {:#x}", path, mode);
 
     // Call the actual filesystem access function
     Ok(unsafe { libc::access(path_ptr as *const i8, mode as i32) } as u64)
@@ -101,6 +101,44 @@ pub fn proxy_fstat(fd: u64, stat_ptr: u64) -> LinuxResult<u64> {
 
     // Call the actual filesystem fstat function
     let ret = unsafe { libc::fstat(fd as i32, stat_ptr as *mut libc::stat) };
+
+    Ok(ret as u64)
+}
+
+pub fn proxy_newfstatat(
+    dirfd: u64,
+    pathname_ptr: u64,
+    stat_ptr: u64,
+    flags: u64,
+) -> LinuxResult<u64> {
+    // Convert the pathname pointer to a Rust string
+    let pathname = unsafe {
+        let cstr = std::ffi::CStr::from_ptr(pathname_ptr as *const i8);
+        cstr.to_string_lossy().into_owned()
+    };
+
+    debug!(
+        "Proxying newfstatat syscall for dirfd: {:#x}, path: \"{}\", stat_ptr: {:#x}, flags: {:#x}",
+        dirfd, pathname, stat_ptr, flags
+    );
+
+    // Call the actual filesystem newfstatat function
+    let ret = unsafe {
+        libc::fstatat(
+            dirfd as i32,
+            pathname_ptr as *const i8,
+            stat_ptr as *mut libc::stat,
+            flags as i32,
+        )
+    };
+
+    if ret < 0 {
+        error!(
+            "Failed to get file status for path: {}, error {}",
+            pathname,
+            std::io::Error::last_os_error()
+        );
+    }
 
     Ok(ret as u64)
 }

@@ -2,6 +2,7 @@ pub mod daemon;
 
 mod fs;
 mod misc;
+mod shm;
 
 #[allow(unused)]
 mod mm;
