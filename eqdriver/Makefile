@@ -17,6 +17,7 @@ MODULE := eqdriver
 SRC := eqmanager.o \
 	   hvc.o \
 	   instance.o \
+	   shm.o \
 	   main.o 
 
 # Default target

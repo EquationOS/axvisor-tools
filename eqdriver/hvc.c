@@ -33,3 +33,8 @@ int hvc_create_instance(
 		HCreateInstance, instance_type, mapping_type, scf_queue_base_ptr,
 		scf_queue_size_ptr, page_cache_base_ptr, page_cache_size_ptr);
 }
+
+int hvc_shmget(__u64 key, __u64 size, __u64 shmflg, __u64 shm_base_ptr)
+{
+	return hvc_call(HShmGet, key, size, shmflg, shm_base_ptr, 0, 0);
+}
