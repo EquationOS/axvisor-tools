@@ -1,11 +1,11 @@
-use std::{collections::BTreeMap, sync::Mutex};
+//! Proxy for filesystem operations.
 
 use axerrno::{LinuxError, LinuxResult};
 use libc::MAP_PRIVATE;
 
 use equation_defs::{PAGE_CACHE_POOL_BASE_VA, PAGE_CACHE_POOL_SIZE};
 
-static FD_LIST: Mutex<BTreeMap<i32, String>> = Mutex::new(BTreeMap::new());
+use super::FD_LIST;
 
 pub fn proxy_access(path_ptr: u64, mode: u64) -> LinuxResult<u64> {
     // Convert the path pointer to a Rust string
@@ -14,7 +14,10 @@ pub fn proxy_access(path_ptr: u64, mode: u64) -> LinuxResult<u64> {
         cstr.to_string_lossy().into_owned()
     };
 
-    debug!("Proxying access syscall for path: \"{}\" mode: {:#x}", path, mode);
+    debug!(
+        "Proxying access syscall for path: \"{}\" mode: {:#x}",
+        path, mode
+    );
 
     // Call the actual filesystem access function
     Ok(unsafe { libc::access(path_ptr as *const i8, mode as i32) } as u64)
@@ -173,20 +176,32 @@ pub fn proxy_write(fd: u64, buf_ptr: u64, count: u64) -> LinuxResult<u64> {
         return Err(LinuxError::ENOENT);
     };
 
+    let dump_len = if count < 20 {
+        count as usize
+    } else {
+        20 // Limit the dump length to 20 bytes for readability
+    };
+
     trace!(
         "Proxying write syscall for fd: {}, buf_ptr: {:#x}, count: {}, content: {:?}",
         fd,
         buf_ptr,
         count,
-        escape_c_string_style(unsafe { std::slice::from_raw_parts(buf_ptr as *const u8, 20) })
+        escape_c_string_style(unsafe {
+            std::slice::from_raw_parts(buf_ptr as *const u8, dump_len)
+        })
     );
 
     // Call the actual filesystem write function
     let ret = unsafe { libc::write(fd as i32, buf_ptr as *const libc::c_void, count as usize) };
 
     debug!(
-        "Wrote {} bytes to fd:{}, path \"{path}\" buf_ptr: {:#x}",
-        ret, fd, buf_ptr
+        "Wrote {} bytes \"{}\" to fd:{} \"{path}\"",
+        ret,
+        escape_c_string_style(unsafe {
+            std::slice::from_raw_parts(buf_ptr as *const u8, dump_len)
+        }),
+        fd,
     );
 
     if ret < 0 {
@@ -274,7 +289,9 @@ pub fn proxy_mmap_into_pagecache(
     );
 
     if wb_fd != 0 {
-        warn!("Writeback {length} Bytes from {addr:#x} to {wb_fd} at offset {wb_offset:#x}, not supported yet");
+        warn!(
+            "Writeback {length} Bytes from {addr:#x} to {wb_fd} at offset {wb_offset:#x}, not supported yet"
+        );
         return Err(LinuxError::ENOSYS);
     }
 
@@ -345,8 +362,12 @@ pub fn proxy_mmap_into_pagecache(
 
     if host_file_mem == libc::MAP_FAILED {
         error!(
-        "Proxying mmap syscall for addr: {:#x}, length: {:#x}, fd: {}, offset: {:#x} failed with error: {}",
-        addr, length, fd, offset, std::io::Error::last_os_error()
+            "Proxying mmap syscall for addr: {:#x}, length: {:#x}, fd: {}, offset: {:#x} failed with error: {}",
+            addr,
+            length,
+            fd,
+            offset,
+            std::io::Error::last_os_error()
         );
         return Ok(libc::MAP_FAILED as u64);
     }

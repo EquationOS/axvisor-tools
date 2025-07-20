@@ -476,6 +476,7 @@ dependencies = [
 [[package]]
 name = "linux-libc-auxv"
 version = "0.3.0"
+source = "git+https://github.com/EquationOS/linux-libc-auxv.git#dc94d64478a2de87c813e0190cc4a885b13f4f50"
 dependencies = [
  "aligned-vec",
  "bitflags 2.9.1",

@@ -4,7 +4,7 @@ use equation_defs::purple_text;
 use equation_defs::scf::Sysno;
 
 use crate::proxy::scf::SyscallQueueBuffer;
-use crate::proxy::{fs, misc, shm};
+use crate::proxy::{fs, misc, net, shm};
 
 pub fn poll() {
     let scf = SyscallQueueBuffer::get();
@@ -49,6 +49,9 @@ fn handle_syscall(syscall_id: Sysno, args: &[u64; 6]) -> LinuxResult<u64> {
         Sysno::pread64 => fs::proxy_pread64(args[0], args[1], args[2], args[3]),
         Sysno::getrandom => misc::sys_getrandom(args[0], args[1], args[2]),
         Sysno::shmget => shm::sys_shmget(args[0], args[1], args[2]),
+
+        Sysno::socket => net::proxy_socket(args[0], args[1], args[2]),
+        Sysno::connect => net::proxy_connect(args[0], args[1], args[2]),
         _ => {
             error!("Unhandled syscall ID: {:?}", syscall_id);
             return Err(LinuxError::ENOSYS);

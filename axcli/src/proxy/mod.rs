@@ -2,6 +2,7 @@ pub mod daemon;
 
 mod fs;
 mod misc;
+mod net;
 mod shm;
 
 #[allow(unused)]
@@ -9,6 +10,10 @@ mod mm;
 
 mod page_cache;
 mod scf;
+
+use std::{collections::BTreeMap, sync::Mutex};
+
+static FD_LIST: Mutex<BTreeMap<i32, String>> = Mutex::new(BTreeMap::new());
 
 static mut INSTANCE_FD: i32 = -1;
 

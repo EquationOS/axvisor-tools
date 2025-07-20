@@ -30,6 +30,8 @@ int eq_shmat(struct file *file, struct vm_area_struct *vma, int shmid)
 	unsigned long pfn_start, mmap_size;
 	int ret = 0;
 
+	INFO("Mapping shared memory with ID 0x%x to user space\n", shmid);
+
 	// Find the shared memory segment by its ID (shmid).
 	list_for_each_entry(shm, &shm_list, list)
 	{
@@ -107,8 +109,8 @@ int eq_shmget(key_t key, size_t size, int shmflg)
 	shm_base_gpa = virt_to_phys(shm_base);
 
 	INFO(
-		"Creating shared memory with key 0x%x, size %zu, flags 0x%x\n", key,
-		size, shmflg);
+		"eq_shmget() key 0x%x, size 0x%lx(%zu), flags 0x%x\n", key, size, size,
+		shmflg);
 
 	// Hypercall to create or get the shared memory segment.
 	ret = hvc_shmget(key, size, shmflg, shm_base_gpa);
@@ -130,14 +132,14 @@ int eq_shmget(key_t key, size_t size, int shmflg)
 		return -ENOMEM;
 	}
 	new_shm->key = key;
-	new_shm->base_gpa = shm_base_gpa;
+	new_shm->base_gpa = *shm_base;
 	new_shm->size = size;
 	INIT_LIST_HEAD(&new_shm->list);
 	list_add_tail(&new_shm->list, &shm_list);
 	INFO(
 		"Shared memory segment created with key 0x%x, base GPA 0x%llx, size "
 		"%zu\n",
-		key, shm_base_gpa, size);
+		new_shm->key, new_shm->base_gpa, new_shm->size);
 
 	return key;
 }
