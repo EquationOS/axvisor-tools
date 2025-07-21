@@ -118,7 +118,7 @@ pub fn execute(args: ExecuteArgs) {
 
     free_shared_pages(&mut shared_pages);
 
-    proxy::setup_proxy_daemon(instance_fd);
+    proxy::setup_proxy_daemon(instance_id, instance_fd);
 
     // In the next step, this process will turn into a daemon proxy process of the junction instance,
     // which handles the system calls which can not be handled by the axvisor directly.

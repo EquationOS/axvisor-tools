@@ -17,6 +17,7 @@ typedef struct eq_shm
 
 static LIST_HEAD(shm_list); // Head of the linked list
 
+/// ** Deprecated for now **
 /// @brief Map the shared memory region into the user space process,
 /// refer to `shmat()` in System V IPC.
 /// `void *shmat(int shmid, const void *_Nullable shmaddr, int shmflg);`
@@ -77,6 +78,7 @@ int eq_shmat(struct file *file, struct vm_area_struct *vma, int shmid)
 	return ret;
 }
 
+/// ** Deprecated for now **
 /// @brief shmget() returns the identifier of the System V shared memory
 /// segment associated with the value of the argument key.  It may be
 /// used either to obtain the identifier of a previously created

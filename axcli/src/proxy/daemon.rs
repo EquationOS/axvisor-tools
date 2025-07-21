@@ -49,7 +49,10 @@ fn handle_syscall(syscall_id: Sysno, args: &[u64; 6]) -> LinuxResult<u64> {
         Sysno::pread64 => fs::proxy_pread64(args[0], args[1], args[2], args[3]),
         Sysno::getrandom => misc::sys_getrandom(args[0], args[1], args[2]),
         Sysno::shmget => shm::sys_shmget(args[0], args[1], args[2]),
-
+        Sysno::shmat => {
+            shm::sys_shmat_with_shmget_args(args[0] as i32, args[1], args[2] as i32, args[3])
+        }
+        Sysno::shmdt => shm::sys_shmdt(args[0]),
         Sysno::socket => net::proxy_socket(args[0], args[1], args[2]),
         Sysno::connect => net::proxy_connect(args[0], args[1], args[2]),
         _ => {
