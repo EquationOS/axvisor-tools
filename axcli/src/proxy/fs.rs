@@ -214,6 +214,83 @@ pub fn proxy_getdents64(fd: u64, dirent_ptr: u64, count: u64) -> LinuxResult<u64
     Ok(ret as u64)
 }
 
+pub fn proxy_readlinkat(
+    dirfd: u64,
+    pathname_ptr: u64,
+    buf_ptr: u64,
+    buf_len: u64,
+) -> LinuxResult<u64> {
+    // Convert the pathname pointer to a Rust string
+    let pathname = unsafe {
+        let cstr = std::ffi::CStr::from_ptr(pathname_ptr as *const i8);
+        cstr.to_string_lossy().into_owned()
+    };
+
+    debug!(
+        "Proxying readlinkat syscall for dirfd: {:#x}, path: \"{}\", buf_ptr: {:#x}, buf_len: {}",
+        dirfd, pathname, buf_ptr, buf_len
+    );
+
+    // Call the actual filesystem readlinkat function
+    let ret = unsafe {
+        libc::readlinkat(
+            dirfd as i32,
+            pathname_ptr as *const i8,
+            buf_ptr as *mut i8,
+            buf_len as usize,
+        )
+    };
+
+    if ret < 0 {
+        error!(
+            "Failed to read link at path: {}, error {}",
+            pathname,
+            std::io::Error::last_os_error()
+        );
+        return Err(LinuxError::EIO);
+    }
+
+    debug!(
+        "Read link at path: \"{}\", returned {} bytes",
+        pathname, ret
+    );
+
+    Ok(ret as u64)
+}
+
+pub fn proxy_getcwd(buf_ptr: u64, size: u64) -> LinuxResult<u64> {
+    // Call the actual filesystem getcwd function
+    let ret = unsafe { libc::getcwd(buf_ptr as *mut i8, size as usize) };
+
+    if ret.is_null() {
+        error!(
+            "Failed to get current working directory, error {}",
+            std::io::Error::last_os_error()
+        );
+        // If getcwd fails, return NULL.
+        return Ok(0);
+    }
+
+    let cwd = unsafe { std::ffi::CStr::from_ptr(ret) };
+    let cwd_len = cwd.to_bytes().len();
+
+    debug!(
+        "Current working directory: \"{}\", len={cwd_len}",
+        cwd.to_string_lossy()
+    );
+
+    // Clear the remaining buffer beyond the length of cwd
+    if cwd_len < size as usize {
+        let clear_ptr = unsafe { (buf_ptr as *mut u8).add(cwd_len) };
+        let clear_len = size as usize - cwd_len;
+        unsafe {
+            libc::memset(clear_ptr as *mut libc::c_void, 0, clear_len);
+        }
+    }
+
+    Ok(ret as u64)
+}
+
 pub fn proxy_close(fd: u64) -> LinuxResult<u64> {
     // Check if the file descriptor exists in the FD_LIST
     let path = if let Some(path) = FD_LIST.lock().unwrap().remove(&(fd as i32)) {
