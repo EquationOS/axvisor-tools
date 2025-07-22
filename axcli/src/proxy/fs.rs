@@ -5,6 +5,8 @@ use libc::MAP_PRIVATE;
 
 use equation_defs::{PAGE_CACHE_POOL_BASE_VA, PAGE_CACHE_POOL_SIZE};
 
+use crate::proxy::raw_syscall;
+
 use super::FD_LIST;
 
 pub fn proxy_access(path_ptr: u64, mode: u64) -> LinuxResult<u64> {
@@ -42,9 +44,12 @@ pub fn proxy_openat_with_stat(
         cstr.to_string_lossy().into_owned()
     };
 
-    debug!(
+    trace!(
         "Proxying openat syscall for dirfd: {:#x}, path: \"{}\", flags: {:#x}, mode: {:#x}",
-        dirfd, pathname, flags, mode
+        dirfd,
+        pathname,
+        flags,
+        mode
     );
 
     // Call the actual filesystem openat function
@@ -60,7 +65,7 @@ pub fn proxy_openat_with_stat(
     if fd > 0 {
         trace!("Opened file descriptor {} for path: {}", fd, pathname);
         // Store the file descriptor and its path in the FD_LIST
-        FD_LIST.lock().unwrap().insert(fd, pathname);
+        FD_LIST.lock().unwrap().insert(fd, pathname.clone());
 
         // If stat_ptr is provided, fill the stat structure
         if stat_ptr != 0 {
@@ -74,6 +79,11 @@ pub fn proxy_openat_with_stat(
             std::io::Error::last_os_error()
         );
     }
+
+    debug!(
+        "Proxying openat syscall for dirfd: {:#x}, path: \"{}\", flags: {:#x}, mode: {:#x}, returned fd: {}",
+        dirfd, pathname, flags, mode, fd
+    );
 
     Ok(fd as u64)
 }
@@ -142,6 +152,64 @@ pub fn proxy_newfstatat(
             std::io::Error::last_os_error()
         );
     }
+
+    Ok(ret as u64)
+}
+
+pub fn proxy_statfs(path_ptr: u64, statfs_ptr: u64) -> LinuxResult<u64> {
+    // Convert the path pointer to a Rust string
+    let path = unsafe {
+        let cstr = std::ffi::CStr::from_ptr(path_ptr as *const i8);
+        cstr.to_string_lossy().into_owned()
+    };
+
+    // Call the actual filesystem statfs function
+    let ret = unsafe { libc::statfs(path_ptr as *const i8, statfs_ptr as *mut libc::statfs) };
+
+    if ret < 0 {
+        error!(
+            "Failed to get filesystem status for path: {}, error {}",
+            path,
+            std::io::Error::last_os_error()
+        );
+    }
+
+    debug!(
+        "Proxying statfs syscall for path: \"{}\", statfs_ptr: {:#x} ret {}",
+        path, statfs_ptr, ret
+    );
+
+    Ok(ret as u64)
+}
+
+pub fn proxy_getdents64(fd: u64, dirent_ptr: u64, count: u64) -> LinuxResult<u64> {
+    // Check if the file descriptor exists in the FD_LIST
+    let path = if let Some(path) = FD_LIST.lock().unwrap().get(&(fd as i32)) {
+        trace!("File descriptor {} corresponds to path: {}", fd, path);
+        path.clone()
+    } else {
+        warn!("File descriptor {} not found in FD_LIST", fd);
+        return Err(LinuxError::ENOENT);
+    };
+
+    let dirent_contents =
+        unsafe { std::slice::from_raw_parts_mut(dirent_ptr as *mut u8, count as usize) };
+
+    // Call the actual filesystem getdents64 function
+    let ret = unsafe { raw_syscall::getdents64(fd as i32, dirent_contents) } as isize;
+
+    if ret < 0 {
+        error!(
+            "getdents64 failed with error: {}",
+            std::io::Error::last_os_error()
+        );
+        return Err(LinuxError::EIO);
+    }
+
+    debug!(
+        "Proxying getdents64  fd: {}, path \"{}\" dirent_ptr: {:#x}, count: {}, ret {}",
+        fd, path, dirent_ptr, count, ret
+    );
 
     Ok(ret as u64)
 }

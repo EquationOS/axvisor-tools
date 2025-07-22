@@ -5,6 +5,8 @@ mod misc;
 mod net;
 mod shm;
 
+mod raw_syscall;
+
 #[allow(unused)]
 mod mm;
 

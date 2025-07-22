@@ -43,6 +43,8 @@ fn handle_syscall(syscall_id: Sysno, args: &[u64; 6]) -> LinuxResult<u64> {
         Sysno::fstat => fs::proxy_fstat(args[0], args[1]),
         Sysno::newfstatat => fs::proxy_newfstatat(args[0], args[1], args[2], args[3]),
         Sysno::close => fs::proxy_close(args[0]),
+        Sysno::statfs => fs::proxy_statfs(args[0], args[1]),
+        Sysno::getdents64 => fs::proxy_getdents64(args[0], args[1], args[2]),
         Sysno::mmap => {
             fs::proxy_mmap_into_pagecache(args[0], args[1], args[2], args[3], args[4], args[5])
         }

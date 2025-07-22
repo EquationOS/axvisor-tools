@@ -13,6 +13,7 @@ log = "0.4.21"
 goblin = "0.10.0"
 lazyinit = "0.2"
 axerrno = "0.1.0"
+sc = "0.2.7"
 
 equation_defs = { git = "https://github.com/EquationOS/equation_defs.git" }
 linux-libc-auxv = { git = "https://github.com/EquationOS/linux-libc-auxv.git" }
