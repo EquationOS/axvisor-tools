@@ -110,7 +110,7 @@ pub fn proxy_fstat(fd: u64, stat_ptr: u64) -> LinuxResult<u64> {
         return Err(LinuxError::ENOENT);
     };
 
-    debug!("Proxying fstat syscall for fd:{fd} \"{path}\" stat_ptr: {stat_ptr:#x}",);
+    trace!("Proxying fstat syscall for fd:{fd} \"{path}\" stat_ptr: {stat_ptr:#x}",);
 
     // Call the actual filesystem fstat function
     let ret = unsafe { libc::fstat(fd as i32, stat_ptr as *mut libc::stat) };
@@ -130,9 +130,12 @@ pub fn proxy_newfstatat(
         cstr.to_string_lossy().into_owned()
     };
 
-    debug!(
+    trace!(
         "Proxying newfstatat syscall for dirfd: {:#x}, path: \"{}\", stat_ptr: {:#x}, flags: {:#x}",
-        dirfd, pathname, stat_ptr, flags
+        dirfd,
+        pathname,
+        stat_ptr,
+        flags
     );
 
     // Call the actual filesystem newfstatat function
@@ -206,9 +209,13 @@ pub fn proxy_getdents64(fd: u64, dirent_ptr: u64, count: u64) -> LinuxResult<u64
         return Err(LinuxError::EIO);
     }
 
-    debug!(
+    trace!(
         "Proxying getdents64  fd: {}, path \"{}\" dirent_ptr: {:#x}, count: {}, ret {}",
-        fd, path, dirent_ptr, count, ret
+        fd,
+        path,
+        dirent_ptr,
+        count,
+        ret
     );
 
     Ok(ret as u64)
@@ -226,9 +233,12 @@ pub fn proxy_readlinkat(
         cstr.to_string_lossy().into_owned()
     };
 
-    debug!(
+    trace!(
         "Proxying readlinkat syscall for dirfd: {:#x}, path: \"{}\", buf_ptr: {:#x}, buf_len: {}",
-        dirfd, pathname, buf_ptr, buf_len
+        dirfd,
+        pathname,
+        buf_ptr,
+        buf_len
     );
 
     // Call the actual filesystem readlinkat function
@@ -250,9 +260,10 @@ pub fn proxy_readlinkat(
         return Err(LinuxError::EIO);
     }
 
-    debug!(
+    trace!(
         "Read link at path: \"{}\", returned {} bytes",
-        pathname, ret
+        pathname,
+        ret
     );
 
     Ok(ret as u64)
@@ -456,7 +467,7 @@ pub fn proxy_mmap_into_pagecache(
     // Check if the file descriptor exists in the FD_LIST,
     // we only handle mmap for file descriptors that are already registered
     // in the FD_LIST.
-    if let Some(path) = FD_LIST.lock().unwrap().get(&(fd as i32)) {
+    let path = if let Some(path) = FD_LIST.lock().unwrap().get(&(fd as i32)) {
         // Update the file length to prevent memcpy from reading beyond the file size.
         let file = std::fs::File::open(path).map_err(|e| {
             error!("Failed to open file {}: {}", path, e);
@@ -471,10 +482,11 @@ pub fn proxy_mmap_into_pagecache(
             .len();
 
         file_len = file_size;
+        path.clone()
     } else {
         warn!("File descriptor {} not found in FD_LIST", fd);
         return Err(LinuxError::ENOENT);
-    }
+    };
 
     // If the passed `offset` is already greater than or equal to the file length,
     // we can just zero out the target frame in the page cache pool.
@@ -507,7 +519,8 @@ pub fn proxy_mmap_into_pagecache(
 
     if host_file_mem == libc::MAP_FAILED {
         error!(
-            "Proxying mmap syscall for addr: {:#x}, length: {:#x}, fd: {}, offset: {:#x} failed with error: {}",
+            "Proxying mmap syscall path {} addr: {:#x}, length: {:#x}, fd: {}, offset: {:#x} failed with error: {}",
+            path,
             addr,
             length,
             fd,
