@@ -4,7 +4,7 @@ use equation_defs::purple_text;
 use equation_defs::scf::Sysno;
 
 use crate::proxy::scf::SyscallQueueBuffer;
-use crate::proxy::{fs, misc, net, shm};
+use crate::proxy::syscall::{fs, misc, net, shm};
 
 pub fn poll() {
     let scf = SyscallQueueBuffer::get();

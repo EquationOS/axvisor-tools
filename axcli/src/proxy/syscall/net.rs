@@ -2,7 +2,7 @@
 
 use axerrno::LinuxResult;
 
-use super::FD_LIST;
+use crate::proxy::FD_LIST;
 
 pub fn proxy_socket(domain: u64, ty: u64, protocol: u64) -> LinuxResult<u64> {
     let fd = unsafe { libc::socket(domain as i32, ty as i32, protocol as i32) };

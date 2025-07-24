@@ -1,17 +1,8 @@
 pub mod daemon;
 
-mod fs;
-mod misc;
-mod net;
-mod shm;
-
-mod raw_syscall;
-
-#[allow(unused)]
-mod mm;
-
 mod page_cache;
 mod scf;
+mod syscall;
 
 use std::{collections::BTreeMap, sync::Mutex};
 
