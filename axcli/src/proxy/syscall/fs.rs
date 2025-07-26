@@ -68,7 +68,7 @@ pub fn proxy_openat_with_stat(
 
         // If stat_ptr is provided, fill the stat structure
         if stat_ptr != 0 {
-            proxy_fstat(fd as _, stat_ptr)?;
+            let _ = proxy_fstat(fd as _, stat_ptr);
         }
     } else {
         error!(
@@ -180,6 +180,50 @@ pub fn proxy_statfs(path_ptr: u64, statfs_ptr: u64) -> LinuxResult<u64> {
         "Proxying statfs syscall for path: \"{}\", statfs_ptr: {:#x} ret {}",
         path, statfs_ptr, ret
     );
+
+    Ok(ret as u64)
+}
+
+pub fn proxy_statx(
+    dirfd: u64,
+    pathname_ptr: u64,
+    flags: u64,
+    mask: u64,
+    statx_ptr: u64,
+) -> LinuxResult<u64> {
+    // Convert the pathname pointer to a Rust string
+    let pathname = unsafe {
+        let cstr = std::ffi::CStr::from_ptr(pathname_ptr as *const i8);
+        cstr.to_string_lossy().into_owned()
+    };
+
+    trace!(
+        "Proxying statx syscall for dirfd: {:#x}, path: \"{}\", flags: {:#x}, mask: {:#x}, statx_ptr: {:#x}",
+        dirfd,
+        pathname,
+        flags,
+        mask,
+        statx_ptr
+    );
+
+    // Call the actual filesystem statx function
+    let ret = unsafe {
+        libc::statx(
+            dirfd as i32,
+            pathname_ptr as *const i8,
+            flags as i32,
+            mask as u32,
+            statx_ptr as *mut libc::statx,
+        )
+    };
+
+    if ret < 0 {
+        error!(
+            "Failed to get file status for path: {}, error {}",
+            pathname,
+            std::io::Error::last_os_error()
+        );
+    }
 
     Ok(ret as u64)
 }

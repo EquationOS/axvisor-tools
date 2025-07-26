@@ -42,6 +42,7 @@ fn handle_syscall(syscall_id: Sysno, args: &[u64; 6]) -> LinuxResult<u64> {
         Sysno::openat => fs::proxy_openat_with_stat(args[0], args[1], args[2], args[3], args[4]),
         Sysno::fstat => fs::proxy_fstat(args[0], args[1]),
         Sysno::newfstatat => fs::proxy_newfstatat(args[0], args[1], args[2], args[3]),
+        Sysno::statx => fs::proxy_statx(args[0], args[1], args[2], args[3], args[4]),
         Sysno::close => fs::proxy_close(args[0]),
         Sysno::statfs => fs::proxy_statfs(args[0], args[1]),
         Sysno::getdents64 => fs::proxy_getdents64(args[0], args[1], args[2]),
