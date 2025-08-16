@@ -71,6 +71,7 @@ pub fn execute(args: ExecuteArgs) {
             instance_dev_path,
             std::io::Error::last_os_error()
         );
+        return;
     }
 
     // We need to copy execution metadate to axvisor to start the loader instance.
