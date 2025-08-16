@@ -48,6 +48,11 @@ pub fn hvc_create_instance(
     shared_pages_base: u64,
     shared_pages_num: u64,
 ) -> isize {
+    info!(
+        "[*] Creating instance with type: {}, mapping: {}, file size: {}, shared pages base: {:#x}, num: {}",
+        instance_type, mapping_type, file_size, shared_pages_base, shared_pages_num
+    );
+
     trigger_hypercall(
         HyperCallCode::HCreateInstance,
         instance_type,
@@ -55,6 +60,50 @@ pub fn hvc_create_instance(
         file_size,
         shared_pages_base,
         shared_pages_num,
+        0,
+    )
+}
+
+pub fn hvc_setup_instance(
+    instance_id: u64,
+    file_size: u64,
+    shared_pages_base: u64,
+    shared_pages_num: u64,
+) -> isize {
+    info!(
+        "[*] Setting up instance ID: {}, file size: {}, shared pages base: {:#x}, num: {}",
+        instance_id, file_size, shared_pages_base, shared_pages_num
+    );
+
+    trigger_hypercall(
+        HyperCallCode::HSetupInstance,
+        instance_id,
+        file_size,
+        shared_pages_base,
+        shared_pages_num,
+        0,
+        0,
+    )
+}
+
+pub fn hvc_daemon_shmat(
+    instance_id: u64,
+    shmkey: u64,
+    shmaddr: u64,
+    shmsize: u64,
+    shmflg: u64,
+) -> isize {
+    info!(
+        "[*] Attaching shm instance ID:{}, key: {:#x}, addr: {:#x}, size: {:#x}, flags: {:#x}",
+        instance_id, shmkey, shmaddr, shmsize, shmflg
+    );
+    trigger_hypercall(
+        HyperCallCode::HIVCSHMAt,
+        instance_id,
+        shmkey,
+        shmaddr,
+        shmsize,
+        shmflg,
         0,
     )
 }

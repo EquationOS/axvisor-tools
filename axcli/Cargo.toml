@@ -5,17 +5,37 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4.5.4", features = ["derive"] }
-rustix = { version = "0.38.34", features = ["fs"] }
 libc = "0.2.154"
 serde = { version = "1.0.204", features = ["derive"] }
 toml = "0.8.14"
 env_logger = "0.11.3"
 log = "0.4.21"
-xmas-elf = "0.8"
+goblin = "0.10.0"
+lazyinit = "0.2"
+axerrno = "0.1.0"
+sc = "0.2.7"
+
+equation_defs = { git = "https://github.com/EquationOS/equation_defs.git" }
+linux-libc-auxv = { git = "https://github.com/EquationOS/linux-libc-auxv.git" }
 
 memory_addr = "0.3"
 page_table_multiarch = "0.5"
 axhvc = { git = "https://github.com/arceos-hypervisor/axhvc.git" }
+pi_memory_layout = { git = "https://github.com/EquationOS/pi-memory-layout.git" }
 
 [patch."https://github.com/arceos-hypervisor/axhvc.git"]
 axhvc = { path = "../../../crates/axhvc" }
+
+[patch."https://github.com/EquationOS/pi-memory-layout.git"]
+pi_memory_layout = { path = "../../../crates/pi_memory_layout" }
+
+[patch."https://github.com/EquationOS/equation_defs.git"]
+equation_defs = { path = "../../../crates/equation_defs" }
+
+[patch.crates-io]
+memory_addr = { path = "../../../crates/memory_addr/memory_addr" }
+bitmaps = { path = "../../../crates/bitmaps" }
+page_table_multiarch = { path = "../../../crates/page_table_multiarch/page_table_multiarch" }
+
+[build-dependencies]
+bindgen = "0.72"

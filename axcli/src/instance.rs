@@ -1,9 +1,15 @@
-use libc::c_void;
-use memory_addr::PAGE_SIZE_4K;
+use std::ffi::CStr;
 
-use crate::hvc::{hvc_create_instance, hvc_init_shim};
-use crate::shared_pages::{alloc_shared_page, free_shared_pages};
-use crate::InstanceCreateArgs;
+use libc::c_void;
+
+use pi_memory_layout::{ArgsLayoutBuilder, ArgsLayoutRef};
+
+use crate::hvc::{hvc_create_instance, hvc_init_shim, hvc_setup_instance};
+use crate::proxy;
+use crate::shared_pages::{copy_content_to_shared_pages, free_shared_pages};
+use crate::{ExecuteArgs, InstanceCreateArgs};
+
+const EQINSTANCE_DEV_PREFIX: &str = "/dev/eqinstance_";
 
 pub fn create_instance(args: InstanceCreateArgs) {
     info!(
@@ -20,33 +26,13 @@ pub fn create_instance(args: InstanceCreateArgs) {
 
     // Copy the raw file to axvisor through shared pages
     // page by page.
-
-    let mut bytes_left = raw_file.len();
-    let mut src_offset = 0;
-    let mut current_offset = 0;
     let mut shared_pages: Vec<*mut c_void> = Vec::new();
-
-    while bytes_left > 0 {
-        let current_page = alloc_shared_page(&mut shared_pages);
-        let page_offset = current_offset % PAGE_SIZE_4K;
-        let space_left = PAGE_SIZE_4K - page_offset;
-        let to_copy = std::cmp::min(space_left, bytes_left);
-
-        unsafe {
-            let dst = (current_page as *mut u8).add(page_offset);
-            std::ptr::copy_nonoverlapping(raw_file.as_ptr().add(src_offset), dst, to_copy);
-        }
-
-        current_offset += to_copy;
-        src_offset += to_copy;
-        bytes_left -= to_copy;
-    }
-    assert!(current_offset == raw_file.len());
+    copy_content_to_shared_pages(&mut shared_pages, raw_file.as_slice());
 
     let iid = hvc_create_instance(
         args.instance_type as _,
         if args.one2onemapping { 0 } else { 1 } as _,
-        current_offset as _,
+        raw_file.len() as _,
         shared_pages.as_ptr() as u64,
         shared_pages.len() as _,
     );
@@ -58,6 +44,94 @@ pub fn create_instance(args: InstanceCreateArgs) {
     info!("Create instance success, instance ID = [{}]", iid);
 
     free_shared_pages(&mut shared_pages);
+}
+
+/// Remote execute in a instance setup by AxVisor.
+pub fn execute(args: ExecuteArgs) {
+    // First, create the instance through ioctl, eqdriver will trigger the hvc to create the instance.
+    let instance_id = crate::ioctl::ioctl_create_instance()
+        .expect("Failed to create instance for dynamic loading");
+
+    info!("Create instance success, instance ID = [{}]", instance_id);
+
+    let instance_dev_path_str = format!("{}{}\0", EQINSTANCE_DEV_PREFIX, instance_id);
+    let instance_dev_path = CStr::from_bytes_with_nul(instance_dev_path_str.as_bytes())
+        .expect("Failed to create CStr for instance device path");
+
+    let instance_fd = unsafe {
+        libc::open(
+            instance_dev_path.as_ptr() as *const libc::c_char,
+            libc::O_RDWR,
+        )
+    };
+
+    if instance_fd < 0 {
+        error!(
+            "Failed to open instance device {:?}: {}",
+            instance_dev_path,
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+
+    // We need to copy execution metadate to axvisor to start the loader instance.
+    let mut args_builder = ArgsLayoutBuilder::new();
+    // Arguments, arg[0] is the executable file.
+    for arg in &args.exec_args {
+        args_builder.add_argv(arg);
+    }
+    // Set EQTEST environment variable
+    args_builder.add_envv("EQTEST=1");
+
+    let args_layout = args_builder.build();
+
+    if true {
+        // Print the stack layout for debugging purposes
+        let layout = ArgsLayoutRef::new(args_layout.as_ref(), None);
+
+        for (i, arg) in unsafe { layout.argv_iter() }.enumerate() {
+            println!("  [{i}] {}", arg.to_str().unwrap());
+        }
+        for (i, env) in unsafe { layout.envv_iter() }.enumerate() {
+            println!("  [env {i}] {}", env.to_str().unwrap());
+        }
+        for auxv in unsafe { layout.auxv_iter() } {
+            println!("  [auxv] {:?}", auxv);
+        }
+    }
+
+    // Copy the stack layout to axvisor through shared pages
+    // page by page.
+    let mut shared_pages: Vec<*mut c_void> = Vec::new();
+    copy_content_to_shared_pages(&mut shared_pages, args_layout.as_ref());
+
+    let res = hvc_setup_instance(
+        instance_id as _,
+        args_layout.len() as u64,
+        shared_pages.as_ptr() as u64,
+        shared_pages.len() as u64,
+    );
+    if res < 0 {
+        panic!("Failed to setup instance: {}", res);
+    }
+
+    info!("Setup instance success, instance ID = [{}]", instance_id);
+
+    free_shared_pages(&mut shared_pages);
+
+    proxy::setup_proxy_daemon(instance_id, instance_fd);
+
+    // In the next step, this process will turn into a daemon proxy process of the junction instance,
+    // which handles the system calls which can not be handled by the axvisor directly.
+    proxy::daemon::poll();
+}
+
+pub fn remove_instance(instance_id: u64) {
+    info!("Remove instance with ID: {}", instance_id);
+
+    crate::ioctl::ioctl_remove_instance(instance_id).expect("Failed to remove instance");
+
+    info!("Instance with ID {} removed successfully", instance_id);
 }
 
 pub fn init_shim() {
