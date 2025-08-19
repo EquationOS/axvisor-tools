@@ -62,6 +62,10 @@ impl SyscallQueueBuffer {
 
         true
     }
+
+    pub fn should_exit(&self) -> bool {
+        self.meta.exit()
+    }
 }
 
 /// Setup the sysycall queue buffer for SCF (system call forwarding).

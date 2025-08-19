@@ -15,6 +15,12 @@ pub fn poll() {
             if !scf.push_syscall_response(index, ans as u64) {
                 error!("Failed to push syscall response {index}");
             }
+        } else if scf.should_exit() {
+            info!(
+                "Instance [{}] SCF daemon exiting as requested",
+                super::instance_id()
+            );
+            break;
         } else {
             // No request available, sleep or yield to avoid busy waiting
             std::hint::spin_loop();
