@@ -56,7 +56,7 @@ pub fn proxy_sendmsg(fd: u64, msg_ptr: u64, flags: u64) -> LinuxResult<u64> {
         );
     }
 
-    debug!("Proxy sendmsg called on fd: {}, result: {}", fd, ret);
+    warn!("Proxy sendmsg called on fd: {}, result: {}", fd, ret);
 
     Ok(ret as u64)
 }
@@ -72,7 +72,7 @@ pub fn proxy_recvmsg(fd: u64, msg_ptr: u64, flags: u64) -> LinuxResult<u64> {
         );
     }
 
-    debug!("Proxy recvmsg called on fd: {}, result: {}", fd, ret);
+    warn!("Proxy recvmsg called on fd: {}, result: {}", fd, ret);
 
     Ok(ret as u64)
 }
