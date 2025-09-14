@@ -3,6 +3,7 @@ use libc::MAP_LOCKED;
 use axerrno::{LinuxError, LinuxResult};
 use equation_defs::shm::ShmArgs;
 use memory_addr::is_aligned_4k;
+use memory_addr::PAGE_SIZE_2M;
 
 use crate::hvc;
 use crate::proxy::instance_id;
@@ -78,7 +79,7 @@ pub fn sys_shmat_with_shmget_args(
     let shmget_args = unsafe { (shmget_args as *mut ShmArgs).as_mut().unwrap() };
     let size = shmget_args.size;
     let shmkey = shmget_args.shmkey;
-    let shmget_flg = shmget_args.shmflg;
+    // let shmget_flg = shmget_args.shmflg;
 
     if res == libc::MAP_FAILED {
         error!(
@@ -111,6 +112,11 @@ pub fn sys_shmat_with_shmget_args(
                 );
             }
 
+            // After pages are touched, read pagemap and print info for debugging.
+            if false {
+                print_pagemap_info(shmaddr as usize, size as usize);
+            }
+
             // Notify the hypervisor about the shared memory attachment.
             // This is necessary to sync the mapping with the instance.
             // The hypervisor will handle the actual mapping in the instance's address space.
@@ -122,7 +128,7 @@ pub fn sys_shmat_with_shmget_args(
                 shmkey as u64,
                 shmaddr as u64,
                 size as u64,
-                shmget_flg as u64,
+                shmat_flg as u64,
             );
 
             if res == -1 {
@@ -269,6 +275,12 @@ fn print_pagemap_info(vaddr_start: usize, length: usize) {
 
     while offset < length {
         let va = vaddr_start + offset;
+
+        if va % PAGE_SIZE_2M != 0 {
+            offset += pagesz;
+            continue;
+        }
+
         let entry = match read_pagemap_entry(pid, va) {
             Ok(e) => e,
             Err(e) => {
@@ -282,12 +294,17 @@ fn print_pagemap_info(vaddr_start: usize, length: usize) {
         if page_index != last_printed_index {
             last_printed_index = page_index;
             println!(
-                "VA {:#x} (+{:#x}) => present={} pfn={} (page_index={})",
-                va, offset, present, pfn, page_index
+                "VA {:#x} (+{:#x}) => present={} pfn={} gpa={:#x} (page_index={})",
+                va,
+                offset,
+                present,
+                pfn,
+                pfn << 12,
+                page_index
             );
         }
 
-        offset += pagesz;
+        offset += PAGE_SIZE_2M;
     }
 }
 
@@ -361,8 +378,10 @@ pub fn sys_mmap_to_memfd(
     // Touch the pages to ensure they are mapped and locked.
     touch_pages(res as *mut u8, length as usize);
 
-    // After pages are touched, read pagemap and print the first 16 pages info for debugging.
-    print_pagemap_info(res as usize, 0x1000 * 16);
+    // After pages are touched, read pagemap and print info for debugging.
+    if false {
+        print_pagemap_info(res as usize, length as usize);
+    }
 
     unsafe {
         *(res as *mut usize) = 0xdeadbeef; // just to use the variable and avoid warnings
