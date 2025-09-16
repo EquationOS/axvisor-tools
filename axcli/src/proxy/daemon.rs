@@ -67,6 +67,8 @@ fn handle_syscall(syscall_id: Sysno, args: &[u64; 6]) -> LinuxResult<u64> {
         Sysno::socket => net::proxy_socket(args[0], args[1], args[2]),
         Sysno::connect => net::proxy_connect(args[0], args[1], args[2]),
         Sysno::arch_prctl => misc::sys_arch_prctl(args[0], args[1]),
+        Sysno::sendmsg => net::proxy_sendmsg(args[0], args[1], args[2]),
+        Sysno::recvmsg => net::proxy_recvmsg(args[0], args[1], args[2]),
         _ => {
             error!("Unhandled syscall ID: {:?}", syscall_id);
             return Err(LinuxError::ENOSYS);
