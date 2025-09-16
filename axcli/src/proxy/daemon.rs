@@ -53,9 +53,29 @@ fn handle_syscall(syscall_id: Sysno, args: &[u64; 6]) -> LinuxResult<u64> {
         Sysno::statfs => fs::proxy_statfs(args[0], args[1]),
         Sysno::getdents64 => fs::proxy_getdents64(args[0], args[1], args[2]),
         Sysno::readlinkat => fs::proxy_readlinkat(args[0], args[1], args[2], args[3]),
+        Sysno::readlink => fs::proxy_readlink(args[0], args[1], args[2]),
         Sysno::getcwd => fs::proxy_getcwd(args[0], args[1]),
         Sysno::mmap => {
-            fs::proxy_mmap_into_pagecache(args[0], args[1], args[2], args[3], args[4], args[5])
+            use memory_addr::PAGE_SIZE_4K;
+
+            let fd = args[4] as i32;
+            let offset = args[5] as usize;
+
+            match offset % PAGE_SIZE_4K {
+                0 => fs::proxy_mmap_into_pagecache(
+                    args[0], args[1], args[2], args[3], args[4], args[5],
+                ),
+                // Since the offset should be aligned to 4K,
+                // if offset % 4K == 1, it means that the caller wants to mmap to a `memfd`.
+                // see `shim/src/mm/mmap.rs` for details.
+                1 => {
+                    shm::sys_mmap_to_memfd(args[0], args[1], args[2], args[3], args[4], args[5] - 1)
+                }
+                _ => {
+                    error!("mmap with unaligned offset: {:#x}, fd: {}.", offset, fd);
+                    return Err(LinuxError::EINVAL);
+                }
+            }
         }
         Sysno::pread64 => fs::proxy_pread64(args[0], args[1], args[2], args[3]),
         Sysno::getrandom => misc::sys_getrandom(args[0], args[1], args[2]),
@@ -67,6 +87,10 @@ fn handle_syscall(syscall_id: Sysno, args: &[u64; 6]) -> LinuxResult<u64> {
         Sysno::socket => net::proxy_socket(args[0], args[1], args[2]),
         Sysno::connect => net::proxy_connect(args[0], args[1], args[2]),
         Sysno::arch_prctl => misc::sys_arch_prctl(args[0], args[1]),
+        Sysno::sendmsg => net::proxy_sendmsg(args[0], args[1], args[2]),
+        Sysno::recvmsg => net::proxy_recvmsg(args[0], args[1], args[2]),
+        Sysno::memfd_create => shm::sys_create_memfd(args[0], args[1]),
+        Sysno::ftruncate => fs::proxy_ftruncate(args[0], args[1]),
         _ => {
             error!("Unhandled syscall ID: {:?}", syscall_id);
             return Err(LinuxError::ENOSYS);

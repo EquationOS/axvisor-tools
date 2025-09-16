@@ -312,6 +312,48 @@ pub fn proxy_readlinkat(
     Ok(ret as u64)
 }
 
+pub fn proxy_readlink(path_ptr: u64, buf_ptr: u64, buf_len: u64) -> LinuxResult<u64> {
+    // Convert the path pointer to a Rust string
+    let path = unsafe {
+        let cstr = std::ffi::CStr::from_ptr(path_ptr as *const i8);
+        cstr.to_string_lossy().into_owned()
+    };
+
+    trace!(
+        "Proxying readlink syscall for path: \"{}\", buf_ptr: {:#x}, buf_len: {}",
+        path,
+        buf_ptr,
+        buf_len
+    );
+
+    // Call the actual filesystem readlink function
+    let ret =
+        unsafe { libc::readlink(path_ptr as *const i8, buf_ptr as *mut i8, buf_len as usize) };
+
+    if ret < 0 {
+        error!(
+            "Failed to read link at path: {}, error {}",
+            path,
+            std::io::Error::last_os_error()
+        );
+        return Err(LinuxError::EIO);
+    }
+
+    let return_path = String::from(unsafe {
+        core::str::from_utf8_unchecked(core::slice::from_raw_parts(
+            buf_ptr as *const u8,
+            ret as usize,
+        ))
+    });
+
+    debug!(
+        "readlink()=> path: \"{}\", returned {} bytes, {}",
+        path, ret, return_path
+    );
+
+    Ok(ret as u64)
+}
+
 pub fn proxy_getcwd(buf_ptr: u64, size: u64) -> LinuxResult<u64> {
     // Call the actual filesystem getcwd function
     let ret = unsafe { libc::getcwd(buf_ptr as *mut i8, size as usize) };
@@ -652,6 +694,39 @@ pub fn proxy_pread64(fd: u64, buf_ptr: u64, count: u64, offset: u64) -> LinuxRes
             "pread64 failed with error: {}",
             std::io::Error::last_os_error()
         );
+    }
+
+    Ok(ret as u64)
+}
+
+pub fn proxy_ftruncate(fd: u64, length: u64) -> LinuxResult<u64> {
+    debug!(
+        "Proxying ftruncate syscall for fd: {}, length: {}",
+        fd, length
+    );
+
+    // Check if the file descriptor exists in the FD_LIST
+    let path = if let Some(path) = FD_LIST.lock().unwrap().get(&(fd as i32)) {
+        path.clone()
+    } else {
+        warn!("File descriptor {} not found in FD_LIST", fd);
+        return Err(LinuxError::ENOENT);
+    };
+
+    // Call the actual filesystem ftruncate function
+    let ret = unsafe { libc::ftruncate(fd as i32, length as libc::off_t) };
+
+    debug!(
+        "Truncated fd:{}, path \"{}\" to length: {}, result: {}",
+        fd, path, length, ret
+    );
+
+    if ret < 0 {
+        error!(
+            "ftruncate failed with error: {}",
+            std::io::Error::last_os_error()
+        );
+        return Err(LinuxError::EIO);
     }
 
     Ok(ret as u64)
