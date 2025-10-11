@@ -1,6 +1,7 @@
 //! Proxy for network operations.
 
 use axerrno::LinuxResult;
+use libc::{msghdr, CMSG_DATA, CMSG_FIRSTHDR, CMSG_LEN};
 
 use crate::proxy::FD_LIST;
 
@@ -62,7 +63,7 @@ pub fn proxy_sendmsg(fd: u64, msg_ptr: u64, flags: u64) -> LinuxResult<u64> {
 }
 
 pub fn proxy_recvmsg(fd: u64, msg_ptr: u64, flags: u64) -> LinuxResult<u64> {
-    let ret = unsafe { libc::recvmsg(fd as i32, msg_ptr as *mut libc::msghdr, flags as i32) };
+    let ret = unsafe { libc::recvmsg(fd as i32, msg_ptr as *mut msghdr, flags as i32) };
 
     if ret < 0 {
         error!(
@@ -73,6 +74,23 @@ pub fn proxy_recvmsg(fd: u64, msg_ptr: u64, flags: u64) -> LinuxResult<u64> {
     }
 
     warn!("Proxy recvmsg called on fd: {}, result: {}", fd, ret);
+
+    let cmptr = unsafe { CMSG_FIRSTHDR(msg_ptr as *mut msghdr) };
+    if !cmptr.is_null() {
+        let cmsg = unsafe { &*cmptr };
+        if cmsg.cmsg_len == unsafe { CMSG_LEN(core::mem::size_of::<i32>() as u32) } as usize
+            && cmsg.cmsg_level == libc::SOL_SOCKET
+            && cmsg.cmsg_type == libc::SCM_RIGHTS
+        {
+            let fd_out = unsafe { *(CMSG_DATA(cmptr) as *const i32) };
+
+            warn!("Received fd: {} on fd: {}", fd_out, fd);
+            FD_LIST
+                .lock()
+                .unwrap()
+                .insert(fd_out, format!("MEMFD-{} (via recvmsg)", fd));
+        }
+    }
 
     Ok(ret as u64)
 }
