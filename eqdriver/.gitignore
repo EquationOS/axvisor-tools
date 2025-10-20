@@ -3,6 +3,8 @@ modules
 .tmp_versions
 .vscode
 __pycache__
+.cache
+compile_commands.json
 
 *.so
 *.ko
