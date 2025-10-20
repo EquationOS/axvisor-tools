@@ -1,5 +1,6 @@
 use std::ffi::CStr;
 
+use equation_defs::gate::region::KSCHED_SHM_REGION_SIZE;
 use libc::c_void;
 
 use pi_memory_layout::{ArgsLayoutBuilder, ArgsLayoutRef};
@@ -135,6 +136,36 @@ pub fn remove_instance(instance_id: u64) {
 }
 
 pub fn init_shim() {
-    info!("Init shim");
-    hvc_init_shim();
+    const KSCHED_DEV_PATH_STR: &str = "/dev/ksched\0";
+    let ksched_dev_path = CStr::from_bytes_with_nul(KSCHED_DEV_PATH_STR.as_bytes())
+        .expect("Failed to create CStr for ksched device path");
+
+    let ksched_fd = unsafe {
+        libc::open(
+            ksched_dev_path.as_ptr() as *const libc::c_char,
+            libc::O_RDWR,
+        )
+    };
+
+    if ksched_fd < 0 {
+        error!(
+            "Failed to open ksched device {:?}: {}",
+            ksched_dev_path,
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    let ksched_shm_base = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            KSCHED_SHM_REGION_SIZE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            ksched_fd,
+            0,
+        )
+    };
+
+    info!("Init shim, ksched_shm_base: 0x{:#?}", ksched_shm_base);
+    hvc_init_shim(ksched_shm_base as _);
 }

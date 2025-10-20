@@ -36,8 +36,8 @@ pub fn hvc_debug() {
     info!("hvc_debug result: {:#x}", result);
 }
 
-pub fn hvc_init_shim() {
-    let result = trigger_hypercall(HyperCallCode::HInitShim, 0, 0, 0, 0, 0, 0);
+pub fn hvc_init_shim(ksched_shm_base: u64) {
+    let result = trigger_hypercall(HyperCallCode::HInitShim, ksched_shm_base, 0, 0, 0, 0, 0);
     info!("hvc_init_shim result: {:#x}", result);
 }
 
