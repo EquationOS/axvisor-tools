@@ -417,6 +417,7 @@ dependencies = [
  "shenango_defs",
  "spin",
  "syscalls",
+ "tock-registers",
  "x86",
  "x86_uintr",
 ]
@@ -1290,7 +1291,6 @@ dependencies = [
 [[package]]
 name = "x86_uintr"
 version = "0.1.0"
-source = "git+https://github.com/arceos-org/x86_uintr.git#cfe77e13977d8421f1cbd0098454178a56c0ba7e"
 dependencies = [
  "atomic",
  "bitflags 2.9.1",

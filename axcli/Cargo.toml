@@ -32,6 +32,9 @@ pi_memory_layout = { path = "../../../crates/pi_memory_layout" }
 [patch."https://github.com/EquationOS/equation_defs.git"]
 equation_defs = { path = "../../../crates/equation_defs" }
 
+[patch."https://github.com/arceos-org/x86_uintr.git"]
+x86_uintr = { path = "../../../crates/x86_uintr" }
+
 [patch.crates-io]
 memory_addr = { path = "../../../crates/memory_addr/memory_addr" }
 bitmaps = { path = "../../../crates/bitmaps" }
