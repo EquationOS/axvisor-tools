@@ -91,6 +91,7 @@ fn handle_syscall(syscall_id: Sysno, args: &[u64; 6]) -> LinuxResult<u64> {
         Sysno::recvmsg => net::proxy_recvmsg(args[0], args[1], args[2]),
         Sysno::memfd_create => shm::sys_create_memfd(args[0], args[1]),
         Sysno::ftruncate => fs::proxy_ftruncate(args[0], args[1]),
+        Sysno::truncate => fs::proxy_truncate(args[0], args[1]),
         _ => {
             error!("Unhandled syscall ID: {:?}", syscall_id);
             return Err(LinuxError::ENOSYS);

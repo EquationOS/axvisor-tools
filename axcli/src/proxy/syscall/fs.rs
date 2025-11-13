@@ -726,7 +726,37 @@ pub fn proxy_ftruncate(fd: u64, length: u64) -> LinuxResult<u64> {
             "ftruncate failed with error: {}",
             std::io::Error::last_os_error()
         );
-        return Err(LinuxError::EIO);
+    }
+
+    Ok(ret as u64)
+}
+
+
+pub fn proxy_truncate(path_ptr: u64, length: u64) -> LinuxResult<u64> {
+    // Convert the path pointer to a Rust string
+    let path = unsafe {
+        let cstr = std::ffi::CStr::from_ptr(path_ptr as *const i8);
+        cstr.to_string_lossy().into_owned()
+    };
+
+    debug!(
+        "Proxying truncate syscall for path: \"{}\", length: {}",
+        path, length
+    );
+
+    // Call the actual filesystem truncate function
+    let ret = unsafe { libc::truncate(path_ptr as *const i8, length as libc::off_t) };
+
+    debug!(
+        "Truncated path \"{}\" to length: {}, result: {}",
+        path, length, ret
+    );
+
+    if ret < 0 {
+        error!(
+            "truncate failed with error: {}",
+            std::io::Error::last_os_error()
+        );
     }
 
     Ok(ret as u64)
