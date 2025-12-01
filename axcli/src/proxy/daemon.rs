@@ -43,6 +43,7 @@ fn handle_syscall(syscall_id: Sysno, args: &[u64; 6]) -> LinuxResult<u64> {
     let res = match syscall_id {
         // Handle specific syscalls here
         Sysno::write => fs::proxy_write(args[0], args[1], args[2]),
+        Sysno::pwritev2 => fs::proxy_pwritev2(args[0], args[1], args[2], args[3], args[4]),
         Sysno::read => fs::proxy_read(args[0], args[1], args[2]),
         Sysno::access => fs::proxy_access(args[0], args[1]),
         Sysno::openat => fs::proxy_openat_with_stat(args[0], args[1], args[2], args[3], args[4]),

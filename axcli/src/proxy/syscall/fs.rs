@@ -456,6 +456,31 @@ pub fn proxy_write(fd: u64, buf_ptr: u64, count: u64) -> LinuxResult<u64> {
     Ok(ret as u64)
 }
 
+pub fn proxy_pwritev2(
+    fd: u64,
+    iov: u64,
+    iocnt: u64,
+    offset: u64,
+    flags: u64,
+) -> LinuxResult<u64> {
+    info!(
+        "Proxying pwritev2 syscall for fd: {}, iocnt: {}, offset: {:#x}, flags: {:#x}, unimplemented",
+        fd, iocnt, offset, flags
+    );
+
+    let ret = unsafe {
+        libc::pwritev2(
+            fd as i32,
+            iov as *const libc::iovec,
+            iocnt as i32,
+            offset as libc::off_t,
+            flags as i32,
+        )
+    };
+
+    Ok(ret as u64)
+}
+
 fn escape_c_string_style(bytes: &[u8]) -> String {
     let mut s = String::new();
     for &b in bytes {
