@@ -456,13 +456,7 @@ pub fn proxy_write(fd: u64, buf_ptr: u64, count: u64) -> LinuxResult<u64> {
     Ok(ret as u64)
 }
 
-pub fn proxy_pwritev2(
-    fd: u64,
-    iov: u64,
-    iocnt: u64,
-    offset: u64,
-    flags: u64,
-) -> LinuxResult<u64> {
+pub fn proxy_pwritev2(fd: u64, iov: u64, iocnt: u64, offset: u64, flags: u64) -> LinuxResult<u64> {
     info!(
         "Proxying pwritev2 syscall for fd: {}, iocnt: {}, offset: {:#x}, flags: {:#x}, unimplemented",
         fd, iocnt, offset, flags
@@ -755,7 +749,6 @@ pub fn proxy_ftruncate(fd: u64, length: u64) -> LinuxResult<u64> {
 
     Ok(ret as u64)
 }
-
 
 pub fn proxy_truncate(path_ptr: u64, length: u64) -> LinuxResult<u64> {
     // Convert the path pointer to a Rust string

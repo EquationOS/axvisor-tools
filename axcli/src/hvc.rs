@@ -88,22 +88,23 @@ pub fn hvc_setup_instance(
 
 pub fn hvc_daemon_shmat(
     instance_id: u64,
+    process_id: u64,
     shmkey: u64,
     shmaddr: u64,
     shmsize: u64,
     shmflg: u64,
 ) -> isize {
-    info!(
-        "[*] Attaching shm instance ID:{}, key: {:#x}, addr: {:#x}, size: {:#x}, flags: {:#x}",
-        instance_id, shmkey, shmaddr, shmsize, shmflg
+    debug!(
+        "[*] Attaching shm instance ID:{}, process ID: {}, key: {:#x}, addr: {:#x}, size: {:#x}, flags: {:#x}",
+        instance_id, process_id, shmkey, shmaddr, shmsize, shmflg
     );
     trigger_hypercall(
         HyperCallCode::HIVCSHMAt,
         instance_id,
+        process_id,
         shmkey,
         shmaddr,
         shmsize,
         shmflg,
-        0,
     )
 }

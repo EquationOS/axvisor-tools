@@ -120,21 +120,24 @@ pub fn sys_shmat_with_shmget_args(
             // Notify the hypervisor about the shared memory attachment.
             // This is necessary to sync the mapping with the instance.
             // The hypervisor will handle the actual mapping in the instance's address space.
-            // The instance ID is used to identify the instance that is attaching the shared memory.
-            // The hypervisor will return the GPA (guest physical address) of the shared memory region
-            // which is then used by the instance to access the shared memory.
+            // The instance ID is used to identify the instance that is attaching the shared memory,
+            // The process ID is passed by SCF and used to identify the process within the instance,
+            // Note that underlying hypervisor will establish the mapping based on the process ID
+            // in the process's state-1 page table.
             let res = hvc::hvc_daemon_shmat(
                 instance_id() as u64,
+                shmget_args.process_id as u64,
                 shmkey as u64,
                 shmaddr as u64,
                 size as u64,
                 shmat_flg as u64,
             );
 
-            if res == -1 {
+            if res < 0 {
                 error!(
-                    "Failed to attach shared memory for instance ID: {}, errno: {}",
+                    "Failed to attach shared memory for instance ID: {}, process {} errno: {}",
                     instance_id(),
+                    shmget_args.process_id,
                     res
                 );
                 return Err(LinuxError::ENOMEM);
@@ -144,10 +147,6 @@ pub fn sys_shmat_with_shmget_args(
 
             // Update the shmget_args with the actual shared memory address.
             shmget_args.shmgva = shmaddr as usize;
-            // The shared memory GPA (guest physical address) is set to the result of the hypercall.
-            // This is the address that the instance will use to access the shared memory.
-            // It is assumed that the hypercall will return the GPA of the shared memory region.
-            shmget_args.shmgpa = res as usize;
         }
     }
 
@@ -394,7 +393,7 @@ pub fn sys_mmap_to_memfd(
     // The hypervisor will return the GPA (guest physical address) of the shared memory region
     // which is then used by the instance to access the shared memory.
     // Just reuse the `hvc_daemon_shmat` function for simplicity.
-    let res = hvc::hvc_daemon_shmat(instance_id() as u64, fd, addr, length, flags);
+    let res = hvc::hvc_daemon_shmat(instance_id() as u64, 1, fd, addr, length, flags);
 
     if res == -1 {
         error!(
