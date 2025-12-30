@@ -30,11 +30,7 @@ typedef struct eq_instance_vdev
 	/// - 2: Running, the instance is running.
 	int status;
 
-	uint64_t scf_region_base_gpa;
-	uint64_t scf_region_size;
-
-	uint64_t page_cache_pool_base_gpa;
-	uint64_t page_cache_pool_size;
+	eq_instance_metadata_t metadata;
 } eq_instance_vdev_t;
 
 static eq_instance_vdev_t instances_array[MAX_EQ_INSTANCES_NUM];
@@ -141,16 +137,16 @@ static int instance_mmap(struct file *file, struct vm_area_struct *vma)
 	// This is a special case for SCF queue regions.
 	if (vma->vm_pgoff == MMAP_SCF_MAGIC_NUMBER)
 	{
-		if (mmap_size > instance_vdev->scf_region_size)
+		if (mmap_size > instance_vdev->metadata.scf_region_size)
 		{
 			ERROR(
 				"SCF queue region size 0x%llx is smaller than requested mmap "
 				"size "
 				"0x%lx\n",
-				instance_vdev->scf_region_size, mmap_size);
+				instance_vdev->metadata.scf_region_size, mmap_size);
 			return -EINVAL;
 		}
-		pfn_start = instance_vdev->scf_region_base_gpa >> PAGE_SHIFT;
+		pfn_start = instance_vdev->metadata.scf_region_base_gpa >> PAGE_SHIFT;
 		INFO(
 			"[%s] Instance [%d] SCF queue region in instance %s, "
 			"va[0x%lx-0x%lx] size 0x%lx\n",
@@ -160,22 +156,24 @@ static int instance_mmap(struct file *file, struct vm_area_struct *vma)
 			"[%s] Instance [%d] SCF queue region in instance %s, "
 			"map to gpa: [0x%llx~0x%llx] size: 0x%llx\n",
 			__func__, instance_id, instance_vdev->name,
-			instance_vdev->scf_region_base_gpa,
-			instance_vdev->scf_region_base_gpa + instance_vdev->scf_region_size,
-			instance_vdev->scf_region_size);
+			instance_vdev->metadata.scf_region_base_gpa,
+			instance_vdev->metadata.scf_region_base_gpa +
+				instance_vdev->metadata.scf_region_size,
+			instance_vdev->metadata.scf_region_size);
 	}
 	else if (vma->vm_pgoff == MMAP_PAGE_CACHE_MAGIC_NUMBER)
 	{
-		if (mmap_size > instance_vdev->page_cache_pool_size)
+		if (mmap_size > instance_vdev->metadata.page_cache_pool_size)
 		{
 			ERROR(
 				"Page cache pool size 0x%llx is smaller than requested mmap "
 				"size "
 				"0x%lx\n",
-				instance_vdev->page_cache_pool_size, mmap_size);
+				instance_vdev->metadata.page_cache_pool_size, mmap_size);
 			return -EINVAL;
 		}
-		pfn_start = instance_vdev->page_cache_pool_base_gpa >> PAGE_SHIFT;
+		pfn_start =
+			instance_vdev->metadata.page_cache_pool_base_gpa >> PAGE_SHIFT;
 		INFO(
 			"[%s] Instance [%d] Page cache pool in instance %s, "
 			"va[0x%lx-0x%lx] size 0x%lx\n",
@@ -185,10 +183,10 @@ static int instance_mmap(struct file *file, struct vm_area_struct *vma)
 			"[%s] Instance [%d] Page cache pool in instance %s, "
 			"map to gpa: [0x%llx~0x%llx] size: 0x%llx\n",
 			__func__, instance_id, instance_vdev->name,
-			instance_vdev->page_cache_pool_base_gpa,
-			instance_vdev->page_cache_pool_base_gpa +
-				instance_vdev->page_cache_pool_size,
-			instance_vdev->page_cache_pool_size);
+			instance_vdev->metadata.page_cache_pool_base_gpa,
+			instance_vdev->metadata.page_cache_pool_base_gpa +
+				instance_vdev->metadata.page_cache_pool_size,
+			instance_vdev->metadata.page_cache_pool_size);
 	}
 
 	INFO(
@@ -223,44 +221,36 @@ int create_instance(eq_create_instance_arg_t *arg)
 	int instance_id;
 	int ret = 0;
 	eq_instance_vdev_t *instance_vdev;
-	__u64 *scf_queue_base, *scf_queue_size;
-	__u64 *page_cache_base, *page_cache_size;
-	phys_addr_t scf_queue_base_ptr_gpa, scf_queue_size_ptr_gpa;
-	phys_addr_t page_cache_base_ptr_gpa, page_cache_size_ptr_gpa;
+
+	eq_instance_metadata_t *instance_metadata;
+	phys_addr_t instance_metadata_ptr_gpa;
 
 	// pid_t pid = task_pid_nr(current);
 	// const char *comm = current->comm;
 
-	scf_queue_base = kmalloc(sizeof(__u64), GFP_KERNEL);
-	scf_queue_size = kmalloc(sizeof(__u64), GFP_KERNEL);
-	page_cache_base = kmalloc(sizeof(__u64), GFP_KERNEL);
-	page_cache_size = kmalloc(sizeof(__u64), GFP_KERNEL);
-
-	if (!scf_queue_base || !scf_queue_size || !page_cache_base ||
-		!page_cache_size)
+	instance_metadata = kmalloc(sizeof(eq_instance_metadata_t), GFP_KERNEL);
+	if (!instance_metadata)
 	{
-		ERROR("Failed to allocate memory\n");
+		ERROR("Failed to allocate memory for instance metadata\n");
 		ret = -ENOMEM;
 		return ret;
 	}
 
-	scf_queue_base_ptr_gpa = virt_to_phys(scf_queue_base);
-	scf_queue_size_ptr_gpa = virt_to_phys(scf_queue_size);
-	page_cache_base_ptr_gpa = virt_to_phys(page_cache_base);
-	page_cache_size_ptr_gpa = virt_to_phys(page_cache_size);
+	instance_metadata_ptr_gpa = virt_to_phys(instance_metadata);
 
 	// Create a new instance through the hypervisor call.
 	instance_id = hvc_create_instance(
-		arg->instance_type, arg->mapping_type, scf_queue_base_ptr_gpa,
-		scf_queue_size_ptr_gpa, page_cache_base_ptr_gpa,
-		page_cache_size_ptr_gpa);
+		arg->instance_type, arg->mapping_type, instance_metadata_ptr_gpa);
 
 	INFO(
 		"Creating instance with type %llu, mapping type %llu\n"
 		"scf queue base @ 0x%llx, size 0x%llx\n"
 		"page cache base @ 0x%llx, size 0x%llx\n",
-		arg->instance_type, arg->mapping_type, *scf_queue_base, *scf_queue_size,
-		*page_cache_base, *page_cache_size);
+		arg->instance_type, arg->mapping_type,
+		instance_metadata->scf_region_base_gpa,
+		instance_metadata->scf_region_size,
+		instance_metadata->page_cache_pool_base_gpa,
+		instance_metadata->page_cache_pool_size);
 
 	if (instance_id < 0)
 	{
@@ -314,10 +304,9 @@ int create_instance(eq_create_instance_arg_t *arg)
 	instance_vdev->active = true;
 	instance_vdev->status = STATUS_CREATED;
 
-	instance_vdev->scf_region_base_gpa = *scf_queue_base;
-	instance_vdev->scf_region_size = *scf_queue_size;
-	instance_vdev->page_cache_pool_base_gpa = *page_cache_base;
-	instance_vdev->page_cache_pool_size = *page_cache_size;
+	memcpy(
+		&instance_vdev->metadata, instance_metadata,
+		sizeof(eq_instance_metadata_t));
 
 	snprintf(
 		instance_vdev->name, sizeof(instance_vdev->name), "%s%d",
@@ -346,10 +335,7 @@ int create_instance(eq_create_instance_arg_t *arg)
 	instance_vdev->status = STATUS_SETTING_UP;
 
 err_free:
-	kfree(scf_queue_base);
-	kfree(scf_queue_size);
-	kfree(page_cache_base);
-	kfree(page_cache_size);
+	kfree(instance_metadata);
 
 	return ret;
 }

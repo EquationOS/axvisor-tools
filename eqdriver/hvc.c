@@ -25,13 +25,11 @@ int hvc_call(
 }
 
 int hvc_create_instance(
-	__u64 instance_type, __u64 mapping_type, __u64 scf_queue_base_ptr,
-	__u64 scf_queue_size_ptr, __u64 page_cache_base_ptr,
-	__u64 page_cache_size_ptr)
+	__u64 instance_type, __u64 mapping_type, __u64 instance_metadata_ptr)
 {
 	return hvc_call(
-		HCreateInstance, instance_type, mapping_type, scf_queue_base_ptr,
-		scf_queue_size_ptr, page_cache_base_ptr, page_cache_size_ptr);
+		HCreateInstance, instance_type, mapping_type, instance_metadata_ptr, 0,
+		0, 0);
 }
 
 int hvc_shmget(__u64 key, __u64 size, __u64 shmflg, __u64 shm_base_ptr)
