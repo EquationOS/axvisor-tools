@@ -2,12 +2,12 @@ use libc::MAP_LOCKED;
 
 use axerrno::{LinuxError, LinuxResult};
 use equation_defs::shm::ShmArgs;
-use memory_addr::is_aligned_4k;
 use memory_addr::PAGE_SIZE_2M;
+use memory_addr::is_aligned_4k;
 
 use crate::hvc;
-use crate::proxy::instance_id;
 use crate::proxy::FD_LIST;
+use crate::proxy::instance_id;
 
 /// Proxy for the `shmget` syscall,
 /// the daemon process does nothing but just forward the request to
@@ -356,7 +356,13 @@ pub fn sys_mmap_to_memfd(
     if res == libc::MAP_FAILED {
         error!(
             "mmap to memfd failed with addr: {:#x}, length: {:#x}, prot: {:#x}, flags: {:#x}, fd: {}, offset: {:#x}, errno: {}",
-            addr, length, prot, flags, fd, offset, std::io::Error::last_os_error()
+            addr,
+            length,
+            prot,
+            flags,
+            fd,
+            offset,
+            std::io::Error::last_os_error()
         );
         return Err(LinuxError::ENOMEM);
     }

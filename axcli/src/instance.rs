@@ -5,53 +5,18 @@ use libc::c_void;
 
 use pi_memory_layout::{ArgsLayoutBuilder, ArgsLayoutRef};
 
-use crate::hvc::{hvc_create_instance, hvc_init_shim, hvc_setup_instance};
+use crate::hvc::{hvc_init_shim, hvc_setup_instance};
 use crate::proxy;
 use crate::shared_pages::{copy_content_to_shared_pages, free_shared_pages};
 use crate::{ExecuteArgs, InstanceCreateArgs};
 
-const EQINSTANCE_DEV_PREFIX: &str = "/dev/eqinstance_";
-
-pub fn create_instance(args: InstanceCreateArgs) {
-    info!(
-        "Create {} instance with file path: {:?}",
-        match args.instance_type {
-            0 => "LibOS",
-            1 => "Kernel",
-            _ => panic!("Invalid instance type"),
-        },
-        args.file_path
-    );
-
-    let raw_file = std::fs::read(args.file_path).expect("Failed to read ELF file");
-
-    // Copy the raw file to axvisor through shared pages
-    // page by page.
-    let mut shared_pages: Vec<*mut c_void> = Vec::new();
-    copy_content_to_shared_pages(&mut shared_pages, raw_file.as_slice());
-
-    let iid = hvc_create_instance(
-        args.instance_type as _,
-        if args.one2onemapping { 0 } else { 1 } as _,
-        raw_file.len() as _,
-        shared_pages.as_ptr() as u64,
-        shared_pages.len() as _,
-    );
-
-    if iid < 0 {
-        panic!("Failed to create instance: {}", iid);
-    }
-
-    info!("Create instance success, instance ID = [{}]", iid);
-
-    free_shared_pages(&mut shared_pages);
-}
+pub const EQINSTANCE_DEV_PREFIX: &str = "/dev/eqinstance_";
 
 /// Remote execute in a instance setup by AxVisor.
 pub fn execute(args: ExecuteArgs) {
     // First, create the instance through ioctl, eqdriver will trigger the hvc to create the instance.
-    let instance_id = crate::ioctl::ioctl_create_instance()
-        .expect("Failed to create instance for dynamic loading");
+    let instance_id =
+        crate::ioctl::ioctl_create_libos().expect("Failed to create instance for dynamic loading");
 
     info!("Create instance success, instance ID = [{}]", instance_id);
 

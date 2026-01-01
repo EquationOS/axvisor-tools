@@ -5,6 +5,7 @@
 
 #include "includes/eqmanager.h"
 #include "includes/instance.h"
+#include "includes/ioctl_args.h"
 #include "includes/shm.h"
 #include "includes/utils.h"
 

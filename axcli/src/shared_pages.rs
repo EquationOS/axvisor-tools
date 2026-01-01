@@ -1,4 +1,4 @@
-use libc::{c_void, mmap, MAP_ANONYMOUS, MAP_POPULATE, MAP_PRIVATE, PROT_READ, PROT_WRITE};
+use libc::{MAP_ANONYMOUS, MAP_POPULATE, MAP_PRIVATE, PROT_READ, PROT_WRITE, c_void, mmap};
 
 use memory_addr::PAGE_SIZE_4K;
 

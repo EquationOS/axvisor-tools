@@ -30,6 +30,12 @@ typedef struct eq_instance_vdev
 	/// - 2: Running, the instance is running.
 	int status;
 
+	/// @brief Type of the instance.
+	/// - 0: staticlly linked LibOS instance.
+	/// - 1: dynamically linked LibOS instance.
+	/// - 2: microVM instance.
+	int instance_type;
+
 	eq_instance_metadata_t metadata;
 } eq_instance_vdev_t;
 
@@ -132,61 +138,118 @@ static int instance_mmap(struct file *file, struct vm_area_struct *vma)
 
 	mmap_size = vma->vm_end - vma->vm_start;
 
-	// Check if the offset is the SCF magic number.
-	// If so, we will map the SCF queue region.
-	// This is a special case for SCF queue regions.
-	if (vma->vm_pgoff == MMAP_SCF_MAGIC_NUMBER)
+	if (instance_vdev->instance_type == 0 || instance_vdev->instance_type == 1)
 	{
-		if (mmap_size > instance_vdev->metadata.scf_region_size)
+		// Check if the offset is the SCF magic number.
+		// If so, we will map the SCF queue region.
+		// This is a special case for SCF queue regions.
+		if (vma->vm_pgoff == MMAP_SCF_MAGIC_NUMBER)
+		{
+			if (mmap_size > instance_vdev->metadata.scf_region_size)
+			{
+				ERROR(
+					"SCF queue region size 0x%llx is smaller than requested "
+					"mmap "
+					"size "
+					"0x%lx\n",
+					instance_vdev->metadata.scf_region_size, mmap_size);
+				return -EINVAL;
+			}
+			pfn_start =
+				instance_vdev->metadata.scf_region_base_gpa >> PAGE_SHIFT;
+			INFO(
+				"[%s] Instance [%d] SCF queue region in instance %s, "
+				"va[0x%lx-0x%lx] size 0x%lx\n",
+				__func__, instance_id, instance_vdev->name, vma->vm_start,
+				vma->vm_end, vma->vm_end - vma->vm_start);
+			INFO(
+				"[%s] Instance [%d] SCF queue region in instance %s, "
+				"map to gpa: [0x%llx~0x%llx] size: 0x%llx\n",
+				__func__, instance_id, instance_vdev->name,
+				instance_vdev->metadata.scf_region_base_gpa,
+				instance_vdev->metadata.scf_region_base_gpa +
+					instance_vdev->metadata.scf_region_size,
+				instance_vdev->metadata.scf_region_size);
+		}
+		else if (vma->vm_pgoff == MMAP_PAGE_CACHE_MAGIC_NUMBER)
+		{
+			if (mmap_size > instance_vdev->metadata.page_cache_pool_size)
+			{
+				ERROR(
+					"Page cache pool size 0x%llx is smaller than requested "
+					"mmap "
+					"size "
+					"0x%lx\n",
+					instance_vdev->metadata.page_cache_pool_size, mmap_size);
+				return -EINVAL;
+			}
+			pfn_start =
+				instance_vdev->metadata.page_cache_pool_base_gpa >> PAGE_SHIFT;
+			INFO(
+				"[%s] Instance [%d] Page cache pool in instance %s, "
+				"va[0x%lx-0x%lx] size 0x%lx\n",
+				__func__, instance_id, instance_vdev->name, vma->vm_start,
+				vma->vm_end, vma->vm_end - vma->vm_start);
+			INFO(
+				"[%s] Instance [%d] Page cache pool in instance %s, "
+				"map to gpa: [0x%llx~0x%llx] size: 0x%llx\n",
+				__func__, instance_id, instance_vdev->name,
+				instance_vdev->metadata.page_cache_pool_base_gpa,
+				instance_vdev->metadata.page_cache_pool_base_gpa +
+					instance_vdev->metadata.page_cache_pool_size,
+				instance_vdev->metadata.page_cache_pool_size);
+		}
+		else
 		{
 			ERROR(
-				"SCF queue region size 0x%llx is smaller than requested mmap "
-				"size "
-				"0x%lx\n",
-				instance_vdev->metadata.scf_region_size, mmap_size);
+				"Invalid mmap offset 0x%lx for LibOS instance %s, expecting "
+				"SCF magic number 0x%x or Page Cache magic number 0x%x\n",
+				vma->vm_pgoff, instance_vdev->name, (int)MMAP_SCF_MAGIC_NUMBER,
+				(int)MMAP_PAGE_CACHE_MAGIC_NUMBER);
 			return -EINVAL;
 		}
-		pfn_start = instance_vdev->metadata.scf_region_base_gpa >> PAGE_SHIFT;
-		INFO(
-			"[%s] Instance [%d] SCF queue region in instance %s, "
-			"va[0x%lx-0x%lx] size 0x%lx\n",
-			__func__, instance_id, instance_vdev->name, vma->vm_start,
-			vma->vm_end, vma->vm_end - vma->vm_start);
-		INFO(
-			"[%s] Instance [%d] SCF queue region in instance %s, "
-			"map to gpa: [0x%llx~0x%llx] size: 0x%llx\n",
-			__func__, instance_id, instance_vdev->name,
-			instance_vdev->metadata.scf_region_base_gpa,
-			instance_vdev->metadata.scf_region_base_gpa +
-				instance_vdev->metadata.scf_region_size,
-			instance_vdev->metadata.scf_region_size);
 	}
-	else if (vma->vm_pgoff == MMAP_PAGE_CACHE_MAGIC_NUMBER)
+	else if (instance_vdev->instance_type == 2)
 	{
-		if (mmap_size > instance_vdev->metadata.page_cache_pool_size)
+		// For microVM instances, we only have one memory region to map.
+		if (mmap_size > instance_vdev->metadata.memory_region_size)
 		{
 			ERROR(
-				"Page cache pool size 0x%llx is smaller than requested mmap "
+				"MicroVM memory region size 0x%llx is smaller than requested "
+				"mmap "
 				"size "
 				"0x%lx\n",
-				instance_vdev->metadata.page_cache_pool_size, mmap_size);
+				instance_vdev->metadata.memory_region_size, mmap_size);
 			return -EINVAL;
 		}
 		pfn_start =
-			instance_vdev->metadata.page_cache_pool_base_gpa >> PAGE_SHIFT;
+			(instance_vdev->metadata.memory_region_base_gpa >> PAGE_SHIFT) +
+			vma->vm_pgoff;
 		INFO(
-			"[%s] Instance [%d] Page cache pool in instance %s, "
+			"[%s] Instance [%d] MicroVM memory region in instance %s, "
 			"va[0x%lx-0x%lx] size 0x%lx\n",
 			__func__, instance_id, instance_vdev->name, vma->vm_start,
 			vma->vm_end, vma->vm_end - vma->vm_start);
 		INFO(
-			"[%s] Instance [%d] Page cache pool in instance %s, "
-			"map to gpa: [0x%llx~0x%llx] size: 0x%llx\n",
+			"[%s] Instance [%d] MicroVM memory region in instance %s, "
+			"map to gpa: [0x%llx~0x%llx] size: 0x%lx, total [0x%llx~0x%llx] "
+			"size: 0x%llx\n",
 			__func__, instance_id, instance_vdev->name,
-			instance_vdev->metadata.page_cache_pool_base_gpa,
-			instance_vdev->metadata.page_cache_pool_base_gpa +
-				instance_vdev->metadata.page_cache_pool_size,
-			instance_vdev->metadata.page_cache_pool_size);
+			instance_vdev->metadata.memory_region_base_gpa +
+				(vma->vm_pgoff << PAGE_SHIFT),
+			instance_vdev->metadata.memory_region_base_gpa +
+				(vma->vm_pgoff << PAGE_SHIFT) + mmap_size,
+			mmap_size, instance_vdev->metadata.memory_region_base_gpa,
+			instance_vdev->metadata.memory_region_base_gpa +
+				instance_vdev->metadata.memory_region_size,
+			instance_vdev->metadata.memory_region_size);
+	}
+	else
+	{
+		ERROR(
+			"Instance %s has unknown instance type %d\n", instance_vdev->name,
+			instance_vdev->instance_type);
+		return -EINVAL;
 	}
 
 	INFO(
@@ -238,19 +301,36 @@ int create_instance(eq_create_instance_arg_t *arg)
 
 	instance_metadata_ptr_gpa = virt_to_phys(instance_metadata);
 
+	memset(instance_metadata, 0, sizeof(eq_instance_metadata_t));
+
+	instance_metadata->memory_region_size = arg->memory_size;
+
 	// Create a new instance through the hypervisor call.
 	instance_id = hvc_create_instance(
 		arg->instance_type, arg->mapping_type, instance_metadata_ptr_gpa);
 
-	INFO(
-		"Creating instance with type %llu, mapping type %llu\n"
-		"scf queue base @ 0x%llx, size 0x%llx\n"
-		"page cache base @ 0x%llx, size 0x%llx\n",
-		arg->instance_type, arg->mapping_type,
-		instance_metadata->scf_region_base_gpa,
-		instance_metadata->scf_region_size,
-		instance_metadata->page_cache_pool_base_gpa,
-		instance_metadata->page_cache_pool_size);
+	if (arg->instance_type < 2)
+	{
+
+		INFO(
+			"Creating LibOS instance %d with type %llu, mapping type %llu\n"
+			"scf queue base @ 0x%llx, size 0x%llx\n"
+			"page cache base @ 0x%llx, size 0x%llx\n",
+			instance_id, arg->instance_type, arg->mapping_type,
+			instance_metadata->scf_region_base_gpa,
+			instance_metadata->scf_region_size,
+			instance_metadata->page_cache_pool_base_gpa,
+			instance_metadata->page_cache_pool_size);
+	}
+	else if (arg->instance_type == 2)
+	{
+		INFO(
+			"Creating microVM instance %d\n"
+			"memory region base @ 0x%llx, size 0x%llx, vcpu number %lld\n",
+			instance_id, instance_metadata->memory_region_base_gpa,
+			instance_metadata->memory_region_size,
+			instance_metadata->init_vcpu_num);
+	}
 
 	if (instance_id < 0)
 	{
@@ -301,6 +381,7 @@ int create_instance(eq_create_instance_arg_t *arg)
 	}
 
 	instance_vdev->id = instance_id;
+	instance_vdev->instance_type = arg->instance_type;
 	instance_vdev->active = true;
 	instance_vdev->status = STATUS_CREATED;
 

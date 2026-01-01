@@ -1,7 +1,7 @@
 //! Proxy for network operations.
 
 use axerrno::LinuxResult;
-use libc::{msghdr, CMSG_DATA, CMSG_FIRSTHDR, CMSG_LEN};
+use libc::{CMSG_DATA, CMSG_FIRSTHDR, CMSG_LEN, msghdr};
 
 use crate::proxy::FD_LIST;
 

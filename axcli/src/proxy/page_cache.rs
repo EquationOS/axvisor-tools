@@ -1,4 +1,4 @@
-use libc::{c_void, mmap, MAP_FAILED, MAP_FIXED, MAP_SHARED, PROT_READ, PROT_WRITE};
+use libc::{MAP_FAILED, MAP_FIXED, MAP_SHARED, PROT_READ, PROT_WRITE, c_void, mmap};
 
 use equation_defs::page_cache::PAGE_CACHE_POOL_MAGIC;
 use equation_defs::{PAGE_CACHE_POOL_BASE_VA, PAGE_CACHE_POOL_SIZE};

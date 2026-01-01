@@ -1,7 +1,7 @@
 use lazyinit::LazyInit;
-use libc::{c_void, mmap, MAP_FAILED, MAP_FIXED, MAP_SHARED, PROT_READ, PROT_WRITE};
+use libc::{MAP_FAILED, MAP_FIXED, MAP_SHARED, PROT_READ, PROT_WRITE, c_void, mmap};
 
-use equation_defs::scf::{ScfDescriptor, SyscallQueueBufferMetadata, SCF_QUEUE_BUFF_MAGIC};
+use equation_defs::scf::{SCF_QUEUE_BUFF_MAGIC, ScfDescriptor, SyscallQueueBufferMetadata};
 use equation_defs::{SCF_QUEUE_REGION_BASE_VA, SCF_QUEUE_REGION_SIZE};
 
 static mut SYSCALL_QUEUE_BUFFER: LazyInit<SyscallQueueBuffer> = LazyInit::new();

@@ -5,8 +5,8 @@ use libc::MAP_PRIVATE;
 
 use equation_defs::{PAGE_CACHE_POOL_BASE_VA, PAGE_CACHE_POOL_SIZE};
 
-use crate::proxy::syscall::raw_syscall;
 use crate::proxy::FD_LIST;
+use crate::proxy::syscall::raw_syscall;
 
 pub fn proxy_access(path_ptr: u64, mode: u64) -> LinuxResult<u64> {
     // Convert the path pointer to a Rust string
@@ -45,10 +45,7 @@ pub fn proxy_openat_with_stat(
 
     trace!(
         "Proxying openat syscall for dirfd: {:#x}, path: \"{}\", flags: {:#x}, mode: {:#x}",
-        dirfd,
-        pathname,
-        flags,
-        mode
+        dirfd, pathname, flags, mode
     );
 
     // Call the actual filesystem openat function
@@ -131,10 +128,7 @@ pub fn proxy_newfstatat(
 
     trace!(
         "Proxying newfstatat syscall for dirfd: {:#x}, path: \"{}\", stat_ptr: {:#x}, flags: {:#x}",
-        dirfd,
-        pathname,
-        stat_ptr,
-        flags
+        dirfd, pathname, stat_ptr, flags
     );
 
     // Call the actual filesystem newfstatat function
@@ -199,11 +193,7 @@ pub fn proxy_statx(
 
     trace!(
         "Proxying statx syscall for dirfd: {:#x}, path: \"{}\", flags: {:#x}, mask: {:#x}, statx_ptr: {:#x}",
-        dirfd,
-        pathname,
-        flags,
-        mask,
-        statx_ptr
+        dirfd, pathname, flags, mask, statx_ptr
     );
 
     // Call the actual filesystem statx function
@@ -254,11 +244,7 @@ pub fn proxy_getdents64(fd: u64, dirent_ptr: u64, count: u64) -> LinuxResult<u64
 
     trace!(
         "Proxying getdents64  fd: {}, path \"{}\" dirent_ptr: {:#x}, count: {}, ret {}",
-        fd,
-        path,
-        dirent_ptr,
-        count,
-        ret
+        fd, path, dirent_ptr, count, ret
     );
 
     Ok(ret as u64)
@@ -278,10 +264,7 @@ pub fn proxy_readlinkat(
 
     trace!(
         "Proxying readlinkat syscall for dirfd: {:#x}, path: \"{}\", buf_ptr: {:#x}, buf_len: {}",
-        dirfd,
-        pathname,
-        buf_ptr,
-        buf_len
+        dirfd, pathname, buf_ptr, buf_len
     );
 
     // Call the actual filesystem readlinkat function
@@ -305,8 +288,7 @@ pub fn proxy_readlinkat(
 
     trace!(
         "Read link at path: \"{}\", returned {} bytes",
-        pathname,
-        ret
+        pathname, ret
     );
 
     Ok(ret as u64)
@@ -321,9 +303,7 @@ pub fn proxy_readlink(path_ptr: u64, buf_ptr: u64, buf_len: u64) -> LinuxResult<
 
     trace!(
         "Proxying readlink syscall for path: \"{}\", buf_ptr: {:#x}, buf_len: {}",
-        path,
-        buf_ptr,
-        buf_len
+        path, buf_ptr, buf_len
     );
 
     // Call the actual filesystem readlink function
@@ -498,9 +478,7 @@ pub fn proxy_read(fd: u64, buf_ptr: u64, count: u64) -> LinuxResult<u64> {
     };
     trace!(
         "Proxying read syscall for fd: {}, buf_ptr: {:#x}, count: {}",
-        fd,
-        buf_ptr,
-        count
+        fd, buf_ptr, count
     );
 
     // Call the actual filesystem read function
@@ -679,10 +657,7 @@ pub fn proxy_mmap_into_pagecache(
 pub fn proxy_pread64(fd: u64, buf_ptr: u64, count: u64, offset: u64) -> LinuxResult<u64> {
     trace!(
         "Proxying pread64 syscall for fd: {}, buf_ptr: {:#x}, count: {}, offset: {:#x}",
-        fd,
-        buf_ptr,
-        count,
-        offset
+        fd, buf_ptr, count, offset
     );
 
     // Check if the file descriptor exists in the FD_LIST

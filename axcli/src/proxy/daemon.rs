@@ -29,9 +29,9 @@ pub fn poll() {
 }
 
 macro_rules! color_text {
-    ($text:expr, $color:expr) => {{
+    ($text:expr, $color:expr) => {
         format_args!("\x1b[{}m{}\x1b[0m", $color, $text)
-    }};
+    };
 }
 
 fn handle_syscall(syscall_id: Sysno, args: &[u64; 6]) -> LinuxResult<u64> {

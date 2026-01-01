@@ -15,6 +15,10 @@ mod ioctl;
 /// A User-level executor to boot ELF.
 mod loader;
 
+mod microvm;
+
+mod utils;
+
 use clap::{Args, Parser, Subcommand};
 
 #[macro_use]
@@ -79,15 +83,9 @@ enum InstanceSubCmd {
 
 #[derive(Debug, Args)]
 struct InstanceCreateArgs {
-    /// Path to the binary file.
+    /// Path to the configuration file in json format.
     #[arg(short, long)]
-    pub file_path: String,
-    /// Instance type, 0 for LibOS, 1 for kernel.
-    #[arg(short, long, default_value_t = 0)]
-    pub instance_type: usize,
-    /// Use one2one mapping or coarse-grained mapping.
-    #[arg(short, long, default_value_t = false)]
-    pub one2onemapping: bool,
+    pub config_file: String,
 }
 
 #[derive(Parser, Debug)]
@@ -97,7 +95,7 @@ struct ExecuteArgs {
     exec_args: Vec<String>,
 }
 
-use libc::{c_void, sigaction, siginfo_t, SA_SIGINFO, SIGBUS};
+use libc::{SA_SIGINFO, SIGBUS, c_void, sigaction, siginfo_t};
 use std::ptr;
 
 extern "C" fn sigbus_handler(_sig: i32, info: *mut siginfo_t, context: *mut c_void) {
@@ -160,7 +158,7 @@ fn main() {
         CLISubCmd::Instance { subcmd } => match subcmd {
             InstanceSubCmd::List => todo!(),
             InstanceSubCmd::Init => instance::init_shim(),
-            InstanceSubCmd::Create(args) => instance::create_instance(args),
+            InstanceSubCmd::Create(args) => microvm::create_microvm(args),
             InstanceSubCmd::Execute(args) => instance::execute(args),
             InstanceSubCmd::Remove { instance_id } => instance::remove_instance(instance_id as _),
         },

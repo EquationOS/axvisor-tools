@@ -357,7 +357,7 @@ pub(super) fn local_execute_app(app_args: &Vec<String>) {
     jumping(entry, stack)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 fn jumping(entry: usize, stack: usize) -> ! {
     println!("[*] Jumping to entry {:#x}, stack {:#x}", entry, stack);
     unsafe {

@@ -20,6 +20,9 @@ typedef struct eq_create_instance_arg
 	uint64_t instance_type; // Instance type
 	uint64_t mapping_type;	// Mapping type, e.g., course-grained mapping or
 							// one-to-one mapping
+	uint64_t init_vcpu_num; // Number of vCPUs for the instance
+	uint64_t max_vcpu_num; // Number of vCPUs for the instance
+	uint64_t memory_size; // Memory size for the instance
 } eq_create_instance_arg_t;
 
 typedef struct eq_remove_instance_arg
