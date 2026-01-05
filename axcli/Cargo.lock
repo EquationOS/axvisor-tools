@@ -722,6 +722,7 @@ dependencies = [
 name = "page_table_multiarch"
 version = "0.5.3"
 dependencies = [
+ "bitmaps",
  "log",
  "memory_addr",
  "page_table_entry",
