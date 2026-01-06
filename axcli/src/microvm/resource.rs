@@ -47,6 +47,9 @@ impl VmResources {
                 .max_vcpu_count
                 .unwrap_or(machine_config.vcpu_count),
             machine_config.init_mem_size_mib,
+            machine_config
+                .max_mem_size_mib
+                .unwrap_or(machine_config.init_mem_size_mib),
         )
         .expect("Failed to create instance for dynamic loading");
 

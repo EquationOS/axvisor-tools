@@ -25,10 +25,12 @@ typedef struct eq_instance_metadata
     uint64_t page_cache_pool_size;
 
     /* For microVM instance */
+    /// Size of the microVM's memory region (set by eqdriver).
+    uint64_t init_memory_region_size_mib;
+    /// Maximum size of the microVM's memory region (set by eqdriver).
+    uint64_t max_memory_region_size_mib;
     /// Base GPA of the microVM's memory region.
     uint64_t memory_region_base_gpa;
-    /// Size of the microVM's memory region.
-    uint64_t memory_region_size;
 
     /// Initial number of vCPUs for the microVM.
     uint64_t init_vcpu_num;

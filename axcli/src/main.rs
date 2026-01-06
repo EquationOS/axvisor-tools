@@ -48,6 +48,11 @@ enum CLISubCmd {
         #[command(subcommand)]
         subcmd: InstanceSubCmd,
     },
+    /// Subcommands related to microVM management.
+    Microvm {
+        #[command(subcommand)]
+        subcmd: MicroVMSubCmd,
+    },
     /// Subcommands related to the a local test loader.
     Loader(ExecuteArgs),
 }
@@ -70,8 +75,6 @@ enum InstanceSubCmd {
     List,
     /// Init instance runtime environment.
     Init,
-    /// Create a new instance.
-    Create(InstanceCreateArgs),
     /// Execute a instance by ELF file alone with its arguments.
     Execute(ExecuteArgs),
     Remove {
@@ -81,8 +84,16 @@ enum InstanceSubCmd {
     },
 }
 
+#[derive(Subcommand, Debug)]
+#[command(args_conflicts_with_subcommands = true)]
+#[command(flatten_help = true)]
+enum MicroVMSubCmd {
+    /// Create a new instance.
+    Create(MicroVMCreateArgs),
+}
+
 #[derive(Debug, Args)]
-struct InstanceCreateArgs {
+struct MicroVMCreateArgs {
     /// Path to the configuration file in json format.
     #[arg(short, long)]
     pub config_file: String,
@@ -158,9 +169,11 @@ fn main() {
         CLISubCmd::Instance { subcmd } => match subcmd {
             InstanceSubCmd::List => todo!(),
             InstanceSubCmd::Init => instance::init_shim(),
-            InstanceSubCmd::Create(args) => microvm::create_microvm(args),
             InstanceSubCmd::Execute(args) => instance::execute(args),
             InstanceSubCmd::Remove { instance_id } => instance::remove_instance(instance_id as _),
+        },
+        CLISubCmd::Microvm { subcmd } => match subcmd {
+            MicroVMSubCmd::Create(args) => microvm::create_microvm(args),
         },
         CLISubCmd::Loader(args) => loader::local_execute(args),
     }

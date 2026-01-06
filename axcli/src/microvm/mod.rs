@@ -12,7 +12,7 @@ use std::fs;
 
 use crate::hvc::hvc_create_instance;
 
-use crate::InstanceCreateArgs;
+use crate::MicroVMCreateArgs;
 
 use axerrno::ax_err_type;
 use config::{BootSource, GuestConfig};
@@ -20,7 +20,7 @@ use image::load_kernel;
 use resource::VmResources;
 use vm::Vm;
 
-pub fn create_microvm(args: InstanceCreateArgs) {
+pub fn create_microvm(args: MicroVMCreateArgs) {
     info!(
         "Create Linux instance with config file path: {:?}",
         args.config_file

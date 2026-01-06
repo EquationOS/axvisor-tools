@@ -22,7 +22,8 @@ typedef struct eq_create_instance_arg
 							// one-to-one mapping
 	uint64_t init_vcpu_num; // Number of vCPUs for the instance
 	uint64_t max_vcpu_num; // Number of vCPUs for the instance
-	uint64_t memory_size; // Memory size for the instance
+	uint64_t init_mem_size_mib; // Memory size for the instance
+	uint64_t max_mem_size_mib; // Max memory size for the instance
 } eq_create_instance_arg_t;
 
 typedef struct eq_remove_instance_arg

@@ -120,6 +120,7 @@ static int instance_mmap(struct file *file, struct vm_area_struct *vma)
 	int ret = 0;
 	int instance_id = instance_vdev->id;
 	unsigned long pfn_start, mmap_size;
+	unsigned long mem_size;
 
 	if (!instance_vdev->active)
 	{
@@ -211,15 +212,17 @@ static int instance_mmap(struct file *file, struct vm_area_struct *vma)
 	}
 	else if (instance_vdev->instance_type == 2)
 	{
+		mem_size =
+			instance_vdev->metadata.init_memory_region_size_mib * 1024 * 1024;
 		// For microVM instances, we only have one memory region to map.
-		if (mmap_size > instance_vdev->metadata.memory_region_size)
+		if (mmap_size > mem_size)
 		{
 			ERROR(
 				"MicroVM memory region size 0x%llx is smaller than requested "
 				"mmap "
 				"size "
 				"0x%lx\n",
-				instance_vdev->metadata.memory_region_size, mmap_size);
+				mem_size, mmap_size);
 			return -EINVAL;
 		}
 		pfn_start =
@@ -240,9 +243,8 @@ static int instance_mmap(struct file *file, struct vm_area_struct *vma)
 			instance_vdev->metadata.memory_region_base_gpa +
 				(vma->vm_pgoff << PAGE_SHIFT) + mmap_size,
 			mmap_size, instance_vdev->metadata.memory_region_base_gpa,
-			instance_vdev->metadata.memory_region_base_gpa +
-				instance_vdev->metadata.memory_region_size,
-			instance_vdev->metadata.memory_region_size);
+			instance_vdev->metadata.memory_region_base_gpa + mem_size,
+			mem_size);
 	}
 	else
 	{
@@ -299,11 +301,26 @@ int create_instance(eq_create_instance_arg_t *arg)
 		return ret;
 	}
 
-	instance_metadata_ptr_gpa = virt_to_phys(instance_metadata);
-
 	memset(instance_metadata, 0, sizeof(eq_instance_metadata_t));
 
-	instance_metadata->memory_region_size = arg->memory_size;
+	if (arg->instance_type < 2)
+	{
+
+		INFO(
+			"Creating LibOS instance %d with type %llu, mapping type "
+			"%llu\n",
+			instance_id, arg->instance_type, arg->mapping_type);
+	}
+	else if (arg->instance_type == 2)
+	{
+		// Fill in the instance metadata based on the arguments provided.
+		instance_metadata->init_memory_region_size_mib = arg->init_mem_size_mib;
+		instance_metadata->max_memory_region_size_mib = arg->max_mem_size_mib;
+		instance_metadata->init_vcpu_num = arg->init_vcpu_num;
+		instance_metadata->max_vcpu_num = arg->max_vcpu_num;
+	}
+
+	instance_metadata_ptr_gpa = virt_to_phys(instance_metadata);
 
 	// Create a new instance through the hypervisor call.
 	instance_id = hvc_create_instance(
@@ -314,8 +331,8 @@ int create_instance(eq_create_instance_arg_t *arg)
 
 		INFO(
 			"Creating LibOS instance %d with type %llu, mapping type %llu\n"
-			"scf queue base @ 0x%llx, size 0x%llx\n"
-			"page cache base @ 0x%llx, size 0x%llx\n",
+			"gets scf queue base @ 0x%llx, size 0x%llx\n"
+			"gets page cache base @ 0x%llx, size 0x%llx\n",
 			instance_id, arg->instance_type, arg->mapping_type,
 			instance_metadata->scf_region_base_gpa,
 			instance_metadata->scf_region_size,
@@ -326,9 +343,10 @@ int create_instance(eq_create_instance_arg_t *arg)
 	{
 		INFO(
 			"Creating microVM instance %d\n"
-			"memory region base @ 0x%llx, size 0x%llx, vcpu number %lld\n",
+			"memory region base @ 0x%llx, init mem size %lld MB, init vcpu "
+			"number %lld\n",
 			instance_id, instance_metadata->memory_region_base_gpa,
-			instance_metadata->memory_region_size,
+			instance_metadata->init_memory_region_size_mib,
 			instance_metadata->init_vcpu_num);
 	}
 

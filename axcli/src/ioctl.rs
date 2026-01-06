@@ -55,7 +55,8 @@ fn open_eqmanager_dev() -> Result<libc::c_int, String> {
 pub fn ioctl_create_microvm(
     init_vcpu_num: u8,
     max_vcpu_num: u8,
-    memory_size: usize,
+    init_mem_size_mib: usize,
+    max_mem_size_mib: usize,
 ) -> Result<usize, String> {
     let fd = open_eqmanager_dev()?;
 
@@ -65,7 +66,8 @@ pub fn ioctl_create_microvm(
         mapping_type: 0,                     // 0 for FlatMapping
         init_vcpu_num: init_vcpu_num as u64, // Initial vCPU number
         max_vcpu_num: max_vcpu_num as u64,
-        memory_size: memory_size as u64,
+        init_mem_size_mib: init_mem_size_mib as u64,
+        max_mem_size_mib: max_mem_size_mib as u64,
     };
 
     let ret = unsafe { libc::ioctl(fd, EQ_CREATE_INSTANCE as libc::c_ulong, &mut arg as *mut _) };
@@ -95,7 +97,8 @@ pub fn ioctl_create_libos() -> Result<usize, String> {
         mapping_type: 1,         // 1 for CoarseGrainedSegmentation2M
         init_vcpu_num: 0,        // Dummy value, not used for libOS
         max_vcpu_num: 0,         // Dummy value, not used for libOS
-        memory_size: 0,          // Dummy value, not used for libOS
+        init_mem_size_mib: 0,    // Dummy value, not used for libOS
+        max_mem_size_mib: 0,     // Dummy value, not used for libOS
     };
 
     let ret = unsafe { libc::ioctl(fd, EQ_CREATE_INSTANCE as libc::c_ulong, &mut arg as *mut _) };
