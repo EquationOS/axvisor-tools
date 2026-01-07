@@ -44,7 +44,7 @@ mod boot_source {
 
     use serde::{Deserialize, Serialize};
 
-    use axerrno::{AxError, AxResult, ax_err_type};
+    use axerrno::{AxResult, ax_err_type};
 
     /// Default guest kernel command line:
     /// - `reboot=k` shut down the guest on reboot, instead of well... rebooting;

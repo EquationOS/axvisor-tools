@@ -5,19 +5,11 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
-use std::collections::HashMap;
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use axerrno::{AxResult, ax_err_type};
-use serde::{Deserialize, Serialize};
 
-use crate::microvm::vstate::memory::{
-    GuestMemory, GuestMemoryMmap, GuestMemoryRegion, GuestRegionMmap, GuestRegionMmapExt,
-};
+use crate::microvm::vstate::memory::{GuestMemoryMmap, GuestRegionMmap, GuestRegionMmapExt};
 use crate::microvm::vstate::resources::ResourceAllocator;
 
 /// Architecture independent parts of a VM.

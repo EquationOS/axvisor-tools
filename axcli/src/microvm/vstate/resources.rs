@@ -1,8 +1,6 @@
 // Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::convert::Infallible;
-
 use serde::{Deserialize, Serialize};
 pub use vm_allocator::AllocPolicy;
 use vm_allocator::{AddressAllocator, IdAllocator};
@@ -61,6 +59,7 @@ impl Default for ResourceAllocator {
     }
 }
 
+#[allow(unused)]
 impl ResourceAllocator {
     /// Create a new resource allocator for Firecracker devices
     pub fn new() -> Self {

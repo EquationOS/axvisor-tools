@@ -16,12 +16,11 @@ use std::fs;
 use crate::MicroVMCreateArgs;
 
 use arch::configure_system_for_boot;
-use arch::{BootProtocol, EntryPoint, load_kernel};
+use arch::load_kernel;
 use axerrno::{AxResult, ax_err_type};
-use config::{GuestConfig, MachineConfig};
+use config::GuestConfig;
 use initrd::InitrdConfig;
 use resource::VmResources;
-use vstate::memory::GuestAddress;
 use vstate::vm::Vm;
 
 pub fn create_microvm(args: MicroVMCreateArgs) -> AxResult {

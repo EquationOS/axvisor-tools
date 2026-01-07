@@ -41,29 +41,6 @@ pub fn hvc_init_shim(ksched_shm_base: u64) {
     info!("hvc_init_shim result: {:#x}", result);
 }
 
-pub fn hvc_create_instance(
-    instance_type: u64,
-    mapping_type: u64,
-    file_size: u64,
-    shared_pages_base: u64,
-    shared_pages_num: u64,
-) -> isize {
-    info!(
-        "[*] Creating instance with type: {}, mapping: {}, file size: {}, shared pages base: {:#x}, num: {}",
-        instance_type, mapping_type, file_size, shared_pages_base, shared_pages_num
-    );
-
-    trigger_hypercall(
-        HyperCallCode::HCreateInstance,
-        instance_type,
-        mapping_type,
-        file_size,
-        shared_pages_base,
-        shared_pages_num,
-        0,
-    )
-}
-
 pub fn hvc_setup_instance(
     instance_id: u64,
     file_size: u64,

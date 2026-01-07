@@ -6,13 +6,11 @@
 // found in the THIRD-PARTY file.
 
 use std::fs::File;
-use std::io::SeekFrom;
 use std::ops::Deref;
 use std::os::fd::FromRawFd;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axerrno::{AxResult, ax_err, ax_err_type};
-use bitvec::vec::BitVec;
 use serde::{Deserialize, Serialize};
 
 use crate::microvm::layout::{
@@ -20,14 +18,13 @@ use crate::microvm::layout::{
 };
 use crate::utils::u64_to_usize;
 
-pub use vm_memory::bitmap::{AtomicBitmap, BS, Bitmap, BitmapSlice};
+pub use vm_memory::bitmap::{AtomicBitmap, BS};
 pub use vm_memory::mmap::MmapRegionBuilder;
-use vm_memory::mmap::{MmapRegionError, NewBitmap};
 pub use vm_memory::{
     Address, ByteValued, Bytes, FileOffset, GuestAddress, GuestMemory, GuestMemoryRegion,
-    GuestUsize, MemoryRegionAddress, MmapRegion, address,
+    GuestUsize, MemoryRegionAddress, MmapRegion,
 };
-use vm_memory::{GuestMemoryError, GuestMemoryRegionBytes, VolatileSlice, WriteVolatile};
+use vm_memory::{GuestMemoryRegionBytes, VolatileSlice};
 
 /// Type of GuestRegionMmap.
 pub type GuestRegionMmap = vm_memory::GuestRegionMmap<Option<AtomicBitmap>>;

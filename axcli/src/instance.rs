@@ -5,10 +5,10 @@ use libc::c_void;
 
 use pi_memory_layout::{ArgsLayoutBuilder, ArgsLayoutRef};
 
+use crate::ExecuteArgs;
 use crate::hvc::{hvc_init_shim, hvc_setup_instance};
 use crate::proxy;
 use crate::shared_pages::{copy_content_to_shared_pages, free_shared_pages};
-use crate::{ExecuteArgs, MicroVMCreateArgs};
 
 pub const EQINSTANCE_DEV_PREFIX: &str = "/dev/eqinstance_";
 

@@ -6,9 +6,7 @@ use std::os::unix::fs::MetadataExt;
 
 use axerrno::{AxResult, ax_err, ax_err_type};
 use memory_addr::{PAGE_SIZE_4K, align_down};
-use vm_memory::{
-    Address, GuestAddress, GuestMemory, GuestMemoryRegion, ReadVolatile, VolatileMemoryError,
-};
+use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryRegion, ReadVolatile};
 
 use crate::microvm::config::BootConfig;
 use crate::microvm::vstate::memory::GuestMemoryMmap;

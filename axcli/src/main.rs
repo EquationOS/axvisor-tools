@@ -17,6 +17,7 @@ mod loader;
 
 mod microvm;
 
+#[allow(unused)]
 mod utils;
 
 use clap::{Args, Parser, Subcommand};
@@ -140,13 +141,13 @@ fn install_signal_handlers() {
         let mut sa: sigaction = std::mem::zeroed();
 
         // Install SIGBUS handler
-        sa.sa_sigaction = sigbus_handler as usize;
+        sa.sa_sigaction = sigbus_handler as *const () as usize;
         sa.sa_flags = SA_SIGINFO;
         sigaction(SIGBUS, &sa, ptr::null_mut());
 
         // Install SIGSEGV handler
         sa = std::mem::zeroed();
-        sa.sa_sigaction = sigsegv_handler as usize;
+        sa.sa_sigaction = sigsegv_handler as *const () as usize;
         sa.sa_flags = SA_SIGINFO;
         sigaction(libc::SIGSEGV, &sa, ptr::null_mut());
     }

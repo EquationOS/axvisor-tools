@@ -47,6 +47,7 @@ pub struct PortIODeviceManager {
     // pub kbd_evt: EventFd,
 }
 
+#[allow(dead_code)]
 impl PortIODeviceManager {
     /// x86 global system interrupt for communication events on serial ports 1
     /// & 3. See

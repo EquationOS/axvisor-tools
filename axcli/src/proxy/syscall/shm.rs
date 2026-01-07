@@ -44,7 +44,7 @@ pub fn sys_shmget(key: u64, size: u64, shmflg: u64) -> LinuxResult<u64> {
 /// Reads the value at `ptr` once using a volatile read.
 #[inline(always)]
 pub unsafe fn access_once<T>(ptr: *const T) -> T {
-    core::ptr::read_volatile(ptr)
+    unsafe { core::ptr::read_volatile(ptr) }
 }
 
 unsafe fn touch_mapping(addr: *mut libc::c_void, size: usize) {

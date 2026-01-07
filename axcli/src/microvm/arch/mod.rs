@@ -1,4 +1,6 @@
 pub mod generated;
+
+#[allow(unused)]
 pub mod layout;
 
 pub use layout::*;
@@ -9,7 +11,7 @@ use std::fs::File;
 
 use axerrno::{AxResult, ax_err, ax_err_type};
 use linux_loader::configurator::linux::LinuxBootConfigurator;
-use linux_loader::configurator::pvh::PvhBootConfigurator;
+// use linux_loader::configurator::pvh::PvhBootConfigurator;
 use linux_loader::configurator::{BootConfigurator, BootParams};
 use linux_loader::loader::bootparam::boot_params;
 use linux_loader::loader::elf::Elf as Loader;
