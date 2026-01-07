@@ -15,9 +15,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use axerrno::{AxResult, ax_err_type};
 use serde::{Deserialize, Serialize};
 
-use crate::microvm::memory::{
+use crate::microvm::vstate::memory::{
     GuestMemory, GuestMemoryMmap, GuestMemoryRegion, GuestRegionMmap, GuestRegionMmapExt,
 };
+use crate::microvm::vstate::resources::ResourceAllocator;
 
 /// Architecture independent parts of a VM.
 #[derive(Debug)]
@@ -26,6 +27,8 @@ pub struct Vm {
     pub fd: i32,
     /// The guest memory of this Vm.
     pub guest_memory: GuestMemoryMmap,
+    /// Allocator for VM resources
+    pub resource_allocator: Mutex<ResourceAllocator>,
 }
 
 /// Contains Vm functions that are usable across CPU architectures
@@ -34,6 +37,7 @@ impl Vm {
         Ok(Vm {
             fd,
             guest_memory: GuestMemoryMmap::default(),
+            resource_allocator: Mutex::new(ResourceAllocator::new()),
         })
     }
 
@@ -72,5 +76,10 @@ impl Vm {
     /// Gets a reference to this [`Vm`]'s [`GuestMemoryMmap`] object
     pub fn guest_memory(&self) -> &GuestMemoryMmap {
         &self.guest_memory
+    }
+
+    /// Gets a mutable reference to this [`Vm`]'s [`ResourceAllocator`] object
+    pub fn resource_allocator(&self) -> MutexGuard<'_, ResourceAllocator> {
+        self.resource_allocator.lock().expect("Poisoned lock")
     }
 }

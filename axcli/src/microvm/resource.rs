@@ -7,8 +7,8 @@ use crate::ioctl;
 use crate::microvm::config::{
     BootConfig, BootSource, BootSourceConfig, GuestConfig, MachineConfig,
 };
-use crate::microvm::memory;
-use crate::microvm::memory::{GuestAddress, GuestRegionMmap};
+use crate::microvm::vstate::memory;
+use crate::microvm::vstate::memory::{GuestAddress, GuestRegionMmap};
 use crate::utils::mib_to_bytes;
 
 /// A data structure that encapsulates the device configurations
@@ -43,13 +43,9 @@ impl VmResources {
         // First, create the instance through ioctl, eqdriver will trigger the hvc to create the instance.
         let microvm_id = ioctl::ioctl_create_microvm(
             machine_config.vcpu_count,
-            machine_config
-                .max_vcpu_count
-                .unwrap_or(machine_config.vcpu_count),
+            machine_config.max_vcpu_count(),
             machine_config.init_mem_size_mib,
-            machine_config
-                .max_mem_size_mib
-                .unwrap_or(machine_config.init_mem_size_mib),
+            machine_config.max_mem_size_mib(),
         )
         .expect("Failed to create instance for dynamic loading");
 

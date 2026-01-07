@@ -18,6 +18,19 @@ pub struct MachineConfig {
     pub max_mem_size_mib: Option<usize>,
 }
 
+impl MachineConfig {
+    /// Get the maximum vCPU count, defaulting to `vcpu_count` if `max_vcpu_count` is not set.
+    pub fn max_vcpu_count(&self) -> u8 {
+        self.max_vcpu_count.unwrap_or(self.vcpu_count)
+    }
+
+    /// Get the maximum memory size in MiB, defaulting to `init_mem_size_mib` if
+    /// `max_mem_size_mib` is not set.
+    pub fn max_mem_size_mib(&self) -> usize {
+        self.max_mem_size_mib.unwrap_or(self.init_mem_size_mib)
+    }
+}
+
 /// Used for configuring a vmm from one single json passed to the Firecracker process.
 #[derive(Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]

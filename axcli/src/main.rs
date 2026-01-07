@@ -173,7 +173,9 @@ fn main() {
             InstanceSubCmd::Remove { instance_id } => instance::remove_instance(instance_id as _),
         },
         CLISubCmd::Microvm { subcmd } => match subcmd {
-            MicroVMSubCmd::Create(args) => microvm::create_microvm(args),
+            MicroVMSubCmd::Create(args) => {
+                microvm::create_microvm(args).expect("Failed to create microvm")
+            }
         },
         CLISubCmd::Loader(args) => loader::local_execute(args),
     }

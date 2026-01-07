@@ -51,8 +51,8 @@ pub enum GuestRegionType {
 pub struct GuestRegionMmapExt {
     /// the wrapped GuestRegionMmap
     pub inner: GuestRegionMmap,
-    // /// the type of region
-    // pub region_type: GuestRegionType,
+    /// the type of region
+    pub region_type: GuestRegionType,
     // /// the starting KVM slot number assigned to this region
     // pub slot_from: u32,
     // /// the size of the slots of this region
@@ -114,6 +114,7 @@ impl GuestRegionMmapExt {
         // let slot_size = u64_to_usize(region.len());
         GuestRegionMmapExt {
             inner: region,
+            region_type: GuestRegionType::Dram,
             // slot_from: slot,
             // slot_size,
             // plugged: Mutex::new(BitVec::repeat(true, 1)),

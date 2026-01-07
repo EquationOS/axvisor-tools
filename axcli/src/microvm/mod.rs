@@ -1,26 +1,30 @@
 //! MicroVM related functionalities.
 //! Most of the code here is adapted from Firecracker's microVM design.
 
+mod acpi;
+pub mod arch;
 mod config;
-mod image;
-mod layout;
-mod memory;
+mod initrd;
+mod mptable;
 mod resource;
-mod vm;
+mod vstate;
+
+use arch::layout;
 
 use std::fs;
 
-use crate::hvc::hvc_create_instance;
-
 use crate::MicroVMCreateArgs;
 
-use axerrno::ax_err_type;
-use config::{BootSource, GuestConfig};
-use image::load_kernel;
+use arch::configure_system_for_boot;
+use arch::{BootProtocol, EntryPoint, load_kernel};
+use axerrno::{AxResult, ax_err_type};
+use config::{GuestConfig, MachineConfig};
+use initrd::InitrdConfig;
 use resource::VmResources;
-use vm::Vm;
+use vstate::memory::GuestAddress;
+use vstate::vm::Vm;
 
-pub fn create_microvm(args: MicroVMCreateArgs) {
+pub fn create_microvm(args: MicroVMCreateArgs) -> AxResult {
     info!(
         "Create Linux instance with config file path: {:?}",
         args.config_file
@@ -50,16 +54,31 @@ pub fn create_microvm(args: MicroVMCreateArgs) {
         .allocate_guest_memory()
         .expect("Failed to allocate guest memory");
 
+    // Clone the command-line so that a failed boot doesn't pollute the original.
+    #[allow(unused_mut)]
+    let mut boot_cmdline = boot_config.cmdline.clone();
+
     let mut vm = Vm::new(vm_resources.fd).expect("Failed to create VM instance");
 
-    vm.register_dram_memory_regions(guest_memory)
-        .expect("Failed to register guest memory");
+    vm.register_dram_memory_regions(guest_memory)?;
 
-    let entry_point = load_kernel(&boot_config.kernel_file, vm.guest_memory())
-        .expect("Failed to load kernel image");
+    let entry_point = load_kernel(&boot_config.kernel_file, vm.guest_memory())?;
 
     info!(
         "Kernel loaded at entry point: {:#x?}, boot protocol: {:?}",
         entry_point.entry_addr, entry_point.protocol
     );
+
+    let initrd = InitrdConfig::from_config(boot_config, vm.guest_memory())?;
+
+    configure_system_for_boot(
+        &vm,
+        &vm_resources.machine_config,
+        entry_point,
+        &initrd,
+        boot_cmdline,
+    )
+    .map_err(|e| ax_err_type!(BadState, format_args!("configuration error {}", e)))?;
+
+    Ok(())
 }
