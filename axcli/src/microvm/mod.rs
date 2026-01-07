@@ -18,7 +18,6 @@ use crate::MicroVMCreateArgs;
 use arch::configure_system_for_boot;
 use arch::load_kernel;
 use axerrno::{AxResult, ax_err_type};
-use config::GuestConfig;
 use initrd::InitrdConfig;
 use resource::VmResources;
 use vstate::vm::Vm;
@@ -32,22 +31,14 @@ pub fn create_microvm(args: MicroVMCreateArgs) -> AxResult {
     let config_json = fs::read_to_string(args.config_file)
         .expect("Unable to open or read from the configuration file");
 
-    let guest_config = serde_json::from_str::<GuestConfig>(&config_json)
-        .expect("Failed to parse json config file");
-
-    let init_vcpu_count = guest_config.machine_config.as_ref().map(|mc| mc.vcpu_count);
-
     let vm_resources = VmResources::from_json(&config_json).expect("Failed to build VM resources");
 
-    let boot_config = vm_resources
-        .boot_source
-        .builder
-        .as_ref()
-        .ok_or(ax_err_type!(
+    let boot_config = vm_resources.boot_source.builder.as_ref().ok_or_else(|| {
+        ax_err_type!(
             InvalidInput,
             "Boot source builder is missing in the VM resources"
-        ))
-        .unwrap();
+        )
+    })?;
 
     let guest_memory = vm_resources
         .allocate_guest_memory()
@@ -78,6 +69,8 @@ pub fn create_microvm(args: MicroVMCreateArgs) -> AxResult {
         boot_cmdline,
     )
     .map_err(|e| ax_err_type!(BadState, format_args!("configuration error {}", e)))?;
+
+    crate::hvc::hvc_microvm_boot(vm_resources.vm_id as u64);
 
     Ok(())
 }

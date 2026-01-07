@@ -15,6 +15,7 @@ use crate::utils::mib_to_bytes;
 /// held in the Vmm.
 #[derive(Debug, Default)]
 pub struct VmResources {
+    pub vm_id: usize,
     /// The vCpu and memory configuration for this microVM.
     pub machine_config: MachineConfig,
     /// The boot source spec (contains both config and builder) for this microVM.
@@ -75,6 +76,7 @@ impl VmResources {
         }
 
         let mut resources: Self = Self {
+            vm_id: microvm_id,
             machine_config,
             fd: instance_fd,
             ..Default::default()

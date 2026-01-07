@@ -36,14 +36,16 @@ unsafe fn mmap_segment(base: usize, ph: &goblin::elf::ProgramHeader, elf_data: &
         aligned_addr, size, aligned_offset
     );
 
-    let ret = mmap(
-        aligned_addr as *mut c_void,
-        size,
-        (prot | PROT_WRITE) as c_int,
-        (MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED) as c_int,
-        -1,
-        0,
-    );
+    let ret = unsafe {
+        mmap(
+            aligned_addr as *mut c_void,
+            size,
+            (prot | PROT_WRITE) as c_int,
+            (MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED) as c_int,
+            -1,
+            0,
+        )
+    };
     assert_ne!(ret, MAP_FAILED);
 
     assert_eq!(
@@ -51,12 +53,13 @@ unsafe fn mmap_segment(base: usize, ph: &goblin::elf::ProgramHeader, elf_data: &
         "mmap returned unexpected address: expected {:#x}, got {:#x}",
         aligned_addr, ret as usize
     );
-
-    std::ptr::copy_nonoverlapping(
-        elf_data[offset..offset + filesz].as_ptr(),
-        vaddr as *mut u8,
-        filesz,
-    );
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            elf_data[offset..offset + filesz].as_ptr(),
+            vaddr as *mut u8,
+            filesz,
+        );
+    }
 
     if memsz > filesz {
         let zero_start = vaddr + filesz;
@@ -65,7 +68,9 @@ unsafe fn mmap_segment(base: usize, ph: &goblin::elf::ProgramHeader, elf_data: &
             "[*] Zeroing out segment: start={:#x}, length={:#x}",
             zero_start, zero_len
         );
-        core::ptr::write_bytes(zero_start as *mut u8, 0, zero_len);
+        unsafe {
+            core::ptr::write_bytes(zero_start as *mut u8, 0, zero_len);
+        }
     }
 }
 
@@ -88,7 +93,7 @@ unsafe fn mprotect_segment(base: usize, ph: &goblin::elf::ProgramHeader) {
         vaddr, size, prot, offset, memsz, filesz
     );
 
-    let mprotect_ret = mprotect(aligned_addr as *mut c_void, size, prot as c_int);
+    let mprotect_ret = unsafe { mprotect(aligned_addr as *mut c_void, size, prot as c_int) };
     assert_eq!(mprotect_ret, 0, "Failed to set memory protection");
 }
 
@@ -108,28 +113,32 @@ unsafe fn mmap_elf(path: &str, base: usize) -> (Elf<'static>, usize, Option<Stri
         path_string.push('\0');
     }
 
-    let fd = openat(
-        AT_FDCWD,
-        path_string.as_ptr() as *const c_char,
-        O_RDONLY | O_CLOEXEC,
-    );
+    let fd = unsafe {
+        openat(
+            AT_FDCWD,
+            path_string.as_ptr() as *const c_char,
+            O_RDONLY | O_CLOEXEC,
+        )
+    };
     assert!(fd >= 2, "Failed to open ELF file: {path}, error code {fd}",);
 
     let mut stat: stat = unsafe { core::mem::zeroed() };
 
-    let res = fstat(fd, &mut stat);
+    let res = unsafe { fstat(fd, &mut stat) };
     assert_eq!(res, 0, "Failed to fstat ELF file: {path}, error {res}");
 
     let file_length = stat.st_size as usize;
 
-    let data = mmap(
-        0 as *mut c_void,
-        file_length,
-        PROT_READ as c_int,
-        MAP_PRIVATE as c_int,
-        fd as c_int,
-        0,
-    );
+    let data = unsafe {
+        mmap(
+            0 as *mut c_void,
+            file_length,
+            PROT_READ as c_int,
+            MAP_PRIVATE as c_int,
+            fd as c_int,
+            0,
+        )
+    };
 
     assert_ne!(data, MAP_FAILED, "Failed to mmap ELF file: {}", path);
     info!(
@@ -179,7 +188,7 @@ unsafe fn mmap_elf(path: &str, base: usize) -> (Elf<'static>, usize, Option<Stri
         unsafe { mprotect_segment(base, ph) };
     }
 
-    let res = close(fd);
+    let res = unsafe { close(fd) };
     assert_eq!(res, 0, "Failed to close ELF file: {path} error {res}");
 
     println!("[*] Loaded ELF: {:?}", path);
@@ -189,14 +198,16 @@ unsafe fn mmap_elf(path: &str, base: usize) -> (Elf<'static>, usize, Option<Stri
 unsafe fn setup_raw_stack() -> *mut c_void {
     let (fd, flags) = (-1, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED);
 
-    let stack = mmap(
-        (USER_STACK_TOP_VA - USER_STACK_SIZE) as *mut c_void, // Start of the stack
-        USER_STACK_SIZE,
-        (PROT_READ | PROT_WRITE) as c_int,
-        flags as c_int,
-        fd,
-        0,
-    );
+    let stack = unsafe {
+        mmap(
+            (USER_STACK_TOP_VA - USER_STACK_SIZE) as *mut c_void, // Start of the stack
+            USER_STACK_SIZE,
+            (PROT_READ | PROT_WRITE) as c_int,
+            flags as c_int,
+            fd,
+            0,
+        )
+    };
     assert_ne!(stack, MAP_FAILED);
     info!("[*] Allocated raw stack at: {:#p}", stack);
     let stack_top = stack as usize + USER_STACK_SIZE;
@@ -215,14 +226,16 @@ unsafe fn setup_stack_with_args(
 ) -> *mut c_void {
     let (fd, flags) = (-1, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED);
 
-    let stack = mmap(
-        (USER_STACK_TOP_VA - USER_STACK_SIZE) as *mut c_void, // Start of the stack
-        USER_STACK_SIZE,
-        PROT_READ | PROT_WRITE,
-        flags,
-        fd,
-        0,
-    );
+    let stack = unsafe {
+        mmap(
+            (USER_STACK_TOP_VA - USER_STACK_SIZE) as *mut c_void, // Start of the stack
+            USER_STACK_SIZE,
+            PROT_READ | PROT_WRITE,
+            flags,
+            fd,
+            0,
+        )
+    };
     assert_ne!(stack, MAP_FAILED);
 
     let stack_top = stack as usize + USER_STACK_SIZE;

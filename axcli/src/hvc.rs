@@ -85,3 +85,9 @@ pub fn hvc_daemon_shmat(
         shmflg,
     )
 }
+
+pub fn hvc_microvm_boot(instance_id: u64) -> isize {
+    info!("[*] Booting microVM instance ID: {}", instance_id);
+
+    trigger_hypercall(HyperCallCode::HMicroVMBoot, instance_id, 0, 0, 0, 0, 0)
+}

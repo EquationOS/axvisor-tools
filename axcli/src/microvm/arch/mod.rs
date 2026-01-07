@@ -15,9 +15,6 @@ use linux_loader::configurator::linux::LinuxBootConfigurator;
 use linux_loader::configurator::{BootConfigurator, BootParams};
 use linux_loader::loader::bootparam::boot_params;
 use linux_loader::loader::elf::Elf as Loader;
-use linux_loader::loader::elf::start_info::{
-    hvm_memmap_table_entry, hvm_modlist_entry, hvm_start_info,
-};
 use linux_loader::loader::{Cmdline, KernelLoader, PvhBootCapability, load_cmdline};
 
 use crate::microvm::acpi::create_acpi_tables;
@@ -35,10 +32,11 @@ const E820_RAM: u32 = 1;
 
 // Reserved area that should be avoided during memory allocations
 const E820_RESERVED: u32 = 2;
-const MEMMAP_TYPE_RAM: u32 = 1;
+// const MEMMAP_TYPE_RAM: u32 = 1;
 
 /// Errors thrown while configuring x86_64 system.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
+#[allow(unused)]
 pub enum ConfigurationError {
     /// Invalid e820 setup params.
     E820Configuration,
@@ -68,6 +66,7 @@ pub enum ConfigurationError {
 
 /// Supported boot protocols for
 #[derive(Debug, Copy, Clone, PartialEq)]
+#[allow(unused)]
 pub enum BootProtocol {
     /// Linux 64-bit boot protocol
     LinuxBoot,
