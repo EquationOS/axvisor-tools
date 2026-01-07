@@ -248,9 +248,5 @@ pub fn alloc_from_eqvisor(
     regions: impl Iterator<Item = (GuestAddress, usize)>,
     eqdev_fd: i32,
 ) -> AxResult<Vec<GuestRegionMmap>> {
-    create(
-        regions,
-        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-        Some(eqdev_fd),
-    )
+    create(regions, libc::MAP_SHARED, Some(eqdev_fd))
 }
