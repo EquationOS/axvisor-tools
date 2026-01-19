@@ -1,9 +1,10 @@
 pub mod generated;
 
-#[allow(unused)]
-pub mod layout;
+mod gdt;
+mod regs;
 
-pub use layout::*;
+pub use equation_defs::microvm::layout;
+pub use equation_defs::microvm::layout::*;
 
 use core::fmt;
 use std::cmp::max;
@@ -58,32 +59,13 @@ pub enum ConfigurationError {
     LoadCommandline(linux_loader::loader::Error),
     // /// Failed to create guest config: {0}
     // CreateGuestConfig(#[from] GuestConfigError),
-    // /// Error configuring the vcpu for boot: {0}
-    // VcpuConfigure(#[from] KvmVcpuConfigureError),
+    /// Error configuring the vcpu for boot
+    VcpuConfigure,
     /// Error configuring ACPI: {0}
     Acpi(#[from] crate::microvm::acpi::AcpiError),
 }
 
-/// Supported boot protocols for
-#[derive(Debug, Copy, Clone, PartialEq)]
-#[allow(unused)]
-pub enum BootProtocol {
-    /// Linux 64-bit boot protocol
-    LinuxBoot,
-    #[cfg(target_arch = "x86_64")]
-    /// PVH boot protocol (x86/HVM direct boot ABI)
-    PvhBoot,
-}
-
-impl fmt::Display for BootProtocol {
-    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
-        match self {
-            BootProtocol::LinuxBoot => write!(f, "Linux 64-bit boot protocol"),
-            #[cfg(target_arch = "x86_64")]
-            BootProtocol::PvhBoot => write!(f, "PVH boot protocol"),
-        }
-    }
-}
+pub use equation_defs::microvm::BootProtocol;
 
 #[derive(Debug, Copy, Clone)]
 /// Specifies the entry point address where the guest must start
@@ -98,7 +80,7 @@ pub struct EntryPoint {
 
 /// Returns the memory address where the kernel could be loaded.
 pub fn get_kernel_start() -> u64 {
-    crate::microvm::layout::HIMEM_START
+    crate::microvm::arch::layout::HIMEM_START
 }
 
 /// Configures the system for booting Linux.
@@ -110,6 +92,8 @@ pub fn configure_system_for_boot(
     initrd: &Option<InitrdConfig>,
     boot_cmdline: Cmdline,
 ) -> Result<(), ConfigurationError> {
+    configure(vm.guest_memory(), entry_point)?;
+
     // Write the kernel command line to guest memory. This is x86_64 specific, since on
     // aarch64 the command line will be specified through the FDT.
     let cmdline_size = boot_cmdline
@@ -310,5 +294,15 @@ pub fn load_kernel(kernel: &File, guest_memory: &GuestMemoryMmap) -> AxResult<En
     Ok(EntryPoint {
         entry_addr: entry_point_addr,
         protocol: boot_prot,
+    })
+}
+
+pub fn configure(
+    guest_mem: &GuestMemoryMmap,
+    kernel_entry_point: EntryPoint,
+) -> Result<(), ConfigurationError> {
+    regs::setup_sregs(guest_mem, kernel_entry_point.protocol).map_err(|e| {
+        error!("Failed to setup special registers: {:#x?}", e);
+        ConfigurationError::VcpuConfigure
     })
 }

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use axerrno::{AxResult, ax_err, ax_err_type};
 use serde::{Deserialize, Serialize};
 
-use crate::microvm::layout::{
+use crate::microvm::arch::layout::{
     MMIO32_MEM_SIZE, MMIO32_MEM_START, MMIO64_MEM_SIZE, MMIO64_MEM_START,
 };
 use crate::utils::u64_to_usize;

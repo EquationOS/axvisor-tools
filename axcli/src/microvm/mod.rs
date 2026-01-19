@@ -9,8 +9,6 @@ mod mptable;
 mod resource;
 mod vstate;
 
-use arch::layout;
-
 use std::fs;
 
 use crate::MicroVMCreateArgs;
@@ -70,7 +68,11 @@ pub fn create_microvm(args: MicroVMCreateArgs) -> AxResult {
     )
     .map_err(|e| ax_err_type!(BadState, format_args!("configuration error {}", e)))?;
 
-    crate::hvc::hvc_microvm_boot(vm_resources.vm_id as u64);
+    crate::hvc::hvc_microvm_boot(
+        vm_resources.vm_id as u64,
+        entry_point.entry_addr.0,
+        entry_point.protocol as u8,
+    );
 
     Ok(())
 }
