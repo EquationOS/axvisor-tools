@@ -14,10 +14,8 @@ use crate::microvm::arch::layout;
 
 #[inline(always)]
 pub(crate) fn setup_interrupt_controllers(nr_vcpus: u8) -> Vec<u8> {
-    let mut ic =
-        Vec::with_capacity(size_of::<IoAPIC>() + (nr_vcpus as usize) * size_of::<LocalAPIC>());
-
-    ic.extend_from_slice(IoAPIC::new(0, layout::IOAPIC_ADDR).as_bytes());
+    // Only Local APICs are supported in this microVM implementation.
+    let mut ic = Vec::with_capacity((nr_vcpus as usize) * size_of::<LocalAPIC>());
     for i in 0..nr_vcpus {
         ic.extend_from_slice(LocalAPIC::new(i).as_bytes());
     }

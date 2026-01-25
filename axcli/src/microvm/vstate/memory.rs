@@ -238,7 +238,7 @@ pub fn create(
                 })?,
                 start,
             )
-            .ok_or(ax_err_type!(BadState, "Failed to create GuestRegionMmap"))
+            .ok_or_else(|| ax_err_type!(BadState, "Failed to create GuestRegionMmap"))
         })
         .collect::<Result<Vec<_>, _>>()
 }

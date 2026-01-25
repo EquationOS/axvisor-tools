@@ -106,10 +106,9 @@ fn compute_mp_size(num_cpus: u8) -> usize {
     mem::size_of::<mpspec::mpf_intel>()
         + mem::size_of::<mpspec::mpc_table>()
         + mem::size_of::<mpspec::mpc_cpu>() * (num_cpus as usize)
-        + mem::size_of::<mpspec::mpc_ioapic>()
         + mem::size_of::<mpspec::mpc_bus>()
-        + mem::size_of::<mpspec::mpc_intsrc>() * (GSI_LEGACY_END as usize + 1)
-        + mem::size_of::<mpspec::mpc_lintsrc>() * 2
+    // + mem::size_of::<mpspec::mpc_intsrc>() * (GSI_LEGACY_END as usize + 1)
+    // + mem::size_of::<mpspec::mpc_lintsrc>() * 2
 }
 
 /// Performs setup of the MP table for the given `num_cpus`.
@@ -208,73 +207,73 @@ pub fn setup_mptable(
         checksum = checksum.wrapping_add(compute_checksum(&mpc_bus));
         mp_num_entries += 1;
     }
-    {
-        let size = mem::size_of::<mpspec::mpc_ioapic>() as u64;
-        let mpc_ioapic = mpspec::mpc_ioapic {
-            type_: mpspec::MP_IOAPIC.try_into().unwrap(),
-            apicid: ioapicid,
-            apicver: APIC_VERSION,
-            flags: mpspec::MPC_APIC_USABLE.try_into().unwrap(),
-            apicaddr: IO_APIC_DEFAULT_PHYS_BASE,
-        };
-        mem.write_obj(mpc_ioapic, base_mp)
-            .map_err(|_| MptableError::WriteMpcIoapic)?;
-        base_mp = base_mp.unchecked_add(size);
-        checksum = checksum.wrapping_add(compute_checksum(&mpc_ioapic));
-        mp_num_entries += 1;
-    }
-    // Per kvm_setup_default_irq_routing() in kernel
-    for i in 0..=u8::try_from(GSI_LEGACY_END).map_err(|_| MptableError::TooManyIrqs)? {
-        let size = mem::size_of::<mpspec::mpc_intsrc>() as u64;
-        let mpc_intsrc = mpspec::mpc_intsrc {
-            type_: mpspec::MP_INTSRC.try_into().unwrap(),
-            irqtype: mpspec::mp_irq_source_types::mp_INT.try_into().unwrap(),
-            irqflag: mpspec::MP_IRQPOL_DEFAULT.try_into().unwrap(),
-            srcbus: 0,
-            srcbusirq: i,
-            dstapic: ioapicid,
-            dstirq: i,
-        };
-        mem.write_obj(mpc_intsrc, base_mp)
-            .map_err(|_| MptableError::WriteMpcIntsrc)?;
-        base_mp = base_mp.unchecked_add(size);
-        checksum = checksum.wrapping_add(compute_checksum(&mpc_intsrc));
-        mp_num_entries += 1;
-    }
-    {
-        let size = mem::size_of::<mpspec::mpc_lintsrc>() as u64;
-        let mpc_lintsrc = mpspec::mpc_lintsrc {
-            type_: mpspec::MP_LINTSRC.try_into().unwrap(),
-            irqtype: mpspec::mp_irq_source_types::mp_ExtINT.try_into().unwrap(),
-            irqflag: mpspec::MP_IRQPOL_DEFAULT.try_into().unwrap(),
-            srcbusid: 0,
-            srcbusirq: 0,
-            destapic: 0,
-            destapiclint: 0,
-        };
-        mem.write_obj(mpc_lintsrc, base_mp)
-            .map_err(|_| MptableError::WriteMpcLintsrc)?;
-        base_mp = base_mp.unchecked_add(size);
-        checksum = checksum.wrapping_add(compute_checksum(&mpc_lintsrc));
-        mp_num_entries += 1;
-    }
-    {
-        let size = mem::size_of::<mpspec::mpc_lintsrc>() as u64;
-        let mpc_lintsrc = mpspec::mpc_lintsrc {
-            type_: mpspec::MP_LINTSRC.try_into().unwrap(),
-            irqtype: mpspec::mp_irq_source_types::mp_NMI.try_into().unwrap(),
-            irqflag: mpspec::MP_IRQPOL_DEFAULT.try_into().unwrap(),
-            srcbusid: 0,
-            srcbusirq: 0,
-            destapic: 0xFF,
-            destapiclint: 1,
-        };
-        mem.write_obj(mpc_lintsrc, base_mp)
-            .map_err(|_| MptableError::WriteMpcLintsrc)?;
-        base_mp = base_mp.unchecked_add(size);
-        checksum = checksum.wrapping_add(compute_checksum(&mpc_lintsrc));
-        mp_num_entries += 1;
-    }
+    // {
+    //     let size = mem::size_of::<mpspec::mpc_ioapic>() as u64;
+    //     let mpc_ioapic = mpspec::mpc_ioapic {
+    //         type_: mpspec::MP_IOAPIC.try_into().unwrap(),
+    //         apicid: ioapicid,
+    //         apicver: APIC_VERSION,
+    //         flags: mpspec::MPC_APIC_USABLE.try_into().unwrap(),
+    //         apicaddr: IO_APIC_DEFAULT_PHYS_BASE,
+    //     };
+    //     mem.write_obj(mpc_ioapic, base_mp)
+    //         .map_err(|_| MptableError::WriteMpcIoapic)?;
+    //     base_mp = base_mp.unchecked_add(size);
+    //     checksum = checksum.wrapping_add(compute_checksum(&mpc_ioapic));
+    //     mp_num_entries += 1;
+    // }
+    // // Per kvm_setup_default_irq_routing() in kernel
+    // for i in 0..=u8::try_from(GSI_LEGACY_END).map_err(|_| MptableError::TooManyIrqs)? {
+    //     let size = mem::size_of::<mpspec::mpc_intsrc>() as u64;
+    //     let mpc_intsrc = mpspec::mpc_intsrc {
+    //         type_: mpspec::MP_INTSRC.try_into().unwrap(),
+    //         irqtype: mpspec::mp_irq_source_types::mp_INT.try_into().unwrap(),
+    //         irqflag: mpspec::MP_IRQPOL_DEFAULT.try_into().unwrap(),
+    //         srcbus: 0,
+    //         srcbusirq: i,
+    //         dstapic: ioapicid,
+    //         dstirq: i,
+    //     };
+    //     mem.write_obj(mpc_intsrc, base_mp)
+    //         .map_err(|_| MptableError::WriteMpcIntsrc)?;
+    //     base_mp = base_mp.unchecked_add(size);
+    //     checksum = checksum.wrapping_add(compute_checksum(&mpc_intsrc));
+    //     mp_num_entries += 1;
+    // }
+    // {
+    //     let size = mem::size_of::<mpspec::mpc_lintsrc>() as u64;
+    //     let mpc_lintsrc = mpspec::mpc_lintsrc {
+    //         type_: mpspec::MP_LINTSRC.try_into().unwrap(),
+    //         irqtype: mpspec::mp_irq_source_types::mp_ExtINT.try_into().unwrap(),
+    //         irqflag: mpspec::MP_IRQPOL_DEFAULT.try_into().unwrap(),
+    //         srcbusid: 0,
+    //         srcbusirq: 0,
+    //         destapic: 0,
+    //         destapiclint: 0,
+    //     };
+    //     mem.write_obj(mpc_lintsrc, base_mp)
+    //         .map_err(|_| MptableError::WriteMpcLintsrc)?;
+    //     base_mp = base_mp.unchecked_add(size);
+    //     checksum = checksum.wrapping_add(compute_checksum(&mpc_lintsrc));
+    //     mp_num_entries += 1;
+    // }
+    // {
+    //     let size = mem::size_of::<mpspec::mpc_lintsrc>() as u64;
+    //     let mpc_lintsrc = mpspec::mpc_lintsrc {
+    //         type_: mpspec::MP_LINTSRC.try_into().unwrap(),
+    //         irqtype: mpspec::mp_irq_source_types::mp_NMI.try_into().unwrap(),
+    //         irqflag: mpspec::MP_IRQPOL_DEFAULT.try_into().unwrap(),
+    //         srcbusid: 0,
+    //         srcbusirq: 0,
+    //         destapic: 0xFF,
+    //         destapiclint: 1,
+    //     };
+    //     mem.write_obj(mpc_lintsrc, base_mp)
+    //         .map_err(|_| MptableError::WriteMpcLintsrc)?;
+    //     base_mp = base_mp.unchecked_add(size);
+    //     checksum = checksum.wrapping_add(compute_checksum(&mpc_lintsrc));
+    //     mp_num_entries += 1;
+    // }
 
     // At this point we know the size of the mp_table.
     let table_end = base_mp;

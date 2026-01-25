@@ -115,12 +115,12 @@ pub fn configure_system_for_boot(
     .map_err(ConfigurationError::LoadCommandline)?;
 
     // Note that this puts the mptable at the last 1k of Linux's 640k base RAM
-    mptable::setup_mptable(
-        vm.guest_memory(),
-        &mut vm.resource_allocator(),
-        machine_config.vcpu_count,
-    )
-    .map_err(ConfigurationError::MpTableSetup)?;
+    // mptable::setup_mptable(
+    //     vm.guest_memory(),
+    //     &mut vm.resource_allocator(),
+    //     machine_config.vcpu_count,
+    // )
+    // .map_err(ConfigurationError::MpTableSetup)?;
 
     match entry_point.protocol {
         BootProtocol::PvhBoot => {
@@ -139,11 +139,11 @@ pub fn configure_system_for_boot(
 
     // Create ACPI tables and write them in guest memory
     // For the time being we only support ACPI in x86_64
-    create_acpi_tables(
-        vm.guest_memory(),
-        &mut vm.resource_allocator(),
-        machine_config.max_vcpu_count(),
-    )?;
+    // create_acpi_tables(
+    //     vm.guest_memory(),
+    //     &mut vm.resource_allocator(),
+    //     machine_config.max_vcpu_count(),
+    // )?;
     Ok(())
 }
 

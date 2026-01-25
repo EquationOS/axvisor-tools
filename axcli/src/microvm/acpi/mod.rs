@@ -91,7 +91,7 @@ impl AcpiTableWriter<'_> {
         // Architecture specific DSDT data
         setup_arch_dsdt(&mut dsdt_data)?;
 
-        let mut dsdt = Dsdt::new(OEM_ID, *b"FCVMDSDT", OEM_REVISION, dsdt_data);
+        let mut dsdt = Dsdt::new(OEM_ID, *b"EQVMDSDT", OEM_REVISION, dsdt_data);
         self.write_acpi_table(resource_allocator, &mut dsdt)
     }
 
@@ -103,7 +103,7 @@ impl AcpiTableWriter<'_> {
         resource_allocator: &mut ResourceAllocator,
         dsdt_addr: u64,
     ) -> Result<u64, AcpiError> {
-        let mut fadt = Fadt::new(OEM_ID, *b"FCVMFADT", OEM_REVISION);
+        let mut fadt = Fadt::new(OEM_ID, *b"EQVMFADT", OEM_REVISION);
         fadt.set_hypervisor_vendor_id(HYPERVISOR_VENDOR_ID);
         fadt.set_x_dsdt(dsdt_addr);
         fadt.set_flags(
@@ -138,14 +138,16 @@ impl AcpiTableWriter<'_> {
         &mut self,
         resource_allocator: &mut ResourceAllocator,
         fadt_addr: u64,
-        madt_addr: u64,
-        mcfg_addr: u64,
+        // madt_addr: u64,
+        // mcfg_addr: u64,
     ) -> Result<u64, AcpiError> {
         let mut xsdt = Xsdt::new(
             OEM_ID,
-            *b"FCMVXSDT",
+            *b"EQMVXSDT",
             OEM_REVISION,
-            vec![fadt_addr, madt_addr, mcfg_addr],
+            // vec![fadt_addr, madt_addr, mcfg_addr],
+            // DO NOT include mcfg table for now.
+            vec![fadt_addr],
         );
         self.write_acpi_table(resource_allocator, &mut xsdt)
     }
@@ -193,8 +195,8 @@ pub(crate) fn create_acpi_tables(
     let dsdt_addr = writer.build_dsdt(resource_allocator)?;
 
     let fadt_addr = writer.build_fadt(resource_allocator, dsdt_addr)?;
-    let madt_addr = writer.build_madt(resource_allocator, max_vcpu_count)?;
-    let mcfg_addr = writer.build_mcfg(resource_allocator, layout::PCI_MMCONFIG_START)?;
-    let xsdt_addr = writer.build_xsdt(resource_allocator, fadt_addr, madt_addr, mcfg_addr)?;
+    // let madt_addr = writer.build_madt(resource_allocator, max_vcpu_count)?;
+    // let mcfg_addr = writer.build_mcfg(resource_allocator, layout::PCI_MMCONFIG_START)?;
+    let xsdt_addr = writer.build_xsdt(resource_allocator, fadt_addr)?;
     writer.build_rsdp(xsdt_addr)
 }
