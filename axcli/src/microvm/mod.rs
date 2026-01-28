@@ -12,6 +12,7 @@ mod vstate;
 use std::fs;
 
 use crate::MicroVMCreateArgs;
+use crate::hvc::hvc_init_shim;
 
 use arch::configure_system_for_boot;
 use arch::load_kernel;
@@ -19,6 +20,12 @@ use axerrno::{AxResult, ax_err_type};
 use initrd::InitrdConfig;
 use resource::VmResources;
 use vstate::vm::Vm;
+
+pub fn init_gate() {
+    // For now, we just reuse the init arg of LibOS instance.
+    // We use arg == 0 to indicate the MicroVM gate instance.
+    hvc_init_shim(0);
+}
 
 pub fn create_microvm(args: MicroVMCreateArgs) -> AxResult {
     info!(

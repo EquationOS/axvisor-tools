@@ -89,6 +89,7 @@ enum InstanceSubCmd {
 #[command(args_conflicts_with_subcommands = true)]
 #[command(flatten_help = true)]
 enum MicroVMSubCmd {
+    Init,
     /// Create a new instance.
     Create(MicroVMCreateArgs),
 }
@@ -174,6 +175,7 @@ fn main() {
             InstanceSubCmd::Remove { instance_id } => instance::remove_instance(instance_id as _),
         },
         CLISubCmd::Microvm { subcmd } => match subcmd {
+            MicroVMSubCmd::Init => microvm::init_gate(),
             MicroVMSubCmd::Create(args) => {
                 microvm::create_microvm(args).expect("Failed to create microvm")
             }
