@@ -79,6 +79,7 @@ mod boot_source {
     #[derive(Debug, Default)]
     pub struct BootSource {
         /// The boot source configuration.
+        #[allow(unused)]
         pub config: BootSourceConfig,
         /// The boot source builder (a boot source allocated and validated).
         /// It is an option cause a resumed microVM does not need it.

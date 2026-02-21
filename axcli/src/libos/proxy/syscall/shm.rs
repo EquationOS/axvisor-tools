@@ -6,8 +6,8 @@ use memory_addr::PAGE_SIZE_2M;
 use memory_addr::is_aligned_4k;
 
 use crate::hvc;
-use crate::proxy::FD_LIST;
-use crate::proxy::instance_id;
+use crate::libos::proxy::FD_LIST;
+use crate::libos::proxy::instance_id;
 
 /// Proxy for the `shmget` syscall,
 /// the daemon process does nothing but just forward the request to

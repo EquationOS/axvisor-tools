@@ -41,6 +41,7 @@ pub fn hvc_init_shim(ksched_shm_base: u64) {
     info!("hvc_init_shim result: {:#x}", result);
 }
 
+#[cfg(feature = "libos")]
 pub fn hvc_setup_instance(
     instance_id: u64,
     file_size: u64,
@@ -63,6 +64,7 @@ pub fn hvc_setup_instance(
     )
 }
 
+#[cfg(feature = "libos")]
 pub fn hvc_daemon_shmat(
     instance_id: u64,
     process_id: u64,
@@ -86,6 +88,7 @@ pub fn hvc_daemon_shmat(
     )
 }
 
+#[cfg(feature = "microvm")]
 pub fn hvc_microvm_boot(instance_id: u64, entry_point: u64, boot_protocol: u8) -> isize {
     info!("[*] Booting microVM instance ID: {}", instance_id);
 

@@ -2,8 +2,8 @@ use std::ffi::CStr;
 
 use axerrno::{AxResult, ax_err, ax_err_type};
 
-use crate::instance::EQINSTANCE_DEV_PREFIX;
 use crate::ioctl;
+use crate::ioctl::EQINSTANCE_DEV_PREFIX;
 use crate::microvm::config::{
     BootConfig, BootSource, BootSourceConfig, GuestConfig, MachineConfig,
 };

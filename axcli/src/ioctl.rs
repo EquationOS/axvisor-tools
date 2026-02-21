@@ -2,6 +2,8 @@ use std::ffi::CStr;
 
 use libc::c_char;
 
+pub const EQINSTANCE_DEV_PREFIX: &str = "/dev/eqinstance_";
+
 include!(concat!(env!("OUT_DIR"), "/eqioctl.rs"));
 
 /// Direction flags

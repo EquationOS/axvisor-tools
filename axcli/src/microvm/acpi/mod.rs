@@ -10,7 +10,7 @@ use vm_allocator::AllocPolicy;
 use crate::microvm::acpi::x86_64::{
     apic_addr, rsdp_addr, setup_arch_dsdt, setup_arch_fadt, setup_interrupt_controllers,
 };
-use crate::microvm::arch::layout;
+// use crate::microvm::arch::layout;
 // use crate::device_manager::DeviceManager;
 use crate::microvm::vstate::memory::{GuestAddress, GuestMemoryMmap};
 use crate::microvm::vstate::resources::ResourceAllocator;

@@ -61,6 +61,7 @@ impl Vm {
     }
 
     /// Gets a reference to the kvm file descriptor owned by this VM.
+    #[allow(unused)]
     pub fn fd(&self) -> i32 {
         self.fd
     }
@@ -71,6 +72,7 @@ impl Vm {
     }
 
     /// Gets a mutable reference to this [`Vm`]'s [`ResourceAllocator`] object
+    #[allow(unused)]
     pub fn resource_allocator(&self) -> MutexGuard<'_, ResourceAllocator> {
         self.resource_allocator.lock().expect("Poisoned lock")
     }

@@ -5,8 +5,8 @@ use libc::MAP_PRIVATE;
 
 use equation_defs::{PAGE_CACHE_POOL_BASE_VA, PAGE_CACHE_POOL_SIZE};
 
-use crate::proxy::FD_LIST;
-use crate::proxy::syscall::raw_syscall;
+use crate::libos::proxy::FD_LIST;
+use crate::libos::proxy::syscall::raw_syscall;
 
 pub fn proxy_access(path_ptr: u64, mode: u64) -> LinuxResult<u64> {
     // Convert the path pointer to a Rust string

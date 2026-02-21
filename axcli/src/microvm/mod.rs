@@ -1,18 +1,23 @@
 //! MicroVM related functionalities.
 //! Most of the code here is adapted from Firecracker's microVM design.
 
+#[allow(unused)]
 mod acpi;
 pub mod arch;
+mod cli;
 mod config;
 mod initrd;
+#[allow(unused)]
 mod mptable;
 mod resource;
 mod vstate;
 
+pub use cli::*;
+
 use std::fs;
 
-use crate::MicroVMCreateArgs;
 use crate::hvc::hvc_init_shim;
+use cli::MicroVMCreateArgs;
 
 use arch::configure_system_for_boot;
 use arch::load_kernel;

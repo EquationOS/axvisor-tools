@@ -1,26 +1,21 @@
 //! CommandLine Interface and host daemon process for Equation OS.
 
 mod hvc;
-mod instance;
-mod shared_pages;
-
-#[allow(static_mut_refs)]
-mod proxy;
 
 #[allow(non_camel_case_types)]
 #[allow(unused)]
 mod ioctl;
 
-/// Just for test and debug purpose.
-/// A User-level executor to boot ELF.
-mod loader;
-
+#[cfg(feature = "microvm")]
 mod microvm;
+
+#[cfg(feature = "libos")]
+mod libos;
 
 #[allow(unused)]
 mod utils;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 
 #[macro_use]
 extern crate log;
@@ -44,18 +39,33 @@ enum CLISubCmd {
         #[command(subcommand)]
         subcmd: HvSubCmd,
     },
+    #[cfg(feature = "libos")]
     /// Subcommands related to the management of the container instance.
     Instance {
         #[command(subcommand)]
-        subcmd: InstanceSubCmd,
+        subcmd: libos::InstanceSubCmd,
     },
+    #[cfg(feature = "libos")]
+    /// Subcommands related to the a local test loader.
+    Loader(libos::ExecuteArgs),
+    #[cfg(not(feature = "libos"))]
+    /// Subcommands related to the management of the container instance.
+    /// This subcommand need to be enabled with libos feature.
+    Instance { _subcmd: String },
+    #[cfg(not(feature = "libos"))]
+    /// Subcommands related to the a local test loader.
+    /// This subcommand need to be enabled with libos feature.
+    Loader { _args: String },
+    #[cfg(feature = "microvm")]
     /// Subcommands related to microVM management.
     Microvm {
         #[command(subcommand)]
-        subcmd: MicroVMSubCmd,
+        subcmd: microvm::MicroVMSubCmd,
     },
-    /// Subcommands related to the a local test loader.
-    Loader(ExecuteArgs),
+    #[cfg(not(feature = "microvm"))]
+    /// Subcommands related to microVM management.
+    /// This subcommand need to be enabled with microvm feature.
+    Microvm { _subcmd: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -66,46 +76,6 @@ enum HvSubCmd {
     Enable,
     /// Disable arceos-hypervisor type1.5.
     Disable,
-}
-
-#[derive(Subcommand, Debug)]
-#[command(args_conflicts_with_subcommands = true)]
-#[command(flatten_help = true)]
-enum InstanceSubCmd {
-    /// list the info of the instance
-    List,
-    /// Init instance runtime environment.
-    Init,
-    /// Execute a instance by ELF file alone with its arguments.
-    Execute(ExecuteArgs),
-    Remove {
-        /// Instance ID to remove.
-        #[arg(short, long)]
-        instance_id: i32,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-#[command(args_conflicts_with_subcommands = true)]
-#[command(flatten_help = true)]
-enum MicroVMSubCmd {
-    Init,
-    /// Create a new instance.
-    Create(MicroVMCreateArgs),
-}
-
-#[derive(Debug, Args)]
-struct MicroVMCreateArgs {
-    /// Path to the configuration file in json format.
-    #[arg(short, long)]
-    pub config_file: String,
-}
-
-#[derive(Parser, Debug)]
-#[command(trailing_var_arg = true)]
-struct ExecuteArgs {
-    #[arg(required = true)]
-    exec_args: Vec<String>,
 }
 
 use libc::{SA_SIGINFO, SIGBUS, c_void, sigaction, siginfo_t};
@@ -168,18 +138,35 @@ fn main() {
             HvSubCmd::Enable => todo!(),
             HvSubCmd::Disable => todo!(),
         },
+        #[cfg(feature = "libos")]
         CLISubCmd::Instance { subcmd } => match subcmd {
-            InstanceSubCmd::List => todo!(),
-            InstanceSubCmd::Init => instance::init_shim(),
-            InstanceSubCmd::Execute(args) => instance::execute(args),
-            InstanceSubCmd::Remove { instance_id } => instance::remove_instance(instance_id as _),
+            libos::InstanceSubCmd::List => todo!(),
+            libos::InstanceSubCmd::Init => libos::instance::init_shim(),
+            libos::InstanceSubCmd::Execute(args) => libos::instance::execute(args),
+            libos::InstanceSubCmd::Remove { instance_id } => {
+                libos::instance::remove_instance(instance_id as _)
+            }
         },
+        #[cfg(feature = "libos")]
+        CLISubCmd::Loader(args) => libos::loader::local_execute(args),
+        #[cfg(not(feature = "libos"))]
+        CLISubCmd::Instance { _subcmd } => {
+            unimplemented!("Instance management is not supported without libos feature")
+        }
+        #[cfg(not(feature = "libos"))]
+        CLISubCmd::Loader { _args } => {
+            unimplemented!("Local test loader is not supported without libos feature")
+        }
+        #[cfg(feature = "microvm")]
         CLISubCmd::Microvm { subcmd } => match subcmd {
-            MicroVMSubCmd::Init => microvm::init_gate(),
-            MicroVMSubCmd::Create(args) => {
+            microvm::MicroVMSubCmd::Init => microvm::init_gate(),
+            microvm::MicroVMSubCmd::Create(args) => {
                 microvm::create_microvm(args).expect("Failed to create microvm")
             }
         },
-        CLISubCmd::Loader(args) => loader::local_execute(args),
+        #[cfg(not(feature = "microvm"))]
+        CLISubCmd::Microvm { _subcmd } => {
+            unimplemented!("MicroVM management is not supported without microvm feature")
+        }
     }
 }

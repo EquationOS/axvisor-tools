@@ -8,7 +8,7 @@
 
 use std::mem;
 
-use kvm_bindings::{kvm_fpu, kvm_regs, kvm_sregs};
+use kvm_bindings::kvm_sregs;
 
 use crate::microvm::arch::BootProtocol;
 use crate::microvm::arch::gdt::{gdt_entry, kvm_segment_from_gdt};

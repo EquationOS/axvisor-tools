@@ -1,6 +1,6 @@
 pub(crate) mod elf;
 
-use crate::ExecuteArgs;
+use crate::libos::ExecuteArgs;
 
 /// A User-level executor to boot ELF.
 /// Just for test and debug purpose.

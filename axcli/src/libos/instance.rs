@@ -5,12 +5,11 @@ use libc::c_void;
 
 use pi_memory_layout::{ArgsLayoutBuilder, ArgsLayoutRef};
 
-use crate::ExecuteArgs;
 use crate::hvc::{hvc_init_shim, hvc_setup_instance};
-use crate::proxy;
-use crate::shared_pages::{copy_content_to_shared_pages, free_shared_pages};
-
-pub const EQINSTANCE_DEV_PREFIX: &str = "/dev/eqinstance_";
+use crate::ioctl::EQINSTANCE_DEV_PREFIX;
+use crate::libos::ExecuteArgs;
+use crate::libos::proxy;
+use crate::libos::shared_pages::{copy_content_to_shared_pages, free_shared_pages};
 
 /// Remote execute in a instance setup by AxVisor.
 pub fn execute(args: ExecuteArgs) {

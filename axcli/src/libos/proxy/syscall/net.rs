@@ -3,7 +3,7 @@
 use axerrno::LinuxResult;
 use libc::{CMSG_DATA, CMSG_FIRSTHDR, CMSG_LEN, msghdr};
 
-use crate::proxy::FD_LIST;
+use crate::libos::proxy::FD_LIST;
 
 pub fn proxy_socket(domain: u64, ty: u64, protocol: u64) -> LinuxResult<u64> {
     let fd = unsafe { libc::socket(domain as i32, ty as i32, protocol as i32) };

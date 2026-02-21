@@ -3,8 +3,8 @@ use axerrno::{LinuxError, LinuxResult};
 use equation_defs::purple_text;
 use equation_defs::scf::Sysno;
 
-use crate::proxy::scf::SyscallQueueBuffer;
-use crate::proxy::syscall::{fs, misc, net, shm};
+use crate::libos::proxy::scf::SyscallQueueBuffer;
+use crate::libos::proxy::syscall::{fs, misc, net, shm};
 
 pub fn poll() {
     let scf = SyscallQueueBuffer::get();

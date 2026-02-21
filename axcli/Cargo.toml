@@ -6,6 +6,11 @@ edition = "2024"
 [workspace]
 members = ["deps/acpi-tables"]
 
+[features]
+default = ["libos", "microvm"]
+microvm = ["eqgate-microvm"]
+libos = ["equation_defs"]
+
 [dependencies]
 clap = { version = "4.5.4", features = ["derive"] }
 libc = "0.2.154"
@@ -19,7 +24,8 @@ lazyinit = "0.2"
 axerrno = "0.1.0"
 sc = "0.2.7"
 
-equation_defs = { git = "https://github.com/EquationOS/equation_defs.git" }
+equation_defs = { optional = true, git = "https://github.com/EquationOS/equation_defs.git" }
+eqgate-microvm = { optional = true, git = "https://github.com/EquationOS/microvm_gate.git" }
 linux-libc-auxv = { git = "https://github.com/EquationOS/linux-libc-auxv.git" }
 
 memory_addr = "0.3"
@@ -51,13 +57,21 @@ pi_memory_layout = { path = "../../../crates/pi_memory_layout" }
 [patch."https://github.com/EquationOS/equation_defs.git"]
 equation_defs = { path = "../../../crates/equation_defs" }
 
+[patch."https://github.com/EquationOS/microvm_gate.git"]
+eqgate-microvm = { path = "../../../deps/microvm_gate/gate" }
+
 [patch."https://github.com/arceos-org/x86_uintr.git"]
 x86_uintr = { path = "../../../crates/x86_uintr" }
 
+[patch."https://github.com/arceos-hypervisor/axaddrspace.git"]
+axaddrspace = { path = "../../../crates/axaddrspace" }
+
 [patch.crates-io]
 memory_addr = { path = "../../../crates/memory_addr/memory_addr" }
-bitmaps = { path = "../../../crates/bitmaps" }
+memory_set = { path = "../../../crates/memory_addr/memory_set" }
+page_table_entry = { path = "../../../crates/page_table_multiarch/page_table_entry" }
 page_table_multiarch = { path = "../../../crates/page_table_multiarch/page_table_multiarch" }
+bitmaps = { path = "../../../crates/bitmaps" }
 
 [build-dependencies]
 bindgen = "0.72"

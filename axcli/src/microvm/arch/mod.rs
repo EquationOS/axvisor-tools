@@ -3,10 +3,9 @@ pub mod generated;
 mod gdt;
 mod regs;
 
-pub use equation_defs::microvm::layout;
-pub use equation_defs::microvm::layout::*;
+pub use eqgate_microvm::layout;
+pub use eqgate_microvm::layout::*;
 
-use core::fmt;
 use std::cmp::max;
 use std::fs::File;
 
@@ -18,6 +17,7 @@ use linux_loader::loader::bootparam::boot_params;
 use linux_loader::loader::elf::Elf as Loader;
 use linux_loader::loader::{Cmdline, KernelLoader, PvhBootCapability, load_cmdline};
 
+#[allow(unused)]
 use crate::microvm::acpi::create_acpi_tables;
 use crate::microvm::config::MachineConfig;
 use crate::microvm::initrd::InitrdConfig;
@@ -65,7 +65,7 @@ pub enum ConfigurationError {
     Acpi(#[from] crate::microvm::acpi::AcpiError),
 }
 
-pub use equation_defs::microvm::BootProtocol;
+pub use eqgate_microvm::BootProtocol;
 
 #[derive(Debug, Copy, Clone)]
 /// Specifies the entry point address where the guest must start
@@ -87,7 +87,7 @@ pub fn get_kernel_start() -> u64 {
 #[allow(clippy::too_many_arguments)]
 pub fn configure_system_for_boot(
     vm: &Vm,
-    machine_config: &MachineConfig,
+    _machine_config: &MachineConfig,
     entry_point: EntryPoint,
     initrd: &Option<InitrdConfig>,
     boot_cmdline: Cmdline,
