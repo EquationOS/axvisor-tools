@@ -10,14 +10,11 @@ use std::mem;
 
 use kvm_bindings::kvm_sregs;
 
+use eqgate_microvm::layout::{PDE_START, PDPTE_START, PML4_START};
+
 use crate::microvm::arch::BootProtocol;
 use crate::microvm::arch::gdt::{gdt_entry, kvm_segment_from_gdt};
 use crate::microvm::vstate::memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
-
-// Initial pagetables.
-const PML4_START: u64 = 0x9000;
-const PDPTE_START: u64 = 0xa000;
-const PDE_START: u64 = 0xb000;
 
 /// Errors thrown while setting up x86_64 registers.
 #[derive(Debug, thiserror::Error, displaydoc::Display, PartialEq, Eq)]
