@@ -10,9 +10,13 @@ mod initrd;
 #[allow(unused)]
 mod mptable;
 mod resource;
+mod vfio_runtime;
 mod vstate;
 
 pub use cli::*;
+pub use config::IovaMode;
+pub use config::PciBdf;
+pub use resource::VfioResourceConfig;
 
 use std::fs;
 
@@ -24,6 +28,7 @@ use arch::load_kernel;
 use axerrno::{AxResult, ax_err_type};
 use initrd::InitrdConfig;
 use resource::VmResources;
+use vfio_runtime::{run_foreground_daemon_loop, setup_vfio_dma_holder};
 use vstate::vm::Vm;
 
 pub fn init_gate() {
@@ -41,7 +46,31 @@ pub fn create_microvm(args: MicroVMCreateArgs) -> AxResult {
     let config_json = fs::read_to_string(args.config_file)
         .expect("Unable to open or read from the configuration file");
 
+    // Build microVM resources from the configuration file. 
+    // It will create the microVM instance in the kernel via ioctl and get an instance ID, which is used as the VM ID for later interactions with this microVM.
+    // This includes preparing the VM configuration, allocating guest memory, and setting up VFIO DMA mappings if needed.
     let vm_resources = VmResources::from_json(&config_json).expect("Failed to build VM resources");
+
+    if !vm_resources.passthrough_devices.is_empty() {
+        for bdf in &vm_resources.passthrough_devices {
+            warn!("microVM passthrough-device requested: {}", bdf.format());
+        }
+        warn!(
+            "BDF list is now forwarded through ioctl/metadata to EqVisor microVM backend. \
+If devices are still not visible in guest, complete BAR/interrupt mapping is likely missing."
+        );
+    }
+    if let Some(vfio) = vm_resources.vfio {
+        warn!(
+            "microVM vfio requested: iommu-group={} guest-visible-bdf={:04x}:{:02x}:{:02x}.{} iova-mode={:?}",
+            vfio.iommu_group,
+            vfio.guest_visible_bdf.domain,
+            vfio.guest_visible_bdf.bus,
+            vfio.guest_visible_bdf.device,
+            vfio.guest_visible_bdf.function,
+            vfio.iova_mode
+        );
+    }
 
     let boot_config = vm_resources.boot_source.builder.as_ref().ok_or_else(|| {
         ax_err_type!(
@@ -53,6 +82,11 @@ pub fn create_microvm(args: MicroVMCreateArgs) -> AxResult {
     let guest_memory = vm_resources
         .allocate_guest_memory()
         .expect("Failed to allocate guest memory");
+
+    let keep_foreground = vm_resources.vfio.is_some();
+    // Build persistent VFIO DMA mappings in current process before guest boot.
+    // In daemon mode this process itself keeps VFIO fds/mappings alive.
+    setup_vfio_dma_holder(&vm_resources, &guest_memory)?;
 
     // Clone the command-line so that a failed boot doesn't pollute the original.
     #[allow(unused_mut)]
@@ -85,6 +119,10 @@ pub fn create_microvm(args: MicroVMCreateArgs) -> AxResult {
         entry_point.entry_addr.0,
         entry_point.protocol as u8,
     );
+
+    if keep_foreground {
+        run_foreground_daemon_loop();
+    }
 
     Ok(())
 }

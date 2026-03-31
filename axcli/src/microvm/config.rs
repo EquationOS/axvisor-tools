@@ -37,6 +37,150 @@ impl MachineConfig {
 pub struct GuestConfig {
     pub boot_source: BootSourceConfig,
     pub machine_config: Option<MachineConfig>,
+    /// Optional host PCI devices to passthrough, identified by BDF.
+    /// Supported forms:
+    /// - "bb:dd.f"        (e.g. "15:00.0")
+    /// - "dddd:bb:dd.f"   (e.g. "0000:15:00.0")
+    pub passthrough_devices: Option<Vec<String>>,
+    /// Optional VFIO-related passthrough settings.
+    pub vfio: Option<VfioConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct VfioConfig {
+    /// Host IOMMU group ID that owns the passthrough device.
+    pub iommu_group: Option<u32>,
+    /// Guest-visible BDF for the passthrough device.
+    /// If absent, EqVisor defaults to `00:00.0`.
+    pub guest_visible_bdf: Option<String>,
+    /// IOVA mode for DMA mapping.
+    /// Supported values:
+    /// - "gpa-identity" (IOVA == GPA)
+    pub iova_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PciBdf {
+    pub domain: u16,
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IovaMode {
+    GpaIdentity,
+}
+
+impl PciBdf {
+    /// Encode into a compact u64: 0xddddbbddf
+    pub fn encode_u64(self) -> u64 {
+        ((self.domain as u64) << 20)
+            | ((self.bus as u64) << 12)
+            | ((self.device as u64) << 4)
+            | (self.function as u64)
+    }
+
+    pub fn format(self) -> String {
+        format!(
+            "{:04x}:{:02x}:{:02x}.{}",
+            self.domain, self.bus, self.device, self.function
+        )
+    }
+}
+
+/// Normalize and validate host PCI BDF strings.
+pub fn normalize_pci_bdf(input: &str) -> Option<String> {
+    let bdf = input.trim().to_ascii_lowercase();
+    if is_short_bdf(&bdf) || is_full_bdf(&bdf) {
+        Some(bdf)
+    } else {
+        None
+    }
+}
+
+pub fn parse_pci_bdf(input: &str) -> Option<PciBdf> {
+    let bdf = normalize_pci_bdf(input)?;
+    if is_short_bdf(&bdf) {
+        // bb:dd.f
+        let mut parts = bdf.split(':');
+        let bus = u8::from_str_radix(parts.next()?, 16).ok()?;
+        let mut df = parts.next()?.split('.');
+        let dev = u8::from_str_radix(df.next()?, 16).ok()?;
+        let func = u8::from_str_radix(df.next()?, 16).ok()?;
+        Some(PciBdf {
+            domain: 0,
+            bus,
+            device: dev,
+            function: func,
+        })
+    } else if is_full_bdf(&bdf) {
+        // dddd:bb:dd.f
+        let mut parts = bdf.split(':');
+        let domain = u16::from_str_radix(parts.next()?, 16).ok()?;
+        let bus = u8::from_str_radix(parts.next()?, 16).ok()?;
+        let mut df = parts.next()?.split('.');
+        let dev = u8::from_str_radix(df.next()?, 16).ok()?;
+        let func = u8::from_str_radix(df.next()?, 16).ok()?;
+        Some(PciBdf {
+            domain,
+            bus,
+            device: dev,
+            function: func,
+        })
+    } else {
+        None
+    }
+}
+
+pub fn parse_iova_mode(input: &str) -> Option<IovaMode> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "gpa-identity" => Some(IovaMode::GpaIdentity),
+        _ => None,
+    }
+}
+
+fn is_hex(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|c| c.is_ascii_hexdigit())
+}
+
+fn is_short_bdf(bdf: &str) -> bool {
+    // bb:dd.f
+    let mut parts = bdf.split(':');
+    let bus = parts.next().unwrap_or_default();
+    let dev_func = parts.next().unwrap_or_default();
+    if parts.next().is_some() || bus.len() != 2 || !is_hex(bus) {
+        return false;
+    }
+    let mut df = dev_func.split('.');
+    let dev = df.next().unwrap_or_default();
+    let func = df.next().unwrap_or_default();
+    if df.next().is_some() || dev.len() != 2 || func.len() != 1 {
+        return false;
+    }
+    is_hex(dev) && func.bytes().all(|c| (b'0'..=b'7').contains(&c))
+}
+
+fn is_full_bdf(bdf: &str) -> bool {
+    // dddd:bb:dd.f
+    let mut parts = bdf.split(':');
+    let domain = parts.next().unwrap_or_default();
+    let bus = parts.next().unwrap_or_default();
+    let dev_func = parts.next().unwrap_or_default();
+    if parts.next().is_some() || domain.len() != 4 || bus.len() != 2 {
+        return false;
+    }
+    if !is_hex(domain) || !is_hex(bus) {
+        return false;
+    }
+    let mut df = dev_func.split('.');
+    let dev = df.next().unwrap_or_default();
+    let func = df.next().unwrap_or_default();
+    if df.next().is_some() || dev.len() != 2 || func.len() != 1 {
+        return false;
+    }
+    is_hex(dev) && func.bytes().all(|c| (b'0'..=b'7').contains(&c))
 }
 
 mod boot_source {

@@ -1,6 +1,7 @@
 use std::ffi::CStr;
 
 use libc::c_char;
+use crate::microvm::{IovaMode, PciBdf, VfioResourceConfig};
 
 pub const EQINSTANCE_DEV_PREFIX: &str = "/dev/eqinstance_";
 
@@ -37,6 +38,7 @@ const fn iow<T>(ty: u32, nr: u32) -> u64 {
 
 const EQ_CREATE_INSTANCE: u64 = iow::<eq_create_instance_arg_t>(0, 0);
 const EQ_REMOVE_INSTANCE: u64 = iow::<eq_remove_instance_arg_t>(0, 1);
+const EQ_INSTANCE_INJECT_IRQ: u64 = iow::<eq_instance_irq_inject_arg_t>(0, 2);
 
 const EQ_DEVICE_NAME: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"/dev/eqmanager\0") };
 
@@ -59,6 +61,8 @@ pub fn ioctl_create_microvm(
     max_vcpu_num: u8,
     init_mem_size_mib: usize,
     max_mem_size_mib: usize,
+    passthrough_devices: &[PciBdf],
+    vfio: Option<VfioResourceConfig>,
 ) -> Result<usize, String> {
     let fd = open_eqmanager_dev()?;
 
@@ -70,7 +74,49 @@ pub fn ioctl_create_microvm(
         max_vcpu_num: max_vcpu_num as u64,
         init_mem_size_mib: init_mem_size_mib as u64,
         max_mem_size_mib: max_mem_size_mib as u64,
+        passthrough_device_count: 0,
+        passthrough_bdf: [0; 8],
+        vfio_flags: 0,
+        vfio_iommu_group: 0,
+        vfio_guest_visible_bdf: 0,
+        vfio_bar_count: 0,
+        vfio_bar_start: [0; 6],
+        vfio_bar_size: [0; 6],
+        vfio_bar_flags: [0; 6],
+        vfio_pci_cfg_space_len: 0,
+        vfio_pci_cfg_space: [0; 256],
     };
+
+    if passthrough_devices.len() > arg.passthrough_bdf.len() {
+        return Err(format!(
+            "Too many passthrough devices: {}, max {}",
+            passthrough_devices.len(),
+            arg.passthrough_bdf.len()
+        ));
+    }
+    arg.passthrough_device_count = passthrough_devices.len() as u64;
+    for (i, bdf) in passthrough_devices.iter().enumerate() {
+        arg.passthrough_bdf[i] = bdf.encode_u64();
+    }
+    if let Some(vfio_cfg) = vfio {
+        const VFIO_FLAG_ENABLED: u64 = 1 << 0;
+        const VFIO_FLAG_IOVA_GPA_IDENTITY: u64 = 1 << 1;
+        arg.vfio_flags |= VFIO_FLAG_ENABLED;
+        if vfio_cfg.iova_mode == IovaMode::GpaIdentity {
+            arg.vfio_flags |= VFIO_FLAG_IOVA_GPA_IDENTITY;
+        }
+        arg.vfio_iommu_group = vfio_cfg.iommu_group as u64;
+        arg.vfio_guest_visible_bdf = vfio_cfg.guest_visible_bdf.encode_u64();
+        arg.vfio_bar_count = vfio_cfg.bars.len() as u64;
+        for (i, bar) in vfio_cfg.bars.iter().enumerate() {
+            arg.vfio_bar_start[i] = bar.start;
+            arg.vfio_bar_size[i] = bar.size;
+            arg.vfio_bar_flags[i] = bar.flags;
+        }
+        let cfg_len = core::cmp::min(vfio_cfg.pci_cfg_space_len, arg.vfio_pci_cfg_space.len());
+        arg.vfio_pci_cfg_space_len = cfg_len as u64;
+        arg.vfio_pci_cfg_space[..cfg_len].copy_from_slice(&vfio_cfg.pci_cfg_space[..cfg_len]);
+    }
 
     let ret = unsafe { libc::ioctl(fd, EQ_CREATE_INSTANCE as libc::c_ulong, &mut arg as *mut _) };
 
@@ -101,6 +147,17 @@ pub fn ioctl_create_libos() -> Result<usize, String> {
         max_vcpu_num: 0,         // Dummy value, not used for libOS
         init_mem_size_mib: 0,    // Dummy value, not used for libOS
         max_mem_size_mib: 0,     // Dummy value, not used for libOS
+        passthrough_device_count: 0,
+        passthrough_bdf: [0; 8],
+        vfio_flags: 0,
+        vfio_iommu_group: 0,
+        vfio_guest_visible_bdf: 0,
+        vfio_bar_count: 0,
+        vfio_bar_start: [0; 6],
+        vfio_bar_size: [0; 6],
+        vfio_bar_flags: [0; 6],
+        vfio_pci_cfg_space_len: 0,
+        vfio_pci_cfg_space: [0; 256],
     };
 
     let ret = unsafe { libc::ioctl(fd, EQ_CREATE_INSTANCE as libc::c_ulong, &mut arg as *mut _) };
@@ -145,5 +202,29 @@ pub fn ioctl_remove_instance(instance_id: u64) -> Result<(), String> {
     }
 
     info!("Instance {} removed successfully", instance_id);
+    Ok(())
+}
+
+pub fn ioctl_inject_instance_irq(instance_fd: i32, instance_id: u64, msix_index: u32) -> Result<(), String> {
+    let mut arg = eq_instance_irq_inject_arg_t {
+        instance_id,
+        msix_index,
+        reserved: 0,
+    };
+    let ret = unsafe {
+        libc::ioctl(
+            instance_fd,
+            EQ_INSTANCE_INJECT_IRQ as libc::c_ulong,
+            &mut arg as *mut _,
+        )
+    };
+    if ret < 0 {
+        return Err(format!(
+            "Failed to inject instance irq (instance={} msix_index={}): {}",
+            instance_id,
+            msix_index,
+            std::io::Error::last_os_error()
+        ));
+    }
     Ok(())
 }

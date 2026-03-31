@@ -4,8 +4,10 @@
 #include <linux/miscdevice.h>
 #include <linux/mm.h>
 #include <linux/pgtable.h>
+#include <linux/uaccess.h>
 #include <linux/pid.h>	 // for pid_nr()
 #include <linux/sched.h> // for current
+#include <linux/uaccess.h>
 
 #include "includes/eqmanager.h"
 #include "includes/hvc.h"
@@ -109,6 +111,58 @@ static int instance_dev_release(struct inode *inode, struct file *file)
 	// Implement release logic here if needed
 	file->private_data = NULL;
 	return 0;
+}
+
+static long instance_dev_ioctl(
+	struct file *file, unsigned int cmd, unsigned long arg)
+{
+	eq_instance_vdev_t *instance_vdev = file->private_data;
+
+	if (!instance_vdev || !instance_vdev->active)
+	{
+		ERROR("Instance fd ioctl on inactive device\n");
+		return -ENODEV;
+	}
+
+	switch (cmd)
+	{
+	case EQ_INSTANCE_INJECT_IRQ:
+	{
+		eq_instance_irq_inject_arg_t irq_arg;
+		int ret;
+		if (copy_from_user(
+				&irq_arg, (void __user *)arg,
+				sizeof(eq_instance_irq_inject_arg_t)))
+		{
+			ERROR("Failed to copy EQ_INSTANCE_INJECT_IRQ arg from user\n");
+			return -EFAULT;
+		}
+
+		if (irq_arg.instance_id != 0 &&
+			irq_arg.instance_id != (uint64_t)instance_vdev->id)
+		{
+			ERROR(
+				"EQ_INSTANCE_INJECT_IRQ mismatched instance id: fd=%d arg=%llu\n",
+				instance_vdev->id, irq_arg.instance_id);
+			return -EINVAL;
+		}
+
+		ret = hvc_inject_microvm_irq(instance_vdev->id, irq_arg.msix_index);
+		if (ret < 0)
+		{
+			ERROR(
+				"HMicroVMInjectIrq failed for instance %d msix_index=%u ret=%d\n",
+				instance_vdev->id, irq_arg.msix_index, ret);
+			return ret;
+		}
+		INFO(
+			"Injected MicroVM IRQ via HVC: instance=%d msix_index=%u\n",
+			instance_vdev->id, irq_arg.msix_index);
+		return 0;
+	}
+	default:
+		return -ENOTTY;
+	}
 }
 
 /// @brief Map the shared memory region for the instance.
@@ -277,6 +331,8 @@ static const struct file_operations instance_fops = {
 	.open = instance_dev_open,
 	.read = instance_dev_read,
 	.write = instance_dev_write,
+	.unlocked_ioctl = instance_dev_ioctl,
+	.compat_ioctl = instance_dev_ioctl,
 	.mmap = instance_mmap,
 	.release = instance_dev_release,
 };
@@ -318,6 +374,26 @@ int create_instance(eq_create_instance_arg_t *arg)
 		instance_metadata->max_memory_region_size_mib = arg->max_mem_size_mib;
 		instance_metadata->init_vcpu_num = arg->init_vcpu_num;
 		instance_metadata->max_vcpu_num = arg->max_vcpu_num;
+		instance_metadata->passthrough_device_count = arg->passthrough_device_count;
+		for (int i = 0; i < EQ_MAX_PASSTHROUGH_DEVICES; i++)
+		{
+			instance_metadata->passthrough_bdf[i] = arg->passthrough_bdf[i];
+		}
+		instance_metadata->vfio_flags = arg->vfio_flags;
+		instance_metadata->vfio_iommu_group = arg->vfio_iommu_group;
+		instance_metadata->vfio_guest_visible_bdf = arg->vfio_guest_visible_bdf;
+		instance_metadata->vfio_bar_count = arg->vfio_bar_count;
+		for (int i = 0; i < EQ_MAX_VFIO_BARS; i++)
+		{
+			instance_metadata->vfio_bar_start[i] = arg->vfio_bar_start[i];
+			instance_metadata->vfio_bar_size[i] = arg->vfio_bar_size[i];
+			instance_metadata->vfio_bar_flags[i] = arg->vfio_bar_flags[i];
+		}
+		instance_metadata->vfio_pci_cfg_space_len = arg->vfio_pci_cfg_space_len;
+		memcpy(
+			instance_metadata->vfio_pci_cfg_space,
+			arg->vfio_pci_cfg_space,
+			EQ_MAX_PCI_CFG_SPACE_BYTES);
 	}
 
 	instance_metadata_ptr_gpa = virt_to_phys(instance_metadata);
@@ -344,10 +420,11 @@ int create_instance(eq_create_instance_arg_t *arg)
 		INFO(
 			"Creating microVM instance %d\n"
 			"memory region base @ 0x%llx, init mem size %lld MB, init vcpu "
-			"number %lld\n",
+			"number %lld, passthrough devices %lld\n",
 			instance_id, instance_metadata->memory_region_base_gpa,
 			instance_metadata->init_memory_region_size_mib,
-			instance_metadata->init_vcpu_num);
+			instance_metadata->init_vcpu_num,
+			instance_metadata->passthrough_device_count);
 	}
 
 	if (instance_id < 0)

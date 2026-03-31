@@ -10,9 +10,8 @@ use std::fmt::Debug;
 use std::mem::{self, size_of};
 
 use libc::c_char;
-use vm_allocator::AllocPolicy;
-
 use crate::microvm::arch::GSI_LEGACY_END;
+use crate::microvm::arch::layout;
 use crate::microvm::arch::generated::mpspec;
 use crate::microvm::vstate::memory::{
     Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap,
@@ -69,6 +68,9 @@ unsafe impl ByteValued for mpspec::mpf_intel {}
 // one APIC ID, so only 254 CPUs at maximum may be supported. Actually it's
 // a large number for FC usecases.
 pub const MAX_SUPPORTED_CPUS: u8 = 254;
+/// Linux scans the top 1 KiB of base 640 KiB RAM for the MP floating pointer.
+/// Place the MP table at this fixed GPA so it is always discoverable.
+const MPTABLE_START_GPA: u64 = layout::SYSTEM_MEM_START;
 
 // Convenience macro for making arrays of diverse character types.
 macro_rules! char_array {
@@ -114,7 +116,7 @@ fn compute_mp_size(num_cpus: u8) -> usize {
 /// Performs setup of the MP table for the given `num_cpus`.
 pub fn setup_mptable(
     mem: &GuestMemoryMmap,
-    resource_allocator: &mut ResourceAllocator,
+    _resource_allocator: &mut ResourceAllocator,
     num_cpus: u8,
 ) -> Result<(), MptableError> {
     if num_cpus > MAX_SUPPORTED_CPUS {
@@ -122,11 +124,10 @@ pub fn setup_mptable(
     }
 
     let mp_size = compute_mp_size(num_cpus);
-    let mptable_addr =
-        resource_allocator.allocate_system_memory(mp_size as u64, 1, AllocPolicy::FirstMatch)?;
+    let mptable_addr = MPTABLE_START_GPA;
     debug!(
-        "mptable: Allocated {mp_size} bytes for MPTable {num_cpus} vCPUs at address {:#010x}",
-        mptable_addr
+        "mptable: Using fixed GPA {:#010x}, size {} bytes for MPTable {} vCPUs",
+        mptable_addr, mp_size, num_cpus
     );
 
     // Used to keep track of the next base pointer into the MP table.

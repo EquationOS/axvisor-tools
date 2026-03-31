@@ -114,7 +114,8 @@ pub fn configure_system_for_boot(
     )
     .map_err(ConfigurationError::LoadCommandline)?;
 
-    // Note that this puts the mptable at the last 1k of Linux's 640k base RAM
+    // Put the MP table in Linux's legacy scan range (top 1 KiB of base 640 KiB RAM).
+    // This ensures smp_found_config is set even without ACPI tables.
     // mptable::setup_mptable(
     //     vm.guest_memory(),
     //     &mut vm.resource_allocator(),

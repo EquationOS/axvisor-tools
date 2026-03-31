@@ -36,3 +36,8 @@ int hvc_shmget(__u64 key, __u64 size, __u64 shmflg, __u64 shm_base_ptr)
 {
 	return hvc_call(HShmGet, key, size, shmflg, shm_base_ptr, 0, 0);
 }
+
+int hvc_inject_microvm_irq(__u64 instance_id, __u64 msix_index)
+{
+	return hvc_call(HMicroVMInjectIrq, instance_id, msix_index, 0, 0, 0, 0);
+}
