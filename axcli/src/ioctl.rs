@@ -52,13 +52,13 @@ fn open_eqmanager_dev() -> Result<libc::c_int, String> {
     Ok(fd)
 }
 
-pub fn ioctl_create_instance() -> Result<usize, String> {
+pub fn ioctl_create_instance(mode: u64) -> Result<usize, String> {
     let fd = open_eqmanager_dev()?;
 
     let mut arg = eq_create_instance_arg_t {
         instance_id: 0xdeadbeef, // 0 means the kernel will assign an ID
         instance_type: 1,        // 1 for dynamic loading instance
-        mapping_type: 1,         // 1 for CoarseGrainedSegmentation2M
+        mode,
     };
 
     let ret = unsafe { libc::ioctl(fd, EQ_CREATE_INSTANCE as libc::c_ulong, &mut arg as *mut _) };

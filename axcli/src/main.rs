@@ -15,7 +15,7 @@ mod ioctl;
 /// A User-level executor to boot ELF.
 mod loader;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[macro_use]
 extern crate log;
@@ -65,9 +65,7 @@ enum InstanceSubCmd {
     /// list the info of the instance
     List,
     /// Init instance runtime environment.
-    Init,
-    /// Create a new instance.
-    Create(InstanceCreateArgs),
+    Init(InitArgs),
     /// Execute a instance by ELF file alone with its arguments.
     Execute(ExecuteArgs),
     Remove {
@@ -77,17 +75,11 @@ enum InstanceSubCmd {
     },
 }
 
-#[derive(Debug, Args)]
-struct InstanceCreateArgs {
-    /// Path to the binary file.
-    #[arg(short, long)]
-    pub file_path: String,
-    /// Instance type, 0 for LibOS, 1 for kernel.
-    #[arg(short, long, default_value_t = 0)]
-    pub instance_type: usize,
-    /// Use one2one mapping or coarse-grained mapping.
-    #[arg(short, long, default_value_t = false)]
-    pub one2onemapping: bool,
+#[derive(Parser, Debug)]
+struct InitArgs {
+    /// Select the guest mapping profile used when initializing shim.
+    #[arg(long, value_enum, default_value_t = CliEptFaultMode::VmExit)]
+    mode: CliEptFaultMode,
 }
 
 #[derive(Parser, Debug)]
@@ -95,6 +87,13 @@ struct InstanceCreateArgs {
 struct ExecuteArgs {
     #[arg(required = true)]
     exec_args: Vec<String>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+#[repr(u64)]
+enum CliEptFaultMode {
+    VmExit = 0,
+    VirtualizationException = 1,
 }
 
 use libc::{c_void, sigaction, siginfo_t, SA_SIGINFO, SIGBUS};
@@ -159,8 +158,7 @@ fn main() {
         },
         CLISubCmd::Instance { subcmd } => match subcmd {
             InstanceSubCmd::List => todo!(),
-            InstanceSubCmd::Init => instance::init_shim(),
-            InstanceSubCmd::Create(args) => instance::create_instance(args),
+            InstanceSubCmd::Init(args) => instance::init_shim(args.mode as u64),
             InstanceSubCmd::Execute(args) => instance::execute(args),
             InstanceSubCmd::Remove { instance_id } => instance::remove_instance(instance_id as _),
         },

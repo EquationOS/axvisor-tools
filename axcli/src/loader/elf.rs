@@ -12,7 +12,12 @@ use equation_defs::{USER_LDSO_BASE_VA, USER_PIE_BASE_VA, USER_STACK_SIZE, USER_S
 // const PIE_BASE: usize = 0x40000000;
 // const LDSO_BASE: usize = 0x7f0000000000;
 
-unsafe fn mmap_segment(base: usize, ph: &goblin::elf::ProgramHeader, elf_data: &[u8], fd: i32) {
+unsafe fn mmap_segment(
+    base: usize,
+    ph: &goblin::elf::ProgramHeader,
+    elf_data: &[u8],
+    eqdev_fd: Option<i32>,
+) {
     let vaddr = base + ph.p_vaddr as usize;
     let memsz = ph.p_memsz as usize;
     let filesz = ph.p_filesz as usize;
@@ -27,9 +32,11 @@ unsafe fn mmap_segment(base: usize, ph: &goblin::elf::ProgramHeader, elf_data: &
     let end_addr = (vaddr + memsz + 0xfff) & !0xfff;
     let size = end_addr - aligned_addr;
 
+    let target_fd = eqdev_fd.unwrap_or(-1);
+
     debug!(
         "[*] Mapping fd {} segment: vaddr={:#x}, prot={:#x}, offset={:#x}, memsz={:#x}, filesz={:#x}",
-        fd, vaddr, prot, offset, memsz, filesz
+        target_fd, vaddr, prot, offset, memsz, filesz
     );
     debug!(
         "[*] Mapping segment: vaddr={:#x}, size={:#x}, offset={:#x}",
@@ -41,7 +48,7 @@ unsafe fn mmap_segment(base: usize, ph: &goblin::elf::ProgramHeader, elf_data: &
         size,
         (prot | PROT_WRITE) as c_int,
         (MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED) as c_int,
-        -1,
+        target_fd,
         0,
     );
     assert_ne!(ret, MAP_FAILED);
@@ -92,7 +99,11 @@ unsafe fn mprotect_segment(base: usize, ph: &goblin::elf::ProgramHeader) {
     assert_eq!(mprotect_ret, 0, "Failed to set memory protection");
 }
 
-unsafe fn mmap_elf(path: &str, base: usize) -> (Elf<'static>, usize, Option<String>) {
+unsafe fn mmap_elf(
+    path: &str,
+    base: usize,
+    eqdev_fd: Option<i32>,
+) -> (Elf<'static>, usize, Option<String>) {
     info!("[*] Loading ELF: {:?}", path);
 
     let mut path_string: String = path.into();
@@ -150,7 +161,7 @@ unsafe fn mmap_elf(path: &str, base: usize) -> (Elf<'static>, usize, Option<Stri
         .iter()
         .filter(|ph| ph.p_type == goblin::elf::program_header::PT_LOAD)
     {
-        unsafe { mmap_segment(base, ph, elf_data, fd) };
+        unsafe { mmap_segment(base, ph, elf_data, eqdev_fd) };
     }
 
     if let Some(interp_ph) = elf
@@ -296,7 +307,11 @@ unsafe fn setup_stack_with_args(
 /// ## Returns
 /// - A tuple containing the entry point address and the stack pointer address.
 ///
-pub unsafe fn load_app(args: &Vec<String>, envs: &Vec<String>) -> (usize, usize) {
+pub unsafe fn load_app(
+    args: &Vec<String>,
+    envs: &Vec<String>,
+    eqdev_fd: Option<i32>,
+) -> (usize, usize) {
     if args.is_empty() {
         panic!("No application path provided");
     }
@@ -307,10 +322,12 @@ pub unsafe fn load_app(args: &Vec<String>, envs: &Vec<String>) -> (usize, usize)
 
     let app_path = args[0].clone();
 
-    let (app_elf, app_base, interp_path) = unsafe { mmap_elf(app_path.as_str(), USER_PIE_BASE_VA) };
+    let (app_elf, app_base, interp_path) =
+        unsafe { mmap_elf(app_path.as_str(), USER_PIE_BASE_VA, eqdev_fd) };
 
     let (entry, stack) = if let Some(interp_path) = interp_path {
-        let (ldso_elf, ldso_base, path) = unsafe { mmap_elf(&interp_path, USER_LDSO_BASE_VA) };
+        let (ldso_elf, ldso_base, path) =
+            unsafe { mmap_elf(&interp_path, USER_LDSO_BASE_VA, eqdev_fd) };
         if let Some(path) = path {
             panic!(
                 "[*] Found interpreter: {:?} for interp {:?}",
@@ -352,7 +369,7 @@ pub unsafe fn load_app(args: &Vec<String>, envs: &Vec<String>) -> (usize, usize)
 pub(super) fn local_execute_app(app_args: &Vec<String>) {
     let envp = vec![];
 
-    let (entry, stack) = unsafe { load_app(app_args, &envp) };
+    let (entry, stack) = unsafe { load_app(app_args, &envp, None) };
 
     jumping(entry, stack)
 }

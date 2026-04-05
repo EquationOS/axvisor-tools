@@ -18,8 +18,7 @@ typedef struct eq_create_instance_arg
 {
 	uint64_t instance_id;	// Instance ID, set by kernel driver.
 	uint64_t instance_type; // Instance type
-	uint64_t mapping_type;	// Mapping type, e.g., course-grained mapping or
-							// one-to-one mapping
+	uint64_t mode;	// EPT fault handling mode, e.g., VMEXIT, VE
 } eq_create_instance_arg_t;
 
 typedef struct eq_remove_instance_arg

@@ -132,6 +132,12 @@ static int instance_mmap(struct file *file, struct vm_area_struct *vma)
 
 	mmap_size = vma->vm_end - vma->vm_start;
 
+	INFO(
+		"[%s] Instance [%d] remap_pfn_range: va[0x%lx-0x%lx], size 0x%lx, "
+		"pgoff 0x%lx\n",
+		__func__, instance_id, vma->vm_start, vma->vm_end, mmap_size,
+		vma->vm_pgoff);
+
 	// Check if the offset is the SCF magic number.
 	// If so, we will map the SCF queue region.
 	// This is a special case for SCF queue regions.
@@ -188,12 +194,32 @@ static int instance_mmap(struct file *file, struct vm_area_struct *vma)
 				instance_vdev->metadata.page_cache_pool_size,
 			instance_vdev->metadata.page_cache_pool_size);
 	}
+	else
+	{
+		// Normal mmap for ELF loading.
+		if (mmap_size > instance_vdev->metadata.init_memory_region_size_mib
+							<< 20)
+		{
+			ERROR(
+				"Initial memory region size 0x%llx is smaller than requested "
+				"mmap size 0x%lx\n",
+				instance_vdev->metadata.init_memory_region_size_mib << 20,
+				mmap_size);
+			return -EINVAL;
+		}
+
+		// Sync the mmap to hypervisor.
+		hvc_mmap_sync(
+			(__u64)vma->vm_start, mmap_size, 0,
+			(__u64)pgprot_val(vma->vm_page_prot), instance_vdev->id);
+
+		pfn_start =
+			instance_vdev->metadata.memory_region_base_gpa >> PAGE_SHIFT;
+	}
 
 	INFO(
-		"[%s] Instance [%d] remap_pfn_range: va[0x%lx-0x%lx], pgoff 0x%lx\n",
-		__func__, instance_id, vma->vm_start, vma->vm_end, vma->vm_pgoff);
-	INFO(
-		"[%s] Instance [%d] remap_pfn_range: pfn_start 0x%lx,mmap_size 0x%lx\n",
+		"[%s] Instance [%d] remap_pfn_range: pfn_start 0x%lx, mmap_size "
+		"0x%lx\n",
 		__func__, instance_id, pfn_start, mmap_size);
 
 	ret = remap_pfn_range(
@@ -240,14 +266,13 @@ int create_instance(eq_create_instance_arg_t *arg)
 
 	// Create a new instance through the hypervisor call.
 	instance_id = hvc_create_instance(
-		arg->instance_type, arg->mapping_type, instance_metadata_ptr_gpa);
+		arg->instance_type, arg->mode, instance_metadata_ptr_gpa);
 
 	INFO(
-		"Creating instance with type %llu, mapping type %llu\n"
+		"Creating instance with type %llu, mode %llu\n"
 		"scf queue base @ 0x%llx, size 0x%llx\n"
 		"page cache base @ 0x%llx, size 0x%llx\n",
-		arg->instance_type, arg->mapping_type,
-		instance_metadata->scf_region_base_gpa,
+		arg->instance_type, arg->mode, instance_metadata->scf_region_base_gpa,
 		instance_metadata->scf_region_size,
 		instance_metadata->page_cache_pool_base_gpa,
 		instance_metadata->page_cache_pool_size);
