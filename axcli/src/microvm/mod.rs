@@ -5,6 +5,7 @@
 mod acpi;
 pub mod arch;
 mod cli;
+pub(crate) mod console;
 mod config;
 mod initrd;
 #[allow(unused)]
@@ -83,7 +84,7 @@ If devices are still not visible in guest, complete BAR/interrupt mapping is lik
         .allocate_guest_memory()
         .expect("Failed to allocate guest memory");
 
-    let keep_foreground = vm_resources.vfio.is_some();
+    let keep_foreground = vm_resources.vfio.is_some() || vm_resources.microvm_console_ring_gpa != 0;
     // Build persistent VFIO DMA mappings in current process before guest boot.
     // In daemon mode this process itself keeps VFIO fds/mappings alive.
     setup_vfio_dma_holder(&vm_resources, &guest_memory)?;
@@ -93,6 +94,12 @@ If devices are still not visible in guest, complete BAR/interrupt mapping is lik
     let mut boot_cmdline = boot_config.cmdline.clone();
 
     let mut vm = Vm::new(vm_resources.fd).expect("Failed to create VM instance");
+    console::attach_console(
+        vm_resources.fd,
+        vm_resources.vm_id,
+        vm_resources.microvm_console_ring_gpa,
+    )
+    .map_err(|e| ax_err_type!(BadState, format_args!("console attach error {}", e)))?;
 
     vm.register_dram_memory_regions(guest_memory)?;
 
@@ -121,7 +128,11 @@ If devices are still not visible in guest, complete BAR/interrupt mapping is lik
     );
 
     if keep_foreground {
-        run_foreground_daemon_loop();
+        if vm_resources.vfio.is_some() {
+            run_foreground_daemon_loop();
+        } else {
+            console::poll_console_forever();
+        }
     }
 
     Ok(())

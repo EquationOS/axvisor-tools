@@ -1,9 +1,15 @@
 use std::ffi::CStr;
 
-use libc::c_char;
 use crate::microvm::{IovaMode, PciBdf, VfioResourceConfig};
+use libc::c_char;
 
 pub const EQINSTANCE_DEV_PREFIX: &str = "/dev/eqinstance_";
+
+#[derive(Debug, Clone, Copy)]
+pub struct MicroVmCreateResult {
+    pub instance_id: usize,
+    pub console_ring_gpa: usize,
+}
 
 include!(concat!(env!("OUT_DIR"), "/eqioctl.rs"));
 
@@ -63,7 +69,7 @@ pub fn ioctl_create_microvm(
     max_mem_size_mib: usize,
     passthrough_devices: &[PciBdf],
     vfio: Option<VfioResourceConfig>,
-) -> Result<usize, String> {
+) -> Result<MicroVmCreateResult, String> {
     let fd = open_eqmanager_dev()?;
 
     let mut arg = eq_create_instance_arg_t {
@@ -85,6 +91,7 @@ pub fn ioctl_create_microvm(
         vfio_bar_flags: [0; 6],
         vfio_pci_cfg_space_len: 0,
         vfio_pci_cfg_space: [0; 256],
+        microvm_console_ring_gpa: 0,
     };
 
     if passthrough_devices.len() > arg.passthrough_bdf.len() {
@@ -133,7 +140,10 @@ pub fn ioctl_create_microvm(
 
     info!("Instance created successfully, ID: {}", arg.instance_id);
 
-    Ok(arg.instance_id as usize)
+    Ok(MicroVmCreateResult {
+        instance_id: arg.instance_id as usize,
+        console_ring_gpa: arg.microvm_console_ring_gpa as usize,
+    })
 }
 
 pub fn ioctl_create_libos() -> Result<usize, String> {
@@ -158,6 +168,7 @@ pub fn ioctl_create_libos() -> Result<usize, String> {
         vfio_bar_flags: [0; 6],
         vfio_pci_cfg_space_len: 0,
         vfio_pci_cfg_space: [0; 256],
+        microvm_console_ring_gpa: 0,
     };
 
     let ret = unsafe { libc::ioctl(fd, EQ_CREATE_INSTANCE as libc::c_ulong, &mut arg as *mut _) };

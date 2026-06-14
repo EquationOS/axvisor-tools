@@ -29,6 +29,8 @@ pub struct VmResources {
     pub passthrough_devices: Vec<PciBdf>,
     /// Optional VFIO settings tied to passthrough devices.
     pub vfio: Option<VfioResourceConfig>,
+    /// GPA of the microVM PV console ring page.
+    pub microvm_console_ring_gpa: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -374,7 +376,7 @@ impl VmResources {
         };
 
         // First, create the instance through ioctl, eqdriver will trigger the hvc to create the instance.
-        let microvm_id = ioctl::ioctl_create_microvm(
+        let create_result = ioctl::ioctl_create_microvm(
             machine_config.vcpu_count,
             machine_config.max_vcpu_count(),
             machine_config.init_mem_size_mib,
@@ -383,6 +385,7 @@ impl VmResources {
             vfio,
         )
         .expect("Failed to create instance for dynamic loading");
+        let microvm_id = create_result.instance_id;
 
         if let Some(vfio_cfg) = &vfio {
             info!(
@@ -449,6 +452,7 @@ impl VmResources {
             fd: instance_fd,
             passthrough_devices,
             vfio,
+            microvm_console_ring_gpa: create_result.console_ring_gpa,
             ..Default::default()
         };
 

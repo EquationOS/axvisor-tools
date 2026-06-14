@@ -11,7 +11,7 @@
 #define EQ_MAX_VFIO_BARS (6)
 #define EQ_MAX_PCI_CFG_SPACE_BYTES (256)
 
-/// See `EqInstanceMetadata` in `equation_defs/src/configs.rs`
+/// See `EqInstanceMetadata` in `axvisor/src/defs.rs`.
 typedef struct eq_instance_metadata
 {    
     /* For LibOS instance */
@@ -54,6 +54,8 @@ typedef struct eq_instance_metadata
     /// Snapshot of host PCI config space bytes used for guest probe emulation.
     uint64_t vfio_pci_cfg_space_len;
     uint8_t vfio_pci_cfg_space[EQ_MAX_PCI_CFG_SPACE_BYTES];
+    /// Host-visible GPA of the microVM PV console ring page.
+    uint64_t microvm_console_ring_gpa;
 } eq_instance_metadata_t;
 
 int create_instance(eq_create_instance_arg_t *arg);

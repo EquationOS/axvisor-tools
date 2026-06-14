@@ -38,6 +38,9 @@ typedef struct eq_instance_vdev
 	/// - 2: microVM instance.
 	int instance_type;
 
+	/// @brief Backing page for the microVM PV console ring.
+	void *microvm_console_ring_virt;
+
 	eq_instance_metadata_t metadata;
 } eq_instance_vdev_t;
 
@@ -266,39 +269,69 @@ static int instance_mmap(struct file *file, struct vm_area_struct *vma)
 	}
 	else if (instance_vdev->instance_type == 2)
 	{
-		mem_size =
-			instance_vdev->metadata.init_memory_region_size_mib * 1024 * 1024;
-		// For microVM instances, we only have one memory region to map.
-		if (mmap_size > mem_size)
+		if (vma->vm_pgoff == MMAP_MICROVM_CONSOLE_MAGIC_NUMBER)
 		{
-			ERROR(
-				"MicroVM memory region size 0x%llx is smaller than requested "
-				"mmap "
-				"size "
-				"0x%lx\n",
-				mem_size, mmap_size);
-			return -EINVAL;
+			if (!instance_vdev->microvm_console_ring_virt)
+			{
+				ERROR(
+					"MicroVM console ring is not allocated for instance %s\n",
+					instance_vdev->name);
+				return -EINVAL;
+			}
+			if (mmap_size > PAGE_SIZE)
+			{
+				ERROR(
+					"MicroVM console ring mmap size 0x%lx exceeds one page for instance %s\n",
+					mmap_size, instance_vdev->name);
+				return -EINVAL;
+			}
+			pfn_start =
+				virt_to_phys(instance_vdev->microvm_console_ring_virt) >>
+				PAGE_SHIFT;
+			INFO(
+				"[%s] Instance [%d] MicroVM console ring in instance %s, "
+				"va[0x%lx-0x%lx] size 0x%lx map to gpa: 0x%llx\n",
+				__func__, instance_id, instance_vdev->name, vma->vm_start,
+				vma->vm_end, mmap_size,
+				(unsigned long long)virt_to_phys(
+					instance_vdev->microvm_console_ring_virt));
 		}
-		pfn_start =
-			(instance_vdev->metadata.memory_region_base_gpa >> PAGE_SHIFT) +
-			vma->vm_pgoff;
-		INFO(
-			"[%s] Instance [%d] MicroVM memory region in instance %s, "
-			"va[0x%lx-0x%lx] size 0x%lx\n",
-			__func__, instance_id, instance_vdev->name, vma->vm_start,
-			vma->vm_end, vma->vm_end - vma->vm_start);
-		INFO(
-			"[%s] Instance [%d] MicroVM memory region in instance %s, "
-			"map to gpa: [0x%llx~0x%llx] size: 0x%lx, total [0x%llx~0x%llx] "
-			"size: 0x%llx\n",
-			__func__, instance_id, instance_vdev->name,
-			instance_vdev->metadata.memory_region_base_gpa +
-				(vma->vm_pgoff << PAGE_SHIFT),
-			instance_vdev->metadata.memory_region_base_gpa +
-				(vma->vm_pgoff << PAGE_SHIFT) + mmap_size,
-			mmap_size, instance_vdev->metadata.memory_region_base_gpa,
-			instance_vdev->metadata.memory_region_base_gpa + mem_size,
-			mem_size);
+		else
+		{
+			mem_size =
+				instance_vdev->metadata.init_memory_region_size_mib * 1024 * 1024;
+			// For microVM instances, we only have one memory region to map.
+			if (mmap_size > mem_size)
+			{
+				ERROR(
+					"MicroVM memory region size 0x%llx is smaller than requested "
+					"mmap "
+					"size "
+					"0x%lx\n",
+					(unsigned long long)mem_size, mmap_size);
+				return -EINVAL;
+			}
+			pfn_start =
+				(instance_vdev->metadata.memory_region_base_gpa >> PAGE_SHIFT) +
+				vma->vm_pgoff;
+			INFO(
+				"[%s] Instance [%d] MicroVM memory region in instance %s, "
+				"va[0x%lx-0x%lx] size 0x%lx\n",
+				__func__, instance_id, instance_vdev->name, vma->vm_start,
+				vma->vm_end, vma->vm_end - vma->vm_start);
+			INFO(
+				"[%s] Instance [%d] MicroVM memory region in instance %s, "
+				"map to gpa: [0x%llx~0x%llx] size: 0x%lx, total [0x%llx~0x%llx] "
+				"size: 0x%llx\n",
+				__func__, instance_id, instance_vdev->name,
+				instance_vdev->metadata.memory_region_base_gpa +
+					(vma->vm_pgoff << PAGE_SHIFT),
+				instance_vdev->metadata.memory_region_base_gpa +
+					(vma->vm_pgoff << PAGE_SHIFT) + mmap_size,
+				mmap_size, instance_vdev->metadata.memory_region_base_gpa,
+				instance_vdev->metadata.memory_region_base_gpa + mem_size,
+				(unsigned long long)mem_size);
+		}
 	}
 	else
 	{
@@ -341,10 +374,11 @@ int create_instance(eq_create_instance_arg_t *arg)
 {
 	int instance_id;
 	int ret = 0;
-	eq_instance_vdev_t *instance_vdev;
+	eq_instance_vdev_t *instance_vdev = NULL;
 
 	eq_instance_metadata_t *instance_metadata;
 	phys_addr_t instance_metadata_ptr_gpa;
+	void *microvm_console_ring_virt = NULL;
 
 	// pid_t pid = task_pid_nr(current);
 	// const char *comm = current->comm;
@@ -394,6 +428,16 @@ int create_instance(eq_create_instance_arg_t *arg)
 			instance_metadata->vfio_pci_cfg_space,
 			arg->vfio_pci_cfg_space,
 			EQ_MAX_PCI_CFG_SPACE_BYTES);
+		microvm_console_ring_virt = (void *)__get_free_page(
+			GFP_KERNEL | __GFP_ZERO);
+		if (!microvm_console_ring_virt)
+		{
+			ERROR("Failed to allocate MicroVM console ring page\n");
+			ret = -ENOMEM;
+			goto err_free;
+		}
+		instance_metadata->microvm_console_ring_gpa =
+			virt_to_phys(microvm_console_ring_virt);
 	}
 
 	instance_metadata_ptr_gpa = virt_to_phys(instance_metadata);
@@ -479,10 +523,14 @@ int create_instance(eq_create_instance_arg_t *arg)
 	instance_vdev->instance_type = arg->instance_type;
 	instance_vdev->active = true;
 	instance_vdev->status = STATUS_CREATED;
+	instance_vdev->microvm_console_ring_virt = microvm_console_ring_virt;
+	microvm_console_ring_virt = NULL;
 
 	memcpy(
 		&instance_vdev->metadata, instance_metadata,
 		sizeof(eq_instance_metadata_t));
+	arg->microvm_console_ring_gpa =
+		instance_vdev->metadata.microvm_console_ring_gpa;
 
 	snprintf(
 		instance_vdev->name, sizeof(instance_vdev->name), "%s%d",
@@ -511,6 +559,16 @@ int create_instance(eq_create_instance_arg_t *arg)
 	instance_vdev->status = STATUS_SETTING_UP;
 
 err_free:
+	if (microvm_console_ring_virt)
+	{
+		free_page((unsigned long)microvm_console_ring_virt);
+		microvm_console_ring_virt = NULL;
+	}
+	if (ret < 0 && instance_vdev && instance_vdev->microvm_console_ring_virt)
+	{
+		free_page((unsigned long)instance_vdev->microvm_console_ring_virt);
+		instance_vdev->microvm_console_ring_virt = NULL;
+	}
 	kfree(instance_metadata);
 
 	return ret;
@@ -562,6 +620,11 @@ int unregister_instance_dev(eq_instance_vdev_t *vdev)
 	}
 
 	misc_deregister(&vdev->misc);
+	if (vdev->microvm_console_ring_virt)
+	{
+		free_page((unsigned long)vdev->microvm_console_ring_virt);
+		vdev->microvm_console_ring_virt = NULL;
+	}
 	vdev->active = false;
 	INFO(
 		"Successfully unregistered instance %s with ID %d\n", vdev->name,

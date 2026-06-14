@@ -837,6 +837,7 @@ pub fn run_foreground_daemon_loop() -> ! {
     let mut last_bar0_trace = Instant::now() - Duration::from_secs(1);
     let mut last_cmdq_trace = Instant::now() - Duration::from_secs(1);
     loop {
+        crate::microvm::console::poll_console_once();
         if let Some(state) = VFIO_RUNTIME_STATE.get() {
             drain_msix_event_and_forward(state);
             if last_bar0_trace.elapsed() >= Duration::from_millis(100) {
