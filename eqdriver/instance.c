@@ -158,9 +158,11 @@ static long instance_dev_ioctl(
 				instance_vdev->id, irq_arg.msix_index, ret);
 			return ret;
 		}
+		/*
 		INFO(
 			"Injected MicroVM IRQ via HVC: instance=%d msix_index=%u\n",
 			instance_vdev->id, irq_arg.msix_index);
+		*/
 		return 0;
 	}
 	default:

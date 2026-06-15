@@ -538,6 +538,7 @@ fn vfio_keep_device_ready(state: &VfioRuntimeState) -> AxResult<()> {
         let new_pmcsr = old_pmcsr & !0x3;
         if new_pmcsr != old_pmcsr {
             write_cfg_u16(state.device_fd, cfg_base, pmcsr_off, new_pmcsr)?;
+            /*
             info!(
                 "VFIO PMCSR keepalive: cap={:#x} off={:#x} old={:#06x} new={:#06x} (force D0)",
                 pm_cap,
@@ -545,6 +546,7 @@ fn vfio_keep_device_ready(state: &VfioRuntimeState) -> AxResult<()> {
                 old_pmcsr,
                 new_pmcsr
             );
+            */
         }
     }
 
@@ -556,23 +558,27 @@ fn vfio_keep_device_ready(state: &VfioRuntimeState) -> AxResult<()> {
         let new_msix = (old_msix | PCI_MSIX_FLAGS_ENABLE) & !PCI_MSIX_FLAGS_MASKALL;
         if new_msix != old_msix {
             write_cfg_u16(state.device_fd, cfg_base, msix_ctrl_off, new_msix)?;
+            /*
             info!(
                 "VFIO MSI-X keepalive: off={:#x} old={:#06x} new={:#06x} (enable, clear function-mask)",
                 cfg_base + msix_ctrl_off,
                 old_msix,
                 new_msix
             );
+            */
         }
     } else if VFIO_MSIX_CTRL_LOGGED.set(()).is_ok() {
         warn!("VFIO MSI-X keepalive: MSI-X capability offset is unavailable");
     }
 
+    /*
     info!(
         "VFIO command keepalive: off={:#x} old={:#06x} new={:#06x} (MEM|BUSMASTER)",
         cfg_base + PCI_COMMAND_REG_OFFSET,
         old_cmd,
         new_cmd
     );
+    */
     Ok(())
 }
 
@@ -698,11 +704,13 @@ fn drain_msix_event_and_forward(state: &VfioRuntimeState) {
                     break;
                 }
             }
+            /*
             info!(
                 "VFIO MSI-X forwarded to EqVisor: instance={} msix_index={} event_cnt={} injected={}",
                 state.instance_id, msix_index, cnt, inject_times
             );
-        }        
+            */
+        }
     }
 }
 
