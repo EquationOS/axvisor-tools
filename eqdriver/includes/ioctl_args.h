@@ -56,6 +56,26 @@ typedef struct eq_instance_irq_inject_arg
 	uint32_t reserved;    // Reserved for alignment/future flags
 } eq_instance_irq_inject_arg_t;
 
+typedef struct eq_instance_irq_route_arg
+{
+	uint64_t instance_id; // Target instance ID, 0 means current instance fd owner
+	int32_t eventfd;      // VFIO MSI-X eventfd token fd from axcli
+	uint32_t msix_index;  // MSI-X entry index in the guest-visible table
+	uint32_t flags;       // In/out flags. bit0: posted interrupt active
+	uint32_t reserved;    // Reserved for alignment
+} eq_instance_irq_route_arg_t;
+
+typedef struct eq_microvm_irq_route_query
+{
+	uint64_t instance_id;
+	uint32_t msix_index;
+	uint32_t flags;
+	uint32_t target_vcpu;
+	uint32_t guest_vector;
+	uint64_t pi_desc_hpa;
+	uint64_t reserved[4];
+} eq_microvm_irq_route_query_t;
+
 // int shmget(key_t key, size_t size, int shmflg);
 // returns the shared memory ID (shmid) on success, or -1 on failure.
 typedef struct eq_shmget_arg
@@ -81,5 +101,7 @@ typedef struct eq_shmctl_arg
 #define EQ_CREATE_INSTANCE _IOW(0, 0, eq_create_instance_arg_t)
 #define EQ_REMOVE_INSTANCE _IOW(0, 1, eq_remove_instance_arg_t)
 #define EQ_INSTANCE_INJECT_IRQ _IOW(0, 2, eq_instance_irq_inject_arg_t)
+#define EQ_INSTANCE_REGISTER_IRQ_ROUTE _IOW(0, 3, eq_instance_irq_route_arg_t)
+#define EQ_INSTANCE_REFRESH_IRQ_ROUTE _IOW(0, 4, eq_instance_irq_route_arg_t)
 #define EQ_SHMGET _IOW(1, 2, eq_shmget_arg_t)
 #define EQ_SHMCTL _IOW(1, 3, eq_shmctl_arg_t)

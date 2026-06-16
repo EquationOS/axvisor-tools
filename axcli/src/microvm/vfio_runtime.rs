@@ -1,14 +1,16 @@
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use axerrno::{AxResult, ax_err_type};
 
-use crate::microvm::resource::VmResources;
-use crate::microvm::vstate::memory::{Address, GuestMemoryRegion, GuestRegionMmap, MemoryRegionAddress};
 use crate::ioctl;
+use crate::microvm::resource::VmResources;
+use crate::microvm::vstate::memory::{
+    Address, GuestMemoryRegion, GuestRegionMmap, MemoryRegionAddress,
+};
 
 const VFIO_TYPE: u32 = b';' as u32;
 const IOC_NRBITS: u32 = 8;
@@ -51,6 +53,7 @@ const VFIO_PCI_MSIX_IRQ_INDEX: u32 = 2;
 const VFIO_IRQ_SET_DATA_EVENTFD: u32 = 1 << 2;
 const VFIO_IRQ_SET_ACTION_TRIGGER: u32 = 1 << 5;
 const MAX_MSIX_EVENT_FDS: usize = 64;
+const PCI_MSIX_TABLE_ENTRY_SIZE: u64 = 16;
 const MLX5_INIT_SEG_CMDQ_ADDR_H_OFF: u64 = 0x10;
 const MLX5_INIT_SEG_CMDQ_ADDR_L_SZ_OFF: u64 = 0x14;
 const MLX5_INIT_SEG_CMD_DBELL_OFF: u64 = 0x18;
@@ -108,6 +111,9 @@ struct VfioRuntimeState {
     msix_event_count: usize,
     msix_event_fds: [i32; MAX_MSIX_EVENT_FDS],
     msix_ctrl_off: Option<u64>,
+    msix_table_bir: Option<u32>,
+    msix_table_offset: u64,
+    msix_table_size: usize,
     cfg_region_offset: u64,
     cfg_region_size: u64,
     bar0_region_offset: u64,
@@ -121,6 +127,10 @@ static VFIO_RUNTIME_STATE: OnceLock<VfioRuntimeState> = OnceLock::new();
 static VFIO_MSIX_CTRL_LOGGED: OnceLock<()> = OnceLock::new();
 static VFIO_MLX5_BAR0_LAST: Mutex<Option<(u32, u32, u32)>> = Mutex::new(None);
 static VFIO_CMDQ_LAST_SIG: Mutex<Option<(u64, u32)>> = Mutex::new(None);
+static VFIO_MSIX_VECTOR_SHADOW: RwLock<[Option<u8>; MAX_MSIX_EVENT_FDS]> =
+    RwLock::new([None; MAX_MSIX_EVENT_FDS]);
+static VFIO_MSIX_POSTED_ROUTE_ACTIVE: RwLock<[bool; MAX_MSIX_EVENT_FDS]> =
+    RwLock::new([false; MAX_MSIX_EVENT_FDS]);
 static VFIO_CMDQ_TRACE_WARNED: AtomicBool = AtomicBool::new(false);
 
 const fn ioc(dir: u32, ty: u32, nr: u32, size: usize) -> u64 {
@@ -143,7 +153,11 @@ fn ioctl_ret(fd: i32, req: u64, arg: usize, what: &str) -> AxResult<i32> {
     if ret < 0 {
         return Err(ax_err_type!(
             InvalidInput,
-            format_args!("VFIO ioctl {} failed: {}", what, std::io::Error::last_os_error())
+            format_args!(
+                "VFIO ioctl {} failed: {}",
+                what,
+                std::io::Error::last_os_error()
+            )
         ));
     }
     Ok(ret as i32)
@@ -151,22 +165,29 @@ fn ioctl_ret(fd: i32, req: u64, arg: usize, what: &str) -> AxResult<i32> {
 
 fn open_rdwr(path: &str) -> AxResult<i32> {
     let cpath = CString::new(path).map_err(|_| {
-        ax_err_type!(InvalidInput, format_args!("Invalid path for CString: {}", path))
+        ax_err_type!(
+            InvalidInput,
+            format_args!("Invalid path for CString: {}", path)
+        )
     })?;
     let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
     if fd < 0 {
         return Err(ax_err_type!(
             InvalidInput,
-            format_args!("Failed to open {}: {}", path, std::io::Error::last_os_error())
+            format_args!(
+                "Failed to open {}: {}",
+                path,
+                std::io::Error::last_os_error()
+            )
         ));
     }
     Ok(fd)
 }
 
 fn setup_vfio_fds(resources: &VmResources) -> AxResult<(i32, i32, i32)> {
-    let vfio = resources.vfio.ok_or_else(|| {
-        ax_err_type!(InvalidInput, "VFIO runtime requested without vfio config")
-    })?;
+    let vfio = resources
+        .vfio
+        .ok_or_else(|| ax_err_type!(InvalidInput, "VFIO runtime requested without vfio config"))?;
     let host_bdf = resources
         .passthrough_devices
         .first()
@@ -235,7 +256,10 @@ fn setup_vfio_fds(resources: &VmResources) -> AxResult<(i32, i32, i32)> {
     )?;
 
     let bdf_c = CString::new(bdf_str.as_str()).map_err(|_| {
-        ax_err_type!(InvalidInput, format_args!("Invalid BDF CString: {}", bdf_str))
+        ax_err_type!(
+            InvalidInput,
+            format_args!("Invalid BDF CString: {}", bdf_str)
+        )
     })?;
     let device_fd = ioctl_ret(
         group_fd,
@@ -296,8 +320,14 @@ fn map_guest_ram_dma(container_fd: i32, guest_memory: &[GuestRegionMmap]) -> AxR
 fn read_cfg_u16(device_fd: i32, cfg_base: u64, reg_off: u64) -> AxResult<u16> {
     let mut bytes = [0u8; 2];
     let off = cfg_base + reg_off;
-    let read_ret =
-        unsafe { libc::pread(device_fd, bytes.as_mut_ptr() as *mut libc::c_void, 2, off as libc::off_t) };
+    let read_ret = unsafe {
+        libc::pread(
+            device_fd,
+            bytes.as_mut_ptr() as *mut libc::c_void,
+            2,
+            off as libc::off_t,
+        )
+    };
     if read_ret != 2 {
         return Err(ax_err_type!(
             InvalidInput,
@@ -314,8 +344,14 @@ fn read_cfg_u16(device_fd: i32, cfg_base: u64, reg_off: u64) -> AxResult<u16> {
 fn read_cfg_u8(device_fd: i32, cfg_base: u64, reg_off: u64) -> AxResult<u8> {
     let mut byte = [0u8; 1];
     let off = cfg_base + reg_off;
-    let read_ret =
-        unsafe { libc::pread(device_fd, byte.as_mut_ptr() as *mut libc::c_void, 1, off as libc::off_t) };
+    let read_ret = unsafe {
+        libc::pread(
+            device_fd,
+            byte.as_mut_ptr() as *mut libc::c_void,
+            1,
+            off as libc::off_t,
+        )
+    };
     if read_ret != 1 {
         return Err(ax_err_type!(
             InvalidInput,
@@ -332,8 +368,14 @@ fn read_cfg_u8(device_fd: i32, cfg_base: u64, reg_off: u64) -> AxResult<u8> {
 fn write_cfg_u16(device_fd: i32, cfg_base: u64, reg_off: u64, val: u16) -> AxResult<()> {
     let bytes = val.to_le_bytes();
     let off = cfg_base + reg_off;
-    let write_ret =
-        unsafe { libc::pwrite(device_fd, bytes.as_ptr() as *const libc::c_void, 2, off as libc::off_t) };
+    let write_ret = unsafe {
+        libc::pwrite(
+            device_fd,
+            bytes.as_ptr() as *const libc::c_void,
+            2,
+            off as libc::off_t,
+        )
+    };
     if write_ret != 2 {
         return Err(ax_err_type!(
             InvalidInput,
@@ -395,6 +437,10 @@ fn read_region_u32_be(device_fd: i32, region_base: u64, reg_off: u64) -> AxResul
     Ok(u32::from_be_bytes(bytes))
 }
 
+fn read_region_u32_le(device_fd: i32, region_base: u64, reg_off: u64) -> AxResult<u32> {
+    read_region_u32(device_fd, region_base, reg_off)
+}
+
 fn trace_mlx5_initseg_bar0(state: &VfioRuntimeState, reason: &str, force: bool) -> AxResult<()> {
     if state.bar0_region_size < (MLX5_INIT_SEG_CMD_DBELL_OFF + 4) {
         return Ok(());
@@ -428,7 +474,10 @@ fn trace_mlx5_cmdq_activity(state: &VfioRuntimeState, reason: &str, force: bool)
     let cmdq_l_sz = read_region_u32_be(state.device_fd, bar0, MLX5_INIT_SEG_CMDQ_ADDR_L_SZ_OFF)?;
     let cmdq_pa = (cmdq_h << 32) | ((cmdq_l_sz as u64) & 0xffff_f000);
     if cmdq_pa < state.guest_ram_iova_base
-        || cmdq_pa >= state.guest_ram_iova_base.saturating_add(state.guest_ram_size)
+        || cmdq_pa
+            >= state
+                .guest_ram_iova_base
+                .saturating_add(state.guest_ram_size)
     {
         return Ok(());
     }
@@ -523,6 +572,115 @@ fn find_capability_in_snapshot(snapshot: &[u8], cfg_len: usize, cap_id: u8) -> O
     None
 }
 
+fn read_snapshot_u16(snapshot: &[u8], off: usize) -> Option<u16> {
+    if off + 2 > snapshot.len() {
+        return None;
+    }
+    Some(u16::from_le_bytes([snapshot[off], snapshot[off + 1]]))
+}
+
+fn read_snapshot_u32(snapshot: &[u8], off: usize) -> Option<u32> {
+    if off + 4 > snapshot.len() {
+        return None;
+    }
+    Some(u32::from_le_bytes([
+        snapshot[off],
+        snapshot[off + 1],
+        snapshot[off + 2],
+        snapshot[off + 3],
+    ]))
+}
+
+fn sample_msix_table_vectors(state: &VfioRuntimeState, _force: bool) -> AxResult<()> {
+    if state.msix_table_bir != Some(0) || state.msix_table_size == 0 {
+        return Ok(());
+    }
+    if state.bar0_region_size < state.msix_table_offset {
+        return Ok(());
+    }
+
+    let count = core::cmp::min(
+        state.msix_table_size,
+        core::cmp::min(state.msix_event_count, MAX_MSIX_EVENT_FDS),
+    );
+    let mut shadow = VFIO_MSIX_VECTOR_SHADOW.write().unwrap();
+    let mut changed = 0usize;
+    let mut unmasked_nonzero = 0usize;
+    for idx in 0..count {
+        let entry_off = state.msix_table_offset + (idx as u64) * PCI_MSIX_TABLE_ENTRY_SIZE;
+        if entry_off + PCI_MSIX_TABLE_ENTRY_SIZE > state.bar0_region_size {
+            break;
+        }
+        let msg_data =
+            read_region_u32_le(state.device_fd, state.bar0_region_offset, entry_off + 8)?;
+        let vector_ctrl =
+            read_region_u32_le(state.device_fd, state.bar0_region_offset, entry_off + 12)?;
+        let vector = (msg_data & 0xff) as u8;
+        let masked = (vector_ctrl & 0x1) != 0;
+        let new_vector = if !masked && vector != 0 {
+            Some(vector)
+        } else {
+            None
+        };
+        if shadow[idx] != new_vector {
+            info!(
+                "VFIO MSI-X vector shadow entry={} msg_data={:#x} vector_ctrl={:#x} vector={:?}",
+                idx, msg_data, vector_ctrl, new_vector
+            );
+            shadow[idx] = new_vector;
+            changed += 1;
+        }
+        if new_vector.is_some() {
+            unmasked_nonzero += 1;
+        }
+    }
+
+    if _force || changed > 0 {
+        info!(
+            "VFIO MSI-X table sample: entries={} changed={} unmasked_nonzero_vectors={}",
+            count, changed, unmasked_nonzero
+        );
+    }
+    Ok(())
+}
+
+fn refresh_posted_irq_routes(state: &VfioRuntimeState) {
+    if state.msix_event_count == 0 {
+        return;
+    }
+    let mut active = VFIO_MSIX_POSTED_ROUTE_ACTIVE.write().unwrap();
+    for msix_index in 0..state.msix_event_count {
+        if active[msix_index] {
+            continue;
+        }
+        match ioctl::ioctl_refresh_instance_irq_route(
+            state.instance_fd,
+            state.instance_id as u64,
+            msix_index as u32,
+        ) {
+            Ok(true) => {
+                active[msix_index] = true;
+                info!(
+                    "VFIO MSI-X route {} switched to posted-interrupt offload",
+                    msix_index
+                );
+            }
+            Ok(false) => {
+                trace!(
+                    "VFIO MSI-X route {} posted-interrupt not ready yet",
+                    msix_index
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "VFIO MSI-X route {} posted-interrupt refresh failed: {}",
+                    msix_index, e
+                );
+            }
+        }
+    }
+}
+
 fn vfio_keep_device_ready(state: &VfioRuntimeState) -> AxResult<()> {
     let cfg_base = state.cfg_region_offset;
     let old_cmd = read_cfg_u16(state.device_fd, cfg_base, PCI_COMMAND_REG_OFFSET)?;
@@ -582,7 +740,11 @@ fn vfio_keep_device_ready(state: &VfioRuntimeState) -> AxResult<()> {
     Ok(())
 }
 
-fn setup_vfio_msix_eventfds(device_fd: i32) -> AxResult<(usize, [i32; MAX_MSIX_EVENT_FDS])> {
+fn setup_vfio_msix_eventfds(
+    instance_fd: i32,
+    instance_id: usize,
+    device_fd: i32,
+) -> AxResult<(usize, [i32; MAX_MSIX_EVENT_FDS])> {
     let mut irq_info = VfioIrqInfo {
         argsz: core::mem::size_of::<VfioIrqInfo>() as u32,
         flags: 0,
@@ -626,7 +788,7 @@ fn setup_vfio_msix_eventfds(device_fd: i32) -> AxResult<(usize, [i32; MAX_MSIX_E
 
     // VFIO_DEVICE_SET_IRQS uses a variable-length payload:
     // struct vfio_irq_set header + count * __s32 eventfd entries.
-    let mut irq_set_hdr = VfioIrqSetHeader {
+    let irq_set_hdr = VfioIrqSetHeader {
         argsz: (core::mem::size_of::<VfioIrqSetHeader>()
             + (irq_info.count as usize) * core::mem::size_of::<i32>()) as u32,
         flags: VFIO_IRQ_SET_ACTION_TRIGGER | VFIO_IRQ_SET_DATA_EVENTFD,
@@ -659,6 +821,37 @@ fn setup_vfio_msix_eventfds(device_fd: i32) -> AxResult<(usize, [i32; MAX_MSIX_E
         "VFIO MSI-X eventfds armed: index={} start={} count={} total_vectors={}",
         VFIO_PCI_MSIX_IRQ_INDEX, irq_set_hdr.start, irq_set_hdr.count, irq_info.count
     );
+
+    for i in 0..irq_info.count as usize {
+        match ioctl::ioctl_register_instance_irq_route(
+            instance_fd,
+            instance_id as u64,
+            fds[i],
+            i as u32,
+        ) {
+            Ok(active) => {
+                VFIO_MSIX_POSTED_ROUTE_ACTIVE.write().unwrap()[i] = active;
+                if active {
+                    info!(
+                        "VFIO MSI-X route {} registered as posted-interrupt offload",
+                        i
+                    );
+                } else {
+                    info!(
+                        "VFIO MSI-X route {} registered for irq_bypass, software forwarding fallback remains active",
+                        i
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "VFIO MSI-X route {} irq_bypass registration failed: {}; software forwarding fallback remains active",
+                    i, e
+                );
+            }
+        }
+    }
+
     Ok((irq_info.count as usize, fds))
 }
 
@@ -669,6 +862,9 @@ fn drain_msix_event_and_forward(state: &VfioRuntimeState) {
     for msix_index in 0..state.msix_event_count {
         let fd = state.msix_event_fds[msix_index];
         if fd < 0 {
+            continue;
+        }
+        if VFIO_MSIX_POSTED_ROUTE_ACTIVE.read().unwrap()[msix_index] {
             continue;
         }
         loop {
@@ -683,7 +879,10 @@ fn drain_msix_event_and_forward(state: &VfioRuntimeState) {
             if n < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.kind() != std::io::ErrorKind::WouldBlock {
-                    warn!("VFIO MSI-X eventfd read failed (idx={}): {}", msix_index, err);
+                    warn!(
+                        "VFIO MSI-X eventfd read failed (idx={}): {}",
+                        msix_index, err
+                    );
                 }
                 break;
             }
@@ -714,7 +913,10 @@ fn drain_msix_event_and_forward(state: &VfioRuntimeState) {
     }
 }
 
-pub fn setup_vfio_dma_holder(resources: &VmResources, guest_memory: &[GuestRegionMmap]) -> AxResult<()> {
+pub fn setup_vfio_dma_holder(
+    resources: &VmResources,
+    guest_memory: &[GuestRegionMmap],
+) -> AxResult<()> {
     if resources.vfio.is_none() {
         return Ok(());
     }
@@ -753,6 +955,9 @@ pub fn setup_vfio_dma_holder(resources: &VmResources, guest_memory: &[GuestRegio
         msix_event_count: 0,
         msix_event_fds: [-1; MAX_MSIX_EVENT_FDS],
         msix_ctrl_off: None,
+        msix_table_bir: None,
+        msix_table_offset: 0,
+        msix_table_size: 0,
         cfg_region_offset: region.offset,
         cfg_region_size: region.size,
         bar0_region_offset: 0,
@@ -805,16 +1010,28 @@ pub fn setup_vfio_dma_holder(resources: &VmResources, guest_memory: &[GuestRegio
             find_capability_in_snapshot(&vfio_cfg.pci_cfg_space, cfg_len, PCI_CAP_ID_MSIX)
         {
             state.msix_ctrl_off = Some((msix_cap_off as u64) + PCI_MSIX_FLAGS_OFFSET_IN_CAP);
+            if let (Some(ctrl), Some(table)) = (
+                read_snapshot_u16(&vfio_cfg.pci_cfg_space, msix_cap_off + 2),
+                read_snapshot_u32(&vfio_cfg.pci_cfg_space, msix_cap_off + 4),
+            ) {
+                state.msix_table_size = ((ctrl & 0x07ff) as usize) + 1;
+                state.msix_table_bir = Some(table & 0x7);
+                state.msix_table_offset = (table & !0x7) as u64;
+            }
             info!(
-                "VFIO MSI-X ctrl offset discovered from snapshot: cap={:#x} ctrl={:#x}",
+                "VFIO MSI-X metadata from snapshot: cap={:#x} ctrl_off={:#x} table_bir={:?} table_off={:#x} table_size={}",
                 msix_cap_off,
-                state.msix_ctrl_off.unwrap()
+                state.msix_ctrl_off.unwrap(),
+                state.msix_table_bir,
+                state.msix_table_offset,
+                state.msix_table_size
             );
         } else {
             warn!("VFIO MSI-X capability not found in config snapshot");
         }
     }
-    let (msix_event_count, msix_event_fds) = setup_vfio_msix_eventfds(device_fd)?;
+    let (msix_event_count, msix_event_fds) =
+        setup_vfio_msix_eventfds(resources.fd, resources.vm_id, device_fd)?;
     let state = VfioRuntimeState {
         msix_event_count,
         msix_event_fds,
@@ -823,6 +1040,7 @@ pub fn setup_vfio_dma_holder(resources: &VmResources, guest_memory: &[GuestRegio
     // Do not rely on host CF8/CFC path from EqVisor: keep critical command/PM
     // bits through VFIO PCI config region in host userspace backend.
     vfio_keep_device_ready(&state)?;
+    let _ = sample_msix_table_vectors(&state, true);
     let _ = trace_mlx5_initseg_bar0(&state, "init", true);
     if cmdq_ram_trace_enabled() {
         let _ = trace_mlx5_cmdq_activity(&state, "init", true);
@@ -844,15 +1062,30 @@ pub fn run_foreground_daemon_loop() -> ! {
     let mut last_keepalive = Instant::now() - Duration::from_secs(10);
     let mut last_bar0_trace = Instant::now() - Duration::from_secs(1);
     let mut last_cmdq_trace = Instant::now() - Duration::from_secs(1);
+    let mut last_route_refresh = Instant::now() - Duration::from_secs(1);
+    let route_refresh_start = Instant::now();
     loop {
         crate::microvm::console::poll_console_once();
         if let Some(state) = VFIO_RUNTIME_STATE.get() {
             drain_msix_event_and_forward(state);
             if last_bar0_trace.elapsed() >= Duration::from_millis(100) {
+                if let Err(e) = sample_msix_table_vectors(state, false) {
+                    warn!("VFIO MSI-X table sample failed: {:?}", e);
+                }
                 if let Err(e) = trace_mlx5_initseg_bar0(state, "poll", false) {
                     warn!("VFIO BAR0 trace failed: {:?}", e);
                 }
                 last_bar0_trace = Instant::now();
+            }
+            let route_refresh_interval = if route_refresh_start.elapsed() < Duration::from_secs(10)
+            {
+                Duration::from_millis(100)
+            } else {
+                Duration::from_secs(1)
+            };
+            if last_route_refresh.elapsed() >= route_refresh_interval {
+                refresh_posted_irq_routes(state);
+                last_route_refresh = Instant::now();
             }
             if cmdq_ram_trace_enabled() && last_cmdq_trace.elapsed() >= Duration::from_millis(100) {
                 if let Err(e) = trace_mlx5_cmdq_activity(state, "poll", false) {

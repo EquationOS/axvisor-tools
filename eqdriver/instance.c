@@ -1,18 +1,43 @@
 #include <linux/fs.h>
+#include <linux/eventfd.h>
+#include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/irq.h>
+#include <linux/irqbypass.h>
 #include <linux/list.h>
 #include <linux/miscdevice.h>
 #include <linux/mm.h>
+#include <linux/slab.h>
+#include <linux/mutex.h>
 #include <linux/pgtable.h>
 #include <linux/uaccess.h>
 #include <linux/pid.h>	 // for pid_nr()
 #include <linux/sched.h> // for current
 #include <linux/uaccess.h>
 
+#ifdef CONFIG_X86
+#include <asm/irq_remapping.h>
+#endif
+
 #include "includes/eqmanager.h"
 #include "includes/hvc.h"
 #include "includes/instance.h"
 #include "includes/utils.h"
+
+typedef struct eq_irq_route
+{
+	struct list_head list;
+	struct irq_bypass_consumer consumer;
+	struct eventfd_ctx *eventfd;
+	uint64_t instance_id;
+	uint32_t msix_index;
+	uint32_t target_vcpu;
+	uint32_t guest_vector;
+	uint64_t pi_desc_hpa;
+	int host_irq;
+	bool posted_active;
+	bool logged_not_ready;
+} eq_irq_route_t;
 
 typedef struct eq_instance_vdev
 {
@@ -40,6 +65,8 @@ typedef struct eq_instance_vdev
 
 	/// @brief Backing page for the microVM PV console ring.
 	void *microvm_console_ring_virt;
+	struct list_head irq_routes;
+	struct mutex irq_routes_lock;
 
 	eq_instance_metadata_t metadata;
 } eq_instance_vdev_t;
@@ -47,6 +74,217 @@ typedef struct eq_instance_vdev
 static eq_instance_vdev_t instances_array[MAX_EQ_INSTANCES_NUM];
 
 int unregister_instance_dev(eq_instance_vdev_t *vdev);
+
+static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
+{
+	eq_microvm_irq_route_query_t *query;
+	phys_addr_t query_hpa;
+	int ret;
+
+	query = kzalloc(sizeof(*query), GFP_KERNEL);
+	if (!query)
+		return -ENOMEM;
+	query->instance_id = route->instance_id;
+	query->msix_index = route->msix_index;
+
+	query_hpa = virt_to_phys(query);
+	ret = hvc_query_microvm_irq_route(query_hpa);
+	if (ret < 0)
+	{
+		INFO(
+			"Eq IRQ bypass route idx=%u producer_irq=%d query unsupported ret=%d; keep software fallback\n",
+			route->msix_index, producer_irq, ret);
+		kfree(query);
+		return 0;
+	}
+	if (query->pi_desc_hpa == 0 || query->guest_vector == 0)
+	{
+		if (!route->logged_not_ready)
+		{
+			INFO(
+				"Eq IRQ bypass route idx=%u producer_irq=%d lacks PI destination pi_desc=%#llx vector=%u; keep software fallback\n",
+				route->msix_index, producer_irq,
+				(unsigned long long)query->pi_desc_hpa,
+				query->guest_vector);
+			route->logged_not_ready = true;
+		}
+		kfree(query);
+		return 0;
+	}
+
+#ifdef CONFIG_X86
+	if (!irq_remapping_cap(IRQ_POSTING_CAP))
+	{
+		INFO(
+			"Eq IRQ bypass route idx=%u producer_irq=%d lacks IRQ posting capability; keep software fallback\n",
+			route->msix_index, producer_irq);
+		kfree(query);
+		return 0;
+	}
+	{
+		struct vcpu_data vcpu_info = {
+			.pi_desc_addr = query->pi_desc_hpa,
+			.vector = query->guest_vector,
+		};
+		ret = irq_set_vcpu_affinity(producer_irq, &vcpu_info);
+	}
+#else
+	ret = -EOPNOTSUPP;
+#endif
+	if (ret)
+	{
+		INFO(
+			"Eq IRQ bypass route idx=%u producer_irq=%d irq_set_vcpu_affinity failed ret=%d; keep software fallback\n",
+			route->msix_index, producer_irq, ret);
+		kfree(query);
+		return 0;
+	}
+
+	route->target_vcpu = query->target_vcpu;
+	route->guest_vector = query->guest_vector;
+	route->pi_desc_hpa = query->pi_desc_hpa;
+	route->host_irq = producer_irq;
+	route->posted_active = true;
+	route->logged_not_ready = false;
+	INFO(
+		"Eq IRQ bypass route active idx=%u host_irq=%d target_vcpu=%u vector=%u pi_desc=%#llx\n",
+		route->msix_index, route->host_irq, route->target_vcpu,
+		route->guest_vector, (unsigned long long)route->pi_desc_hpa);
+	kfree(query);
+	return 0;
+}
+
+static int eq_irq_route_add_producer(
+	struct irq_bypass_consumer *consumer, struct irq_bypass_producer *producer)
+{
+	eq_irq_route_t *route =
+		container_of(consumer, eq_irq_route_t, consumer);
+
+	route->host_irq = producer->irq;
+	return eq_irq_route_try_activate(route, producer->irq);
+}
+
+static void eq_irq_route_del_producer(
+	struct irq_bypass_consumer *consumer, struct irq_bypass_producer *producer)
+{
+	eq_irq_route_t *route =
+		container_of(consumer, eq_irq_route_t, consumer);
+
+	if (route->posted_active)
+	{
+		irq_set_vcpu_affinity(producer->irq, NULL);
+		route->posted_active = false;
+	}
+	route->host_irq = -1;
+	INFO(
+		"Eq IRQ bypass route disconnected idx=%u producer_irq=%d\n",
+		route->msix_index, producer->irq);
+}
+
+static void eq_irq_route_free(eq_irq_route_t *route)
+{
+	if (!route)
+		return;
+	irq_bypass_unregister_consumer(&route->consumer);
+	if (route->eventfd)
+		eventfd_ctx_put(route->eventfd);
+	kfree(route);
+}
+
+static void eq_irq_routes_clear(eq_instance_vdev_t *vdev)
+{
+	eq_irq_route_t *route, *tmp;
+	LIST_HEAD(routes_to_free);
+
+	mutex_lock(&vdev->irq_routes_lock);
+	list_for_each_entry_safe(route, tmp, &vdev->irq_routes, list)
+	{
+		list_del(&route->list);
+		list_add_tail(&route->list, &routes_to_free);
+	}
+	mutex_unlock(&vdev->irq_routes_lock);
+
+	list_for_each_entry_safe(route, tmp, &routes_to_free, list)
+	{
+		list_del(&route->list);
+		eq_irq_route_free(route);
+	}
+}
+
+static int eq_register_irq_route(
+	eq_instance_vdev_t *instance_vdev, eq_instance_irq_route_arg_t *arg)
+{
+	eq_irq_route_t *route;
+	struct eventfd_ctx *eventfd;
+	int ret;
+
+	if (arg->eventfd < 0)
+		return -EINVAL;
+
+	eventfd = eventfd_ctx_fdget(arg->eventfd);
+	if (IS_ERR(eventfd))
+		return PTR_ERR(eventfd);
+
+	route = kzalloc(sizeof(*route), GFP_KERNEL);
+	if (!route)
+	{
+		eventfd_ctx_put(eventfd);
+		return -ENOMEM;
+	}
+
+	INIT_LIST_HEAD(&route->list);
+	route->eventfd = eventfd;
+	route->instance_id = instance_vdev->id;
+	route->msix_index = arg->msix_index;
+	route->host_irq = -1;
+	route->consumer.token = eventfd;
+	route->consumer.add_producer = eq_irq_route_add_producer;
+	route->consumer.del_producer = eq_irq_route_del_producer;
+
+	ret = irq_bypass_register_consumer(&route->consumer);
+	if (ret)
+	{
+		INFO(
+			"Eq IRQ bypass consumer register failed instance=%d msix_index=%u ret=%d; software fallback remains active\n",
+			instance_vdev->id, route->msix_index, ret);
+		eventfd_ctx_put(eventfd);
+		kfree(route);
+		return ret;
+	}
+	arg->flags = route->posted_active ? 0x1 : 0x0;
+
+	mutex_lock(&instance_vdev->irq_routes_lock);
+	list_add_tail(&route->list, &instance_vdev->irq_routes);
+	mutex_unlock(&instance_vdev->irq_routes_lock);
+
+	INFO(
+		"Eq IRQ bypass consumer registered instance=%d msix_index=%u token=%p\n",
+		instance_vdev->id, route->msix_index, route->consumer.token);
+	return 0;
+}
+
+static int eq_refresh_irq_route(
+	eq_instance_vdev_t *instance_vdev, eq_instance_irq_route_arg_t *arg)
+{
+	eq_irq_route_t *route;
+	int ret = -ENOENT;
+
+	mutex_lock(&instance_vdev->irq_routes_lock);
+	list_for_each_entry(route, &instance_vdev->irq_routes, list)
+	{
+		if (route->msix_index != arg->msix_index)
+			continue;
+
+		ret = 0;
+		if (!route->posted_active && route->host_irq >= 0)
+			ret = eq_irq_route_try_activate(route, route->host_irq);
+		arg->flags = route->posted_active ? 0x1 : 0x0;
+		break;
+	}
+	mutex_unlock(&instance_vdev->irq_routes_lock);
+
+	return ret;
+}
 
 static int instance_dev_open(struct inode *inode, struct file *file)
 {
@@ -163,6 +401,41 @@ static long instance_dev_ioctl(
 			"Injected MicroVM IRQ via HVC: instance=%d msix_index=%u\n",
 			instance_vdev->id, irq_arg.msix_index);
 		*/
+		return 0;
+	}
+	case EQ_INSTANCE_REGISTER_IRQ_ROUTE:
+	case EQ_INSTANCE_REFRESH_IRQ_ROUTE:
+	{
+		eq_instance_irq_route_arg_t route_arg;
+		int ret;
+		if (copy_from_user(
+				&route_arg, (void __user *)arg,
+				sizeof(eq_instance_irq_route_arg_t)))
+		{
+			ERROR("Failed to copy EQ_INSTANCE_*_IRQ_ROUTE arg from user\n");
+			return -EFAULT;
+		}
+
+		if (route_arg.instance_id != 0 &&
+		route_arg.instance_id != (uint64_t)instance_vdev->id)
+		{
+			ERROR(
+				"EQ_INSTANCE_REGISTER_IRQ_ROUTE mismatched instance id: fd=%d arg=%llu\n",
+				instance_vdev->id, route_arg.instance_id);
+			return -EINVAL;
+		}
+
+		if (cmd == EQ_INSTANCE_REGISTER_IRQ_ROUTE)
+			ret = eq_register_irq_route(instance_vdev, &route_arg);
+		else
+			ret = eq_refresh_irq_route(instance_vdev, &route_arg);
+		if (ret < 0)
+			return ret;
+		if (copy_to_user((void __user *)arg, &route_arg, sizeof(route_arg)))
+		{
+			ERROR("Failed to copy EQ_INSTANCE_*_IRQ_ROUTE result back to user\n");
+			return -EFAULT;
+		}
 		return 0;
 	}
 	default:
@@ -527,6 +800,8 @@ int create_instance(eq_create_instance_arg_t *arg)
 	instance_vdev->status = STATUS_CREATED;
 	instance_vdev->microvm_console_ring_virt = microvm_console_ring_virt;
 	microvm_console_ring_virt = NULL;
+	INIT_LIST_HEAD(&instance_vdev->irq_routes);
+	mutex_init(&instance_vdev->irq_routes_lock);
 
 	memcpy(
 		&instance_vdev->metadata, instance_metadata,
@@ -622,6 +897,7 @@ int unregister_instance_dev(eq_instance_vdev_t *vdev)
 	}
 
 	misc_deregister(&vdev->misc);
+	eq_irq_routes_clear(vdev);
 	if (vdev->microvm_console_ring_virt)
 	{
 		free_page((unsigned long)vdev->microvm_console_ring_virt);

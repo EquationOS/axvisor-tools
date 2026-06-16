@@ -45,6 +45,8 @@ const fn iow<T>(ty: u32, nr: u32) -> u64 {
 const EQ_CREATE_INSTANCE: u64 = iow::<eq_create_instance_arg_t>(0, 0);
 const EQ_REMOVE_INSTANCE: u64 = iow::<eq_remove_instance_arg_t>(0, 1);
 const EQ_INSTANCE_INJECT_IRQ: u64 = iow::<eq_instance_irq_inject_arg_t>(0, 2);
+const EQ_INSTANCE_REGISTER_IRQ_ROUTE: u64 = iow::<eq_instance_irq_route_arg_t>(0, 3);
+const EQ_INSTANCE_REFRESH_IRQ_ROUTE: u64 = iow::<eq_instance_irq_route_arg_t>(0, 4);
 
 const EQ_DEVICE_NAME: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"/dev/eqmanager\0") };
 
@@ -216,7 +218,11 @@ pub fn ioctl_remove_instance(instance_id: u64) -> Result<(), String> {
     Ok(())
 }
 
-pub fn ioctl_inject_instance_irq(instance_fd: i32, instance_id: u64, msix_index: u32) -> Result<(), String> {
+pub fn ioctl_inject_instance_irq(
+    instance_fd: i32,
+    instance_id: u64,
+    msix_index: u32,
+) -> Result<(), String> {
     let mut arg = eq_instance_irq_inject_arg_t {
         instance_id,
         msix_index,
@@ -238,4 +244,71 @@ pub fn ioctl_inject_instance_irq(instance_fd: i32, instance_id: u64, msix_index:
         ));
     }
     Ok(())
+}
+
+pub fn ioctl_register_instance_irq_route(
+    instance_fd: i32,
+    instance_id: u64,
+    eventfd: i32,
+    msix_index: u32,
+) -> Result<bool, String> {
+    let mut arg = eq_instance_irq_route_arg_t {
+        instance_id,
+        eventfd,
+        msix_index,
+        flags: 0,
+        reserved: 0,
+    };
+
+    let ret = unsafe {
+        libc::ioctl(
+            instance_fd,
+            EQ_INSTANCE_REGISTER_IRQ_ROUTE as libc::c_ulong,
+            &mut arg as *mut _,
+        )
+    };
+
+    if ret < 0 {
+        return Err(format!(
+            "Failed to register IRQ route for instance {} msix_index {}: {}",
+            instance_id,
+            msix_index,
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    Ok((arg.flags & 0x1) != 0)
+}
+
+pub fn ioctl_refresh_instance_irq_route(
+    instance_fd: i32,
+    instance_id: u64,
+    msix_index: u32,
+) -> Result<bool, String> {
+    let mut arg = eq_instance_irq_route_arg_t {
+        instance_id,
+        eventfd: -1,
+        msix_index,
+        flags: 0,
+        reserved: 0,
+    };
+
+    let ret = unsafe {
+        libc::ioctl(
+            instance_fd,
+            EQ_INSTANCE_REFRESH_IRQ_ROUTE as libc::c_ulong,
+            &mut arg as *mut _,
+        )
+    };
+
+    if ret < 0 {
+        return Err(format!(
+            "Failed to refresh IRQ route for instance {} msix_index {}: {}",
+            instance_id,
+            msix_index,
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    Ok((arg.flags & 0x1) != 0)
 }

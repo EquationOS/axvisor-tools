@@ -41,3 +41,8 @@ int hvc_inject_microvm_irq(__u64 instance_id, __u64 msix_index)
 {
 	return hvc_call(HMicroVMInjectIrq, instance_id, msix_index, 0, 0, 0, 0);
 }
+
+int hvc_query_microvm_irq_route(__u64 route_query_ptr)
+{
+	return hvc_call(HMicroVMQueryIrqRoute, route_query_ptr, 0, 0, 0, 0, 0);
+}
