@@ -5,8 +5,8 @@
 mod acpi;
 pub mod arch;
 mod cli;
-pub(crate) mod console;
 mod config;
+pub(crate) mod console;
 mod initrd;
 #[allow(unused)]
 mod mptable;
@@ -47,7 +47,7 @@ pub fn create_microvm(args: MicroVMCreateArgs) -> AxResult {
     let config_json = fs::read_to_string(args.config_file)
         .expect("Unable to open or read from the configuration file");
 
-    // Build microVM resources from the configuration file. 
+    // Build microVM resources from the configuration file.
     // It will create the microVM instance in the kernel via ioctl and get an instance ID, which is used as the VM ID for later interactions with this microVM.
     // This includes preparing the VM configuration, allocating guest memory, and setting up VFIO DMA mappings if needed.
     let vm_resources = VmResources::from_json(&config_json).expect("Failed to build VM resources");

@@ -9,14 +9,14 @@ use std::convert::TryFrom;
 use std::fmt::Debug;
 use std::mem::{self, size_of};
 
-use libc::c_char;
 use crate::microvm::arch::GSI_LEGACY_END;
-use crate::microvm::arch::layout;
 use crate::microvm::arch::generated::mpspec;
+use crate::microvm::arch::layout;
 use crate::microvm::vstate::memory::{
     Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap,
 };
 use crate::microvm::vstate::resources::ResourceAllocator;
+use libc::c_char;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error, displaydoc::Display)]
 pub enum MptableError {

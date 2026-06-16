@@ -3,11 +3,11 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use libc::{mmap, MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE};
+use libc::{MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE, mmap};
 
 use eqvm_defs::{
-    MICROVM_CONSOLE_RING_DATA_SIZE, MICROVM_CONSOLE_RING_MAGIC,
-    MICROVM_CONSOLE_RING_SIZE, MMAP_MICROVM_CONSOLE_MAGIC_NUMBER, MicroVmConsoleRing,
+    MICROVM_CONSOLE_RING_DATA_SIZE, MICROVM_CONSOLE_RING_MAGIC, MICROVM_CONSOLE_RING_SIZE,
+    MMAP_MICROVM_CONSOLE_MAGIC_NUMBER, MicroVmConsoleRing,
 };
 
 use crate::ioctl::EQINSTANCE_DEV_PREFIX;
@@ -74,7 +74,9 @@ impl MicroVmConsoleSession {
 
     fn drain_guest_output(&mut self) {
         let ring = unsafe { &mut *self.ring };
-        let head = ring.guest_to_host_head.load(std::sync::atomic::Ordering::Acquire);
+        let head = ring
+            .guest_to_host_head
+            .load(std::sync::atomic::Ordering::Acquire);
         while self.guest_to_host_tail != head {
             let idx = (self.guest_to_host_tail as usize) % MICROVM_CONSOLE_RING_DATA_SIZE;
             let byte = ring.guest_to_host[idx];
@@ -97,8 +99,12 @@ impl MicroVmConsoleSession {
         if n == 0 {
             return;
         }
-        let head = ring.host_to_guest_head.load(std::sync::atomic::Ordering::Acquire);
-        let tail = ring.host_to_guest_tail.load(std::sync::atomic::Ordering::Acquire);
+        let head = ring
+            .host_to_guest_head
+            .load(std::sync::atomic::Ordering::Acquire);
+        let tail = ring
+            .host_to_guest_tail
+            .load(std::sync::atomic::Ordering::Acquire);
         let used = head.wrapping_sub(tail) as usize;
         if used >= MICROVM_CONSOLE_RING_DATA_SIZE {
             ring.host_to_guest_dropped
