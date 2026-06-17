@@ -1,5 +1,5 @@
 use std::ffi::CString;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -132,6 +132,8 @@ static VFIO_MSIX_VECTOR_SHADOW: RwLock<[Option<u8>; MAX_MSIX_EVENT_FDS]> =
 static VFIO_MSIX_POSTED_ROUTE_ACTIVE: RwLock<[bool; MAX_MSIX_EVENT_FDS]> =
     RwLock::new([false; MAX_MSIX_EVENT_FDS]);
 static VFIO_CMDQ_TRACE_WARNED: AtomicBool = AtomicBool::new(false);
+static VFIO_ACTIVE_ROUTE_FALLBACK_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+const VFIO_ACTIVE_ROUTE_FALLBACK_TRACE_LIMIT: usize = 64;
 
 const fn ioc(dir: u32, ty: u32, nr: u32, size: usize) -> u64 {
     ((dir as u64) << IOC_DIRSHIFT)
@@ -650,26 +652,33 @@ fn refresh_posted_irq_routes(state: &VfioRuntimeState) {
     }
     let mut active = VFIO_MSIX_POSTED_ROUTE_ACTIVE.write().unwrap();
     for msix_index in 0..state.msix_event_count {
-        if active[msix_index] {
-            continue;
-        }
         match ioctl::ioctl_refresh_instance_irq_route(
             state.instance_fd,
             state.instance_id as u64,
             msix_index as u32,
         ) {
             Ok(true) => {
-                active[msix_index] = true;
-                info!(
-                    "VFIO MSI-X route {} switched to posted-interrupt offload",
-                    msix_index
-                );
+                if !active[msix_index] {
+                    active[msix_index] = true;
+                    info!(
+                        "VFIO MSI-X route {} switched to posted-interrupt offload",
+                        msix_index
+                    );
+                }
             }
             Ok(false) => {
-                trace!(
-                    "VFIO MSI-X route {} posted-interrupt not ready yet",
-                    msix_index
-                );
+                if active[msix_index] {
+                    active[msix_index] = false;
+                    info!(
+                        "VFIO MSI-X route {} switched to software interrupt fallback",
+                        msix_index
+                    );
+                } else {
+                    trace!(
+                        "VFIO MSI-X route {} posted-interrupt not ready yet",
+                        msix_index
+                    );
+                }
             }
             Err(e) => {
                 warn!(
@@ -864,9 +873,7 @@ fn drain_msix_event_and_forward(state: &VfioRuntimeState) {
         if fd < 0 {
             continue;
         }
-        if VFIO_MSIX_POSTED_ROUTE_ACTIVE.read().unwrap()[msix_index] {
-            continue;
-        }
+        let posted_route_active = VFIO_MSIX_POSTED_ROUTE_ACTIVE.read().unwrap()[msix_index];
         loop {
             let mut cnt: u64 = 0;
             let n = unsafe {
@@ -903,12 +910,15 @@ fn drain_msix_event_and_forward(state: &VfioRuntimeState) {
                     break;
                 }
             }
-            /*
-            info!(
-                "VFIO MSI-X forwarded to EqVisor: instance={} msix_index={} event_cnt={} injected={}",
-                state.instance_id, msix_index, cnt, inject_times
-            );
-            */
+            if posted_route_active
+                && VFIO_ACTIVE_ROUTE_FALLBACK_TRACE_COUNT.fetch_add(1, Ordering::Relaxed)
+                    < VFIO_ACTIVE_ROUTE_FALLBACK_TRACE_LIMIT
+            {
+                info!(
+                    "VFIO MSI-X software fallback forwarded while posted route is active: instance={} msix_index={} event_cnt={} injected={}",
+                    state.instance_id, msix_index, cnt, inject_times
+                );
+            }
         }
     }
 }
@@ -1077,11 +1087,11 @@ pub fn run_foreground_daemon_loop() -> ! {
                 }
                 last_bar0_trace = Instant::now();
             }
-            let route_refresh_interval = if route_refresh_start.elapsed() < Duration::from_secs(10)
+            let route_refresh_interval = if route_refresh_start.elapsed() < Duration::from_secs(30)
             {
-                Duration::from_millis(100)
+                Duration::from_millis(20)
             } else {
-                Duration::from_secs(1)
+                Duration::from_millis(100)
             };
             if last_route_refresh.elapsed() >= route_refresh_interval {
                 refresh_posted_irq_routes(state);

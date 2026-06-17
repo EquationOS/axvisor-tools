@@ -99,6 +99,17 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 	}
 	if (query->pi_desc_hpa == 0 || query->guest_vector == 0)
 	{
+		if (route->posted_active)
+		{
+			irq_set_vcpu_affinity(producer_irq, NULL);
+			route->posted_active = false;
+			route->target_vcpu = 0;
+			route->guest_vector = 0;
+			route->pi_desc_hpa = 0;
+			INFO(
+				"Eq IRQ bypass route idx=%u producer_irq=%d switched to software fallback (PI owner unavailable)\n",
+				route->msix_index, producer_irq);
+		}
 		if (!route->logged_not_ready)
 		{
 			INFO(
@@ -115,9 +126,26 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 #ifdef CONFIG_X86
 	if (!irq_remapping_cap(IRQ_POSTING_CAP))
 	{
+		if (route->posted_active)
+		{
+			irq_set_vcpu_affinity(producer_irq, NULL);
+			route->posted_active = false;
+			route->target_vcpu = 0;
+			route->guest_vector = 0;
+			route->pi_desc_hpa = 0;
+		}
 		INFO(
 			"Eq IRQ bypass route idx=%u producer_irq=%d lacks IRQ posting capability; keep software fallback\n",
 			route->msix_index, producer_irq);
+		kfree(query);
+		return 0;
+	}
+	if (route->posted_active &&
+		route->target_vcpu == query->target_vcpu &&
+		route->guest_vector == query->guest_vector &&
+		route->pi_desc_hpa == query->pi_desc_hpa)
+	{
+		route->logged_not_ready = false;
 		kfree(query);
 		return 0;
 	}
@@ -133,6 +161,14 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 #endif
 	if (ret)
 	{
+		if (route->posted_active)
+		{
+			irq_set_vcpu_affinity(producer_irq, NULL);
+			route->posted_active = false;
+			route->target_vcpu = 0;
+			route->guest_vector = 0;
+			route->pi_desc_hpa = 0;
+		}
 		INFO(
 			"Eq IRQ bypass route idx=%u producer_irq=%d irq_set_vcpu_affinity failed ret=%d; keep software fallback\n",
 			route->msix_index, producer_irq, ret);
@@ -276,7 +312,7 @@ static int eq_refresh_irq_route(
 			continue;
 
 		ret = 0;
-		if (!route->posted_active && route->host_irq >= 0)
+		if (route->host_irq >= 0)
 			ret = eq_irq_route_try_activate(route, route->host_irq);
 		arg->flags = route->posted_active ? 0x1 : 0x0;
 		break;
