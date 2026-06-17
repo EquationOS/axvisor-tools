@@ -523,6 +523,12 @@ fn cmdq_ram_trace_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn active_route_fallback_enabled() -> bool {
+    std::env::var("AXCLI_VFIO_DRAIN_ACTIVE_ROUTE")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
 fn find_pci_capability(device_fd: i32, cfg_base: u64, cap_id: u8) -> AxResult<Option<u64>> {
     // Some platforms can expose an inconsistent STATUS.CAP_LIST bit via VFIO
     // for VFs, but capability chain still exists. Do not hard-stop on CAP_LIST.
@@ -650,6 +656,13 @@ fn refresh_posted_irq_routes(state: &VfioRuntimeState) {
     if state.msix_event_count == 0 {
         return;
     }
+    static LOGGED_DRAIN_MODE: std::sync::Once = std::sync::Once::new();
+    LOGGED_DRAIN_MODE.call_once(|| {
+        info!(
+            "VFIO active posted-route eventfd drain mode: {}",
+            active_route_fallback_enabled()
+        );
+    });
     let mut active = VFIO_MSIX_POSTED_ROUTE_ACTIVE.write().unwrap();
     for msix_index in 0..state.msix_event_count {
         match ioctl::ioctl_refresh_instance_irq_route(
@@ -874,6 +887,9 @@ fn drain_msix_event_and_forward(state: &VfioRuntimeState) {
             continue;
         }
         let posted_route_active = VFIO_MSIX_POSTED_ROUTE_ACTIVE.read().unwrap()[msix_index];
+        if posted_route_active && !active_route_fallback_enabled() {
+            continue;
+        }
         loop {
             let mut cnt: u64 = 0;
             let n = unsafe {

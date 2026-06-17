@@ -14,6 +14,7 @@
 #include <linux/pid.h>	 // for pid_nr()
 #include <linux/sched.h> // for current
 #include <linux/uaccess.h>
+#include <linux/hashtable.h>
 
 #ifdef CONFIG_X86
 #include <asm/irq_remapping.h>
@@ -37,7 +38,26 @@ typedef struct eq_irq_route
 	int host_irq;
 	bool posted_active;
 	bool logged_not_ready;
+	struct list_head posted_owner_list;
+	bool posted_owner_linked;
 } eq_irq_route_t;
+
+typedef struct eq_vfio_posted_owner
+{
+	struct hlist_node node;
+	uint32_t target_vcpu;
+	uint64_t owner_instance_id;
+	struct list_head active_routes;
+} eq_vfio_posted_owner_t;
+
+#define EQ_VFIO_POSTED_OWNER_BITS 4
+#define EQ_IRQ_ROUTE_FLAG_COMMIT_OWNER (1U << 0)
+#define EQ_IRQ_ROUTE_FLAG_SHARED_VMCS_PID (1U << 1)
+
+static DEFINE_HASHTABLE(eq_vfio_posted_owners, EQ_VFIO_POSTED_OWNER_BITS);
+static DEFINE_MUTEX(eq_vfio_posted_owners_lock);
+
+static void eq_irq_route_deactivate_owned_locked(eq_irq_route_t *route, int producer_irq, const char *reason);
 
 typedef struct eq_instance_vdev
 {
@@ -75,11 +95,135 @@ static eq_instance_vdev_t instances_array[MAX_EQ_INSTANCES_NUM];
 
 int unregister_instance_dev(eq_instance_vdev_t *vdev);
 
+static eq_vfio_posted_owner_t *eq_vfio_posted_owner_find_locked(uint32_t target_vcpu)
+{
+	eq_vfio_posted_owner_t *owner;
+
+	hash_for_each_possible(eq_vfio_posted_owners, owner, node, target_vcpu)
+	{
+		if (owner->target_vcpu == target_vcpu)
+			return owner;
+	}
+	return NULL;
+}
+
+static void eq_irq_route_deactivate_locked(eq_irq_route_t *route, int producer_irq, const char *reason)
+{
+	if (!route || !route->posted_active)
+		return;
+
+	if (route->posted_owner_linked)
+	{
+		list_del_init(&route->posted_owner_list);
+		route->posted_owner_linked = false;
+	}
+	irq_set_vcpu_affinity(producer_irq, NULL);
+	INFO(
+		"Eq IRQ bypass route idx=%u producer_irq=%d switched to software fallback (%s)\n",
+		route->msix_index, producer_irq, reason);
+	route->posted_active = false;
+	route->target_vcpu = 0;
+	route->guest_vector = 0;
+	route->pi_desc_hpa = 0;
+}
+
+static void eq_vfio_posted_owner_drop_empty_locked(uint32_t target_vcpu, uint64_t owner_instance_id)
+{
+	eq_vfio_posted_owner_t *owner;
+
+	owner = eq_vfio_posted_owner_find_locked(target_vcpu);
+	if (!owner || owner->owner_instance_id != owner_instance_id ||
+		!list_empty(&owner->active_routes))
+		return;
+	hash_del(&owner->node);
+	kfree(owner);
+}
+
+static int eq_vfio_posted_owner_prepare_locked(eq_irq_route_t *route, uint32_t target_vcpu)
+{
+	eq_vfio_posted_owner_t *owner;
+	eq_irq_route_t *old_route, *tmp;
+
+	owner = eq_vfio_posted_owner_find_locked(target_vcpu);
+	if (owner)
+	{
+		if (owner->owner_instance_id == route->instance_id)
+			return 0;
+
+		list_for_each_entry_safe(old_route, tmp, &owner->active_routes, posted_owner_list)
+		{
+			if (old_route->host_irq >= 0)
+				eq_irq_route_deactivate_locked(
+					old_route, old_route->host_irq,
+					"shared VMCS PID owner replaced");
+		}
+		INFO(
+			"Eq VFIO posted owner target_vcpu=%u owner_instance=%llu previous=%llu\n",
+			target_vcpu, (unsigned long long)route->instance_id,
+			(unsigned long long)owner->owner_instance_id);
+		owner->owner_instance_id = route->instance_id;
+		return 0;
+	}
+
+	owner = kzalloc(sizeof(*owner), GFP_KERNEL);
+	if (!owner)
+		return -ENOMEM;
+	owner->target_vcpu = target_vcpu;
+	owner->owner_instance_id = route->instance_id;
+	INIT_LIST_HEAD(&owner->active_routes);
+	hash_add(eq_vfio_posted_owners, &owner->node, target_vcpu);
+	INFO(
+		"Eq VFIO posted owner target_vcpu=%u owner_instance=%llu previous=none\n",
+		target_vcpu, (unsigned long long)route->instance_id);
+	return 0;
+}
+
+static void eq_vfio_posted_owner_add_route_locked(eq_irq_route_t *route, uint32_t target_vcpu)
+{
+	eq_vfio_posted_owner_t *owner;
+
+	owner = eq_vfio_posted_owner_find_locked(target_vcpu);
+	if (!owner || owner->owner_instance_id != route->instance_id)
+		return;
+
+	if (!route->posted_owner_linked)
+	{
+		list_add_tail(&route->posted_owner_list, &owner->active_routes);
+		route->posted_owner_linked = true;
+	}
+}
+
+static void eq_irq_route_deactivate_owned_locked(eq_irq_route_t *route, int producer_irq, const char *reason)
+{
+	uint32_t old_target_vcpu;
+
+	if (!route || !route->posted_active)
+		return;
+
+	old_target_vcpu = route->target_vcpu;
+	eq_irq_route_deactivate_locked(route, producer_irq, reason);
+	eq_vfio_posted_owner_drop_empty_locked(old_target_vcpu, route->instance_id);
+}
+
+static bool eq_vfio_posted_owner_is_route_locked(eq_irq_route_t *route, uint32_t target_vcpu)
+{
+	eq_vfio_posted_owner_t *owner;
+
+	hash_for_each_possible(eq_vfio_posted_owners, owner, node, target_vcpu)
+	{
+		if (owner->target_vcpu == target_vcpu &&
+			owner->owner_instance_id == route->instance_id)
+			return true;
+	}
+	return false;
+}
+
 static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 {
 	eq_microvm_irq_route_query_t *query;
 	phys_addr_t query_hpa;
 	int ret;
+	bool owner_lock_held = false;
 
 	query = kzalloc(sizeof(*query), GFP_KERNEL);
 	if (!query)
@@ -101,14 +245,9 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 	{
 		if (route->posted_active)
 		{
-			irq_set_vcpu_affinity(producer_irq, NULL);
-			route->posted_active = false;
-			route->target_vcpu = 0;
-			route->guest_vector = 0;
-			route->pi_desc_hpa = 0;
-			INFO(
-				"Eq IRQ bypass route idx=%u producer_irq=%d switched to software fallback (PI owner unavailable)\n",
-				route->msix_index, producer_irq);
+			mutex_lock(&eq_vfio_posted_owners_lock);
+			eq_irq_route_deactivate_owned_locked(route, producer_irq, "PI owner unavailable");
+			mutex_unlock(&eq_vfio_posted_owners_lock);
 		}
 		if (!route->logged_not_ready)
 		{
@@ -128,11 +267,9 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 	{
 		if (route->posted_active)
 		{
-			irq_set_vcpu_affinity(producer_irq, NULL);
-			route->posted_active = false;
-			route->target_vcpu = 0;
-			route->guest_vector = 0;
-			route->pi_desc_hpa = 0;
+			mutex_lock(&eq_vfio_posted_owners_lock);
+			eq_irq_route_deactivate_owned_locked(route, producer_irq, "IRQ posting unavailable");
+			mutex_unlock(&eq_vfio_posted_owners_lock);
 		}
 		INFO(
 			"Eq IRQ bypass route idx=%u producer_irq=%d lacks IRQ posting capability; keep software fallback\n",
@@ -140,14 +277,45 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 		kfree(query);
 		return 0;
 	}
+	mutex_lock(&eq_vfio_posted_owners_lock);
+	owner_lock_held = true;
 	if (route->posted_active &&
 		route->target_vcpu == query->target_vcpu &&
 		route->guest_vector == query->guest_vector &&
 		route->pi_desc_hpa == query->pi_desc_hpa)
 	{
-		route->logged_not_ready = false;
-		kfree(query);
-		return 0;
+		if (!(query->flags & EQ_IRQ_ROUTE_FLAG_SHARED_VMCS_PID) ||
+			eq_vfio_posted_owner_is_route_locked(route, query->target_vcpu))
+		{
+			route->logged_not_ready = false;
+			mutex_unlock(&eq_vfio_posted_owners_lock);
+			kfree(query);
+			return 0;
+		}
+	}
+	if (query->flags & EQ_IRQ_ROUTE_FLAG_SHARED_VMCS_PID)
+	{
+		uint32_t prepared_target_vcpu = query->target_vcpu;
+		ret = eq_vfio_posted_owner_prepare_locked(route, query->target_vcpu);
+		if (ret)
+		{
+			mutex_unlock(&eq_vfio_posted_owners_lock);
+			owner_lock_held = false;
+			kfree(query);
+			return ret;
+		}
+		query->flags |= EQ_IRQ_ROUTE_FLAG_COMMIT_OWNER;
+		ret = hvc_query_microvm_irq_route(query_hpa);
+		if (ret < 0 || query->pi_desc_hpa == 0 || query->guest_vector == 0 ||
+			query->target_vcpu != prepared_target_vcpu ||
+			!(query->flags & EQ_IRQ_ROUTE_FLAG_SHARED_VMCS_PID))
+		{
+			eq_vfio_posted_owner_drop_empty_locked(prepared_target_vcpu, route->instance_id);
+			mutex_unlock(&eq_vfio_posted_owners_lock);
+			owner_lock_held = false;
+			kfree(query);
+			return 0;
+		}
 	}
 	{
 		struct vcpu_data vcpu_info = {
@@ -161,14 +329,12 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 #endif
 	if (ret)
 	{
+		eq_vfio_posted_owner_drop_empty_locked(query->target_vcpu, route->instance_id);
 		if (route->posted_active)
-		{
-			irq_set_vcpu_affinity(producer_irq, NULL);
-			route->posted_active = false;
-			route->target_vcpu = 0;
-			route->guest_vector = 0;
-			route->pi_desc_hpa = 0;
-		}
+			eq_irq_route_deactivate_owned_locked(route, producer_irq, "irq_set_vcpu_affinity failed");
+		eq_vfio_posted_owner_drop_empty_locked(query->target_vcpu, route->instance_id);
+		if (owner_lock_held)
+			mutex_unlock(&eq_vfio_posted_owners_lock);
 		INFO(
 			"Eq IRQ bypass route idx=%u producer_irq=%d irq_set_vcpu_affinity failed ret=%d; keep software fallback\n",
 			route->msix_index, producer_irq, ret);
@@ -182,6 +348,15 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 	route->host_irq = producer_irq;
 	route->posted_active = true;
 	route->logged_not_ready = false;
+	if (query->flags & EQ_IRQ_ROUTE_FLAG_SHARED_VMCS_PID)
+		eq_vfio_posted_owner_add_route_locked(route, route->target_vcpu);
+	else if (route->posted_owner_linked)
+	{
+		list_del_init(&route->posted_owner_list);
+		route->posted_owner_linked = false;
+	}
+	if (owner_lock_held)
+		mutex_unlock(&eq_vfio_posted_owners_lock);
 	INFO(
 		"Eq IRQ bypass route active idx=%u host_irq=%d target_vcpu=%u vector=%u pi_desc=%#llx\n",
 		route->msix_index, route->host_irq, route->target_vcpu,
@@ -208,8 +383,9 @@ static void eq_irq_route_del_producer(
 
 	if (route->posted_active)
 	{
-		irq_set_vcpu_affinity(producer->irq, NULL);
-		route->posted_active = false;
+		mutex_lock(&eq_vfio_posted_owners_lock);
+		eq_irq_route_deactivate_owned_locked(route, producer->irq, "producer disconnected");
+		mutex_unlock(&eq_vfio_posted_owners_lock);
 	}
 	route->host_irq = -1;
 	INFO(
@@ -221,6 +397,14 @@ static void eq_irq_route_free(eq_irq_route_t *route)
 {
 	if (!route)
 		return;
+	mutex_lock(&eq_vfio_posted_owners_lock);
+	if (route->posted_owner_linked)
+	{
+		list_del_init(&route->posted_owner_list);
+		route->posted_owner_linked = false;
+	}
+	eq_vfio_posted_owner_drop_empty_locked(route->target_vcpu, route->instance_id);
+	mutex_unlock(&eq_vfio_posted_owners_lock);
 	irq_bypass_unregister_consumer(&route->consumer);
 	if (route->eventfd)
 		eventfd_ctx_put(route->eventfd);
@@ -269,6 +453,7 @@ static int eq_register_irq_route(
 	}
 
 	INIT_LIST_HEAD(&route->list);
+	INIT_LIST_HEAD(&route->posted_owner_list);
 	route->eventfd = eventfd;
 	route->instance_id = instance_vdev->id;
 	route->msix_index = arg->msix_index;
