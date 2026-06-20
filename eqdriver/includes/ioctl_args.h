@@ -65,6 +65,14 @@ typedef struct eq_instance_irq_route_arg
 	uint32_t reserved;    // Reserved for alignment
 } eq_instance_irq_route_arg_t;
 
+typedef struct eq_instance_vcpu_resize_arg
+{
+	uint64_t instance_id; // Target instance ID, 0 means current instance fd owner
+	uint32_t vcpu_count;  // Desired online vCPU count
+	uint32_t flags;       // Reserved for future policies
+	uint64_t reserved[2];
+} eq_instance_vcpu_resize_arg_t;
+
 typedef struct eq_microvm_irq_route_query
 {
 	uint64_t instance_id;
@@ -103,5 +111,6 @@ typedef struct eq_shmctl_arg
 #define EQ_INSTANCE_INJECT_IRQ _IOW(0, 2, eq_instance_irq_inject_arg_t)
 #define EQ_INSTANCE_REGISTER_IRQ_ROUTE _IOW(0, 3, eq_instance_irq_route_arg_t)
 #define EQ_INSTANCE_REFRESH_IRQ_ROUTE _IOW(0, 4, eq_instance_irq_route_arg_t)
+#define EQ_INSTANCE_SET_VCPU_COUNT _IOW(0, 5, eq_instance_vcpu_resize_arg_t)
 #define EQ_SHMGET _IOW(1, 2, eq_shmget_arg_t)
 #define EQ_SHMCTL _IOW(1, 3, eq_shmctl_arg_t)

@@ -8,20 +8,36 @@ pub use boot_source::*;
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct MachineConfig {
-    /// Number of vcpu to start.
+    /// Number of vcpu to start. Kept for backward-compatible configs.
+    #[serde(default = "default_vcpu_count")]
     pub vcpu_count: u8,
+    /// Preferred name for the default online vCPU count at boot.
+    pub default_vcpu_num: Option<u8>,
     /// Maximum number of vcpu supported, if hotplug is supported.
     pub max_vcpu_count: Option<u8>,
+    /// Preferred name for the maximum possible vCPU count.
+    pub max_vcpu_num: Option<u8>,
     /// The size of the memory to allocate at startup, in MiB.
     pub init_mem_size_mib: usize,
     /// Maximum memory size in MiB, if memory hotplug is supported.
     pub max_mem_size_mib: Option<usize>,
 }
 
+const fn default_vcpu_count() -> u8 {
+    1
+}
+
 impl MachineConfig {
+    /// Get the default online vCPU count at boot.
+    pub fn default_vcpu_count(&self) -> u8 {
+        self.default_vcpu_num.unwrap_or(self.vcpu_count)
+    }
+
     /// Get the maximum vCPU count, defaulting to `vcpu_count` if `max_vcpu_count` is not set.
     pub fn max_vcpu_count(&self) -> u8 {
-        self.max_vcpu_count.unwrap_or(self.vcpu_count)
+        self.max_vcpu_num
+            .or(self.max_vcpu_count)
+            .unwrap_or_else(|| self.default_vcpu_count())
     }
 
     /// Get the maximum memory size in MiB, defaulting to `init_mem_size_mib` if

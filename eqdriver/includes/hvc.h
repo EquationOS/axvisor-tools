@@ -8,6 +8,7 @@ enum hvc_fid
 	HShmGet = 0xe0000000 | 8,
 	HMicroVMInjectIrq = 0xe0000000 | 0x21,
 	HMicroVMQueryIrqRoute = 0xe0000000 | 0x22,
+	HMicroVMSetVcpuCount = 0xe0000000 | 0x25,
 };
 
 int hvc_create_instance(
@@ -17,3 +18,4 @@ int hvc_shmget(__u64 key, __u64 size, __u64 shmflg, __u64 shm_base_ptr);
 
 int hvc_inject_microvm_irq(__u64 instance_id, __u64 msix_index);
 int hvc_query_microvm_irq_route(__u64 route_query_ptr);
+int hvc_set_microvm_vcpu_count(__u64 instance_id, __u64 vcpu_count);

@@ -6,6 +6,7 @@ mod acpi;
 pub mod arch;
 mod cli;
 mod config;
+pub(crate) mod control;
 pub(crate) mod console;
 mod initrd;
 #[allow(unused)]
@@ -20,6 +21,8 @@ pub use config::PciBdf;
 pub use resource::VfioResourceConfig;
 
 use std::fs;
+use std::thread;
+use std::time::Duration;
 
 use crate::hvc::hvc_init_shim;
 use cli::MicroVMCreateArgs;
@@ -92,6 +95,17 @@ If devices are still not visible in guest, complete BAR/interrupt mapping is lik
     // Clone the command-line so that a failed boot doesn't pollute the original.
     #[allow(unused_mut)]
     let mut boot_cmdline = boot_config.cmdline.clone();
+    let default_vcpus = vm_resources.machine_config.default_vcpu_count();
+    let max_vcpus = vm_resources.machine_config.max_vcpu_count();
+    if max_vcpus > default_vcpus {
+        boot_cmdline
+            .insert("maxcpus".to_string(), default_vcpus.to_string())
+            .map_err(|e| ax_err_type!(InvalidInput, format_args!("maxcpus cmdline error: {}", e)))?;
+        info!(
+            "microVM CPU elasticity enabled: default_vcpus={} max_vcpus={} appended maxcpus={}",
+            default_vcpus, max_vcpus, default_vcpus
+        );
+    }
 
     let mut vm = Vm::new(vm_resources.fd).expect("Failed to create VM instance");
     console::attach_console(
@@ -100,6 +114,13 @@ If devices are still not visible in guest, complete BAR/interrupt mapping is lik
         vm_resources.microvm_console_ring_gpa,
     )
     .map_err(|e| ax_err_type!(BadState, format_args!("console attach error {}", e)))?;
+    control::start_control_socket(
+        vm_resources.fd,
+        vm_resources.vm_id,
+        default_vcpus,
+        max_vcpus,
+    )
+    .map_err(|e| ax_err_type!(BadState, format_args!("control socket error {}", e)))?;
 
     vm.register_dram_memory_regions(guest_memory)?;
 
@@ -131,9 +152,17 @@ If devices are still not visible in guest, complete BAR/interrupt mapping is lik
         if vm_resources.vfio.is_some() {
             run_foreground_daemon_loop();
         } else {
-            console::poll_console_forever();
+            run_console_control_loop();
         }
     }
 
     Ok(())
+}
+
+fn run_console_control_loop() -> ! {
+    loop {
+        console::poll_console_once();
+        control::poll_control_once();
+        thread::sleep(Duration::from_millis(10));
+    }
 }

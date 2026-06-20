@@ -240,7 +240,9 @@ impl VmResources {
 
         let machine_config = guest_config.machine_config.unwrap_or(MachineConfig {
             vcpu_count: 1,
+            default_vcpu_num: None,
             max_vcpu_count: None,
+            max_vcpu_num: None,
             init_mem_size_mib: 512,
             max_mem_size_mib: None,
         });
@@ -377,7 +379,7 @@ impl VmResources {
 
         // First, create the instance through ioctl, eqdriver will trigger the hvc to create the instance.
         let create_result = ioctl::ioctl_create_microvm(
-            machine_config.vcpu_count,
+            machine_config.default_vcpu_count(),
             machine_config.max_vcpu_count(),
             machine_config.init_mem_size_mib,
             machine_config.max_mem_size_mib(),

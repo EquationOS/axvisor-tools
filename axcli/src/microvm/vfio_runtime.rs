@@ -1092,6 +1092,7 @@ pub fn run_foreground_daemon_loop() -> ! {
     let route_refresh_start = Instant::now();
     loop {
         crate::microvm::console::poll_console_once();
+        crate::microvm::control::poll_control_once();
         if let Some(state) = VFIO_RUNTIME_STATE.get() {
             drain_msix_event_and_forward(state);
             if last_bar0_trace.elapsed() >= Duration::from_millis(100) {

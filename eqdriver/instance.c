@@ -659,6 +659,41 @@ static long instance_dev_ioctl(
 		}
 		return 0;
 	}
+	case EQ_INSTANCE_SET_VCPU_COUNT:
+	{
+		eq_instance_vcpu_resize_arg_t resize_arg;
+		int ret;
+		if (copy_from_user(
+				&resize_arg, (void __user *)arg,
+				sizeof(eq_instance_vcpu_resize_arg_t)))
+		{
+			ERROR("Failed to copy EQ_INSTANCE_SET_VCPU_COUNT arg from user\n");
+			return -EFAULT;
+		}
+
+		if (resize_arg.instance_id != 0 &&
+			resize_arg.instance_id != (uint64_t)instance_vdev->id)
+		{
+			ERROR(
+				"EQ_INSTANCE_SET_VCPU_COUNT mismatched instance id: fd=%d arg=%llu\n",
+				instance_vdev->id, resize_arg.instance_id);
+			return -EINVAL;
+		}
+
+		ret = hvc_set_microvm_vcpu_count(
+			instance_vdev->id, resize_arg.vcpu_count);
+		if (ret < 0)
+		{
+			ERROR(
+				"HMicroVMSetVcpuCount failed for instance %d vcpu_count=%u ret=%d\n",
+				instance_vdev->id, resize_arg.vcpu_count, ret);
+			return ret;
+		}
+		INFO(
+			"MicroVM instance %d desired vCPU count set to %u\n",
+			instance_vdev->id, resize_arg.vcpu_count);
+		return 0;
+	}
 	default:
 		return -ENOTTY;
 	}

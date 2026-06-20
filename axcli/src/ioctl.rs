@@ -47,6 +47,7 @@ const EQ_REMOVE_INSTANCE: u64 = iow::<eq_remove_instance_arg_t>(0, 1);
 const EQ_INSTANCE_INJECT_IRQ: u64 = iow::<eq_instance_irq_inject_arg_t>(0, 2);
 const EQ_INSTANCE_REGISTER_IRQ_ROUTE: u64 = iow::<eq_instance_irq_route_arg_t>(0, 3);
 const EQ_INSTANCE_REFRESH_IRQ_ROUTE: u64 = iow::<eq_instance_irq_route_arg_t>(0, 4);
+const EQ_INSTANCE_SET_VCPU_COUNT: u64 = iow::<eq_instance_vcpu_resize_arg_t>(0, 5);
 
 const EQ_DEVICE_NAME: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"/dev/eqmanager\0") };
 
@@ -311,4 +312,36 @@ pub fn ioctl_refresh_instance_irq_route(
     }
 
     Ok((arg.flags & 0x1) != 0)
+}
+
+pub fn ioctl_set_instance_vcpu_count(
+    instance_fd: i32,
+    instance_id: u64,
+    vcpu_count: u32,
+) -> Result<(), String> {
+    let mut arg = eq_instance_vcpu_resize_arg_t {
+        instance_id,
+        vcpu_count,
+        flags: 0,
+        reserved: [0; 2],
+    };
+
+    let ret = unsafe {
+        libc::ioctl(
+            instance_fd,
+            EQ_INSTANCE_SET_VCPU_COUNT as libc::c_ulong,
+            &mut arg as *mut _,
+        )
+    };
+
+    if ret < 0 {
+        return Err(format!(
+            "Failed to set vCPU count for instance {} to {}: {}",
+            instance_id,
+            vcpu_count,
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    Ok(())
 }
