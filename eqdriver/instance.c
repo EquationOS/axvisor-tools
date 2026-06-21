@@ -37,6 +37,7 @@ typedef struct eq_irq_route
 	uint64_t pi_desc_hpa;
 	int host_irq;
 	bool posted_active;
+	bool posted_shared_pid;
 	bool logged_not_ready;
 	struct list_head posted_owner_list;
 	bool posted_owner_linked;
@@ -122,6 +123,7 @@ static void eq_irq_route_deactivate_locked(eq_irq_route_t *route, int producer_i
 		"Eq IRQ bypass route idx=%u producer_irq=%d switched to software fallback (%s)\n",
 		route->msix_index, producer_irq, reason);
 	route->posted_active = false;
+	route->posted_shared_pid = false;
 	route->target_vcpu = 0;
 	route->guest_vector = 0;
 	route->pi_desc_hpa = 0;
@@ -226,6 +228,7 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 	bool owner_lock_held = false;
 	uint32_t old_target_vcpu = 0;
 	bool old_owner_linked = false;
+	bool query_shared_pid;
 
 	query = kzalloc(sizeof(*query), GFP_KERNEL);
 	if (!query)
@@ -283,13 +286,15 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 	owner_lock_held = true;
 	old_target_vcpu = route->target_vcpu;
 	old_owner_linked = route->posted_owner_linked;
+	query_shared_pid = (query->flags & EQ_IRQ_ROUTE_FLAG_SHARED_VMCS_PID) != 0;
 
 	if (route->posted_active &&
 		route->target_vcpu == query->target_vcpu &&
 		route->guest_vector == query->guest_vector &&
-		route->pi_desc_hpa == query->pi_desc_hpa)
+		route->pi_desc_hpa == query->pi_desc_hpa &&
+		route->posted_shared_pid == query_shared_pid)
 	{
-		if (!(query->flags & EQ_IRQ_ROUTE_FLAG_SHARED_VMCS_PID) ||
+		if (!query_shared_pid ||
 			eq_vfio_posted_owner_is_route_locked(route, query->target_vcpu))
 		{
 			route->logged_not_ready = false;
@@ -352,8 +357,9 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 	route->pi_desc_hpa = query->pi_desc_hpa;
 	route->host_irq = producer_irq;
 	route->posted_active = true;
+	route->posted_shared_pid = query_shared_pid;
 	route->logged_not_ready = false;
-	if (query->flags & EQ_IRQ_ROUTE_FLAG_SHARED_VMCS_PID)
+	if (query_shared_pid)
 		eq_vfio_posted_owner_add_route_locked(route, route->target_vcpu);
 	else if (route->posted_owner_linked)
 	{
