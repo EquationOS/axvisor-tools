@@ -228,7 +228,7 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 	bool owner_lock_held = false;
 	uint32_t old_target_vcpu = 0;
 	bool old_owner_linked = false;
-	bool query_shared_pid;
+	bool query_shared_pid = false;
 
 	query = kzalloc(sizeof(*query), GFP_KERNEL);
 	if (!query)
