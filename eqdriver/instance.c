@@ -224,6 +224,8 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 	phys_addr_t query_hpa;
 	int ret;
 	bool owner_lock_held = false;
+	uint32_t old_target_vcpu = 0;
+	bool old_owner_linked = false;
 
 	query = kzalloc(sizeof(*query), GFP_KERNEL);
 	if (!query)
@@ -279,6 +281,9 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 	}
 	mutex_lock(&eq_vfio_posted_owners_lock);
 	owner_lock_held = true;
+	old_target_vcpu = route->target_vcpu;
+	old_owner_linked = route->posted_owner_linked;
+
 	if (route->posted_active &&
 		route->target_vcpu == query->target_vcpu &&
 		route->guest_vector == query->guest_vector &&
@@ -354,6 +359,8 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 	{
 		list_del_init(&route->posted_owner_list);
 		route->posted_owner_linked = false;
+		if (old_owner_linked)
+			eq_vfio_posted_owner_drop_empty_locked(old_target_vcpu, route->instance_id);
 	}
 	if (owner_lock_held)
 		mutex_unlock(&eq_vfio_posted_owners_lock);
@@ -398,12 +405,14 @@ static void eq_irq_route_free(eq_irq_route_t *route)
 	if (!route)
 		return;
 	mutex_lock(&eq_vfio_posted_owners_lock);
-	if (route->posted_owner_linked)
+	if (route->posted_active && route->host_irq >= 0)
+		eq_irq_route_deactivate_owned_locked(route, route->host_irq, "route freed");
+	else if (route->posted_owner_linked)
 	{
 		list_del_init(&route->posted_owner_list);
 		route->posted_owner_linked = false;
+		eq_vfio_posted_owner_drop_empty_locked(route->target_vcpu, route->instance_id);
 	}
-	eq_vfio_posted_owner_drop_empty_locked(route->target_vcpu, route->instance_id);
 	mutex_unlock(&eq_vfio_posted_owners_lock);
 	irq_bypass_unregister_consumer(&route->consumer);
 	if (route->eventfd)
