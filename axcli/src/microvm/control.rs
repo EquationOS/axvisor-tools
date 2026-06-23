@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -42,6 +43,8 @@ pub fn start_control_socket(
 
     let listener = UnixListener::bind(&socket_path)
         .map_err(|err| format!("Failed to bind control socket {}: {}", socket_path, err))?;
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o666))
+        .map_err(|err| format!("Failed to chmod control socket {}: {}", socket_path, err))?;
     listener
         .set_nonblocking(true)
         .map_err(|err| format!("Failed to set control socket nonblocking: {}", err))?;

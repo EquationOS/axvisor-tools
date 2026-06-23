@@ -672,6 +672,7 @@ fn refresh_posted_irq_routes(state: &VfioRuntimeState) {
         ) {
             Ok(true) => {
                 if !active[msix_index] {
+                    drain_single_msix_event_and_forward(state, msix_index, "posted-route-switch");
                     active[msix_index] = true;
                     info!(
                         "VFIO MSI-X route {} switched to posted-interrupt offload",
@@ -700,6 +701,63 @@ fn refresh_posted_irq_routes(state: &VfioRuntimeState) {
                 );
             }
         }
+    }
+}
+
+fn drain_single_msix_event_and_forward(
+    state: &VfioRuntimeState,
+    msix_index: usize,
+    reason: &'static str,
+) {
+    if msix_index >= state.msix_event_count {
+        return;
+    }
+    let fd = state.msix_event_fds[msix_index];
+    if fd < 0 {
+        return;
+    }
+
+    loop {
+        let mut cnt: u64 = 0;
+        let n = unsafe {
+            libc::read(
+                fd,
+                (&mut cnt as *mut u64).cast::<libc::c_void>(),
+                core::mem::size_of::<u64>(),
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::WouldBlock {
+                warn!(
+                    "VFIO MSI-X eventfd read failed (idx={} reason={}): {}",
+                    msix_index, reason, err
+                );
+            }
+            break;
+        }
+        if n as usize != core::mem::size_of::<u64>() {
+            break;
+        }
+
+        let inject_times = core::cmp::min(cnt as usize, 128);
+        for _ in 0..inject_times {
+            if let Err(e) = ioctl::ioctl_inject_instance_irq(
+                state.instance_fd,
+                state.instance_id as u64,
+                msix_index as u32,
+            ) {
+                warn!(
+                    "Forward VFIO MSI-X to EqVisor failed: instance={} msix_index={} reason={} err={}",
+                    state.instance_id, msix_index, reason, e
+                );
+                break;
+            }
+        }
+        info!(
+            "VFIO MSI-X eventfd residual flush: instance={} msix_index={} reason={} event_cnt={} injected={}",
+            state.instance_id, msix_index, reason, cnt, inject_times
+        );
     }
 }
 
@@ -890,51 +948,15 @@ fn drain_msix_event_and_forward(state: &VfioRuntimeState) {
         if posted_route_active && !active_route_fallback_enabled() {
             continue;
         }
-        loop {
-            let mut cnt: u64 = 0;
-            let n = unsafe {
-                libc::read(
-                    fd,
-                    (&mut cnt as *mut u64).cast::<libc::c_void>(),
-                    core::mem::size_of::<u64>(),
-                )
-            };
-            if n < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() != std::io::ErrorKind::WouldBlock {
-                    warn!(
-                        "VFIO MSI-X eventfd read failed (idx={}): {}",
-                        msix_index, err
-                    );
-                }
-                break;
-            }
-            if n as usize != core::mem::size_of::<u64>() {
-                break;
-            }
-            let inject_times = core::cmp::min(cnt as usize, 128);
-            for _ in 0..inject_times {
-                if let Err(e) = ioctl::ioctl_inject_instance_irq(
-                    state.instance_fd,
-                    state.instance_id as u64,
-                    msix_index as u32,
-                ) {
-                    warn!(
-                        "Forward VFIO MSI-X to EqVisor failed: instance={} msix_index={} err={}",
-                        state.instance_id, msix_index, e
-                    );
-                    break;
-                }
-            }
-            if posted_route_active
-                && VFIO_ACTIVE_ROUTE_FALLBACK_TRACE_COUNT.fetch_add(1, Ordering::Relaxed)
-                    < VFIO_ACTIVE_ROUTE_FALLBACK_TRACE_LIMIT
-            {
-                info!(
-                    "VFIO MSI-X software fallback forwarded while posted route is active: instance={} msix_index={} event_cnt={} injected={}",
-                    state.instance_id, msix_index, cnt, inject_times
-                );
-            }
+        drain_single_msix_event_and_forward(state, msix_index, "software-fallback");
+        if posted_route_active
+            && VFIO_ACTIVE_ROUTE_FALLBACK_TRACE_COUNT.fetch_add(1, Ordering::Relaxed)
+                < VFIO_ACTIVE_ROUTE_FALLBACK_TRACE_LIMIT
+        {
+            info!(
+                "VFIO MSI-X software fallback drain checked while posted route is active: instance={} msix_index={}",
+                state.instance_id, msix_index
+            );
         }
     }
 }
