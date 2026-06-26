@@ -6,8 +6,8 @@ mod acpi;
 pub mod arch;
 mod cli;
 mod config;
-pub(crate) mod control;
 pub(crate) mod console;
+pub(crate) mod control;
 mod initrd;
 #[allow(unused)]
 mod mptable;
@@ -100,10 +100,17 @@ If devices are still not visible in guest, complete BAR/interrupt mapping is lik
     if max_vcpus > default_vcpus {
         boot_cmdline
             .insert("maxcpus".to_string(), default_vcpus.to_string())
-            .map_err(|e| ax_err_type!(InvalidInput, format_args!("maxcpus cmdline error: {}", e)))?;
+            .map_err(|e| {
+                ax_err_type!(InvalidInput, format_args!("maxcpus cmdline error: {}", e))
+            })?;
+        boot_cmdline
+            .insert("nr_cpus".to_string(), max_vcpus.to_string())
+            .map_err(|e| {
+                ax_err_type!(InvalidInput, format_args!("nr_cpus cmdline error: {}", e))
+            })?;
         info!(
-            "microVM CPU elasticity enabled: default_vcpus={} max_vcpus={} appended maxcpus={}",
-            default_vcpus, max_vcpus, default_vcpus
+            "microVM CPU elasticity enabled: default_vcpus={} max_vcpus={} appended maxcpus={} nr_cpus={}",
+            default_vcpus, max_vcpus, default_vcpus, max_vcpus
         );
     }
 

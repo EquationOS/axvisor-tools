@@ -81,6 +81,7 @@ typedef struct eq_microvm_irq_route_query
 	uint32_t target_vcpu;
 	uint32_t guest_vector;
 	uint64_t pi_desc_hpa;
+	/* reserved[0]: owner-coded posted vector when HAS_POSTED_VECTOR is set. */
 	uint64_t reserved[4];
 } eq_microvm_irq_route_query_t;
 

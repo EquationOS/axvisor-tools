@@ -9,6 +9,7 @@
 #include <linux/mm.h>
 #include <linux/slab.h>
 #include <linux/mutex.h>
+#include <linux/moduleparam.h>
 #include <linux/pgtable.h>
 #include <linux/uaccess.h>
 #include <linux/pid.h>	 // for pid_nr()
@@ -34,10 +35,12 @@ typedef struct eq_irq_route
 	uint32_t msix_index;
 	uint32_t target_vcpu;
 	uint32_t guest_vector;
+	uint32_t posted_vector;
 	uint64_t pi_desc_hpa;
 	int host_irq;
 	bool posted_active;
 	bool posted_shared_pid;
+	bool posted_vector_hardware;
 	bool logged_not_ready;
 	struct list_head posted_owner_list;
 	bool posted_owner_linked;
@@ -54,9 +57,15 @@ typedef struct eq_vfio_posted_owner
 #define EQ_VFIO_POSTED_OWNER_BITS 4
 #define EQ_IRQ_ROUTE_FLAG_COMMIT_OWNER (1U << 0)
 #define EQ_IRQ_ROUTE_FLAG_SHARED_VMCS_PID (1U << 1)
+#define EQ_IRQ_ROUTE_FLAG_HAS_POSTED_VECTOR (1U << 2)
 
 static DEFINE_HASHTABLE(eq_vfio_posted_owners, EQ_VFIO_POSTED_OWNER_BITS);
 static DEFINE_MUTEX(eq_vfio_posted_owners_lock);
+static bool eq_vfio_use_eqgate_posted_vector;
+module_param(eq_vfio_use_eqgate_posted_vector, bool, 0644);
+MODULE_PARM_DESC(
+	eq_vfio_use_eqgate_posted_vector,
+	"Use hypervisor-provided owner-coded posted vector for VFIO IRQ posting");
 
 static void eq_irq_route_deactivate_owned_locked(eq_irq_route_t *route, int producer_irq, const char *reason);
 
@@ -124,8 +133,10 @@ static void eq_irq_route_deactivate_locked(eq_irq_route_t *route, int producer_i
 		route->msix_index, producer_irq, reason);
 	route->posted_active = false;
 	route->posted_shared_pid = false;
+	route->posted_vector_hardware = false;
 	route->target_vcpu = 0;
 	route->guest_vector = 0;
+	route->posted_vector = 0;
 	route->pi_desc_hpa = 0;
 }
 
@@ -229,6 +240,9 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 	uint32_t old_target_vcpu = 0;
 	bool old_owner_linked = false;
 	bool query_shared_pid = false;
+	uint32_t query_posted_vector = 0;
+	bool query_use_posted_vector = false;
+	uint32_t pir_vector = 0;
 
 	query = kzalloc(sizeof(*query), GFP_KERNEL);
 	if (!query)
@@ -287,10 +301,18 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 	old_target_vcpu = route->target_vcpu;
 	old_owner_linked = route->posted_owner_linked;
 	query_shared_pid = (query->flags & EQ_IRQ_ROUTE_FLAG_SHARED_VMCS_PID) != 0;
+	query_posted_vector =
+		(query->flags & EQ_IRQ_ROUTE_FLAG_HAS_POSTED_VECTOR) ?
+			(uint32_t)(query->reserved[0] & 0xff) :
+			0;
+	query_use_posted_vector =
+		eq_vfio_use_eqgate_posted_vector && query_posted_vector != 0;
 
 	if (route->posted_active &&
 		route->target_vcpu == query->target_vcpu &&
 		route->guest_vector == query->guest_vector &&
+		route->posted_vector == query_posted_vector &&
+		route->posted_vector_hardware == query_use_posted_vector &&
 		route->pi_desc_hpa == query->pi_desc_hpa &&
 		route->posted_shared_pid == query_shared_pid)
 	{
@@ -327,10 +349,17 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 			return 0;
 		}
 	}
+	query_posted_vector =
+		(query->flags & EQ_IRQ_ROUTE_FLAG_HAS_POSTED_VECTOR) ?
+			(uint32_t)(query->reserved[0] & 0xff) :
+			0;
+	query_use_posted_vector =
+		eq_vfio_use_eqgate_posted_vector && query_posted_vector != 0;
+	pir_vector = query_use_posted_vector ? query_posted_vector : query->guest_vector;
 	{
 		struct vcpu_data vcpu_info = {
 			.pi_desc_addr = query->pi_desc_hpa,
-			.vector = query->guest_vector,
+			.vector = pir_vector,
 		};
 		ret = irq_set_vcpu_affinity(producer_irq, &vcpu_info);
 	}
@@ -354,10 +383,12 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 
 	route->target_vcpu = query->target_vcpu;
 	route->guest_vector = query->guest_vector;
+	route->posted_vector = query_posted_vector;
 	route->pi_desc_hpa = query->pi_desc_hpa;
 	route->host_irq = producer_irq;
 	route->posted_active = true;
 	route->posted_shared_pid = query_shared_pid;
+	route->posted_vector_hardware = query_use_posted_vector;
 	route->logged_not_ready = false;
 	if (query_shared_pid)
 		eq_vfio_posted_owner_add_route_locked(route, route->target_vcpu);
@@ -371,9 +402,11 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 	if (owner_lock_held)
 		mutex_unlock(&eq_vfio_posted_owners_lock);
 	INFO(
-		"Eq IRQ bypass route active idx=%u host_irq=%d target_vcpu=%u vector=%u pi_desc=%#llx\n",
+		"Eq IRQ bypass route active idx=%u host_irq=%d target_vcpu=%u pir_vector=%u posted_vector=%u guest_vector=%u use_posted_vector=%d pi_desc=%#llx\n",
 		route->msix_index, route->host_irq, route->target_vcpu,
-		route->guest_vector, (unsigned long long)route->pi_desc_hpa);
+		pir_vector, route->posted_vector, route->guest_vector,
+		route->posted_vector_hardware,
+		(unsigned long long)route->pi_desc_hpa);
 	kfree(query);
 	return 0;
 }
