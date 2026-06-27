@@ -529,6 +529,16 @@ fn active_route_fallback_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn log_posted_route_drain_mode_once() {
+    static LOGGED_DRAIN_MODE: std::sync::Once = std::sync::Once::new();
+    LOGGED_DRAIN_MODE.call_once(|| {
+        info!(
+            "VFIO active posted-route eventfd drain mode: {}",
+            active_route_fallback_enabled()
+        );
+    });
+}
+
 fn find_pci_capability(device_fd: i32, cfg_base: u64, cap_id: u8) -> AxResult<Option<u64>> {
     // Some platforms can expose an inconsistent STATUS.CAP_LIST bit via VFIO
     // for VFs, but capability chain still exists. Do not hard-stop on CAP_LIST.
@@ -652,54 +662,58 @@ fn sample_msix_table_vectors(state: &VfioRuntimeState, _force: bool) -> AxResult
     Ok(())
 }
 
-fn refresh_posted_irq_routes(state: &VfioRuntimeState) {
+fn refresh_posted_irq_route_locked(
+    state: &VfioRuntimeState,
+    msix_index: usize,
+    active: &mut [bool; MAX_MSIX_EVENT_FDS],
+) {
+    match ioctl::ioctl_refresh_instance_irq_route(
+        state.instance_fd,
+        state.instance_id as u64,
+        msix_index as u32,
+    ) {
+        Ok(true) => {
+            if !active[msix_index] {
+                drain_single_msix_event_and_forward(state, msix_index, "posted-route-switch");
+                active[msix_index] = true;
+                info!(
+                    "VFIO MSI-X route {} switched to posted-interrupt offload",
+                    msix_index
+                );
+            }
+        }
+        Ok(false) => {
+            if active[msix_index] {
+                active[msix_index] = false;
+                info!(
+                    "VFIO MSI-X route {} switched to software interrupt fallback",
+                    msix_index
+                );
+            } else {
+                trace!(
+                    "VFIO MSI-X route {} posted-interrupt not ready yet",
+                    msix_index
+                );
+            }
+        }
+        Err(e) => {
+            warn!(
+                "VFIO MSI-X route {} posted-interrupt refresh failed: {}",
+                msix_index, e
+            );
+        }
+    }
+}
+
+fn refresh_posted_irq_routes(state: &VfioRuntimeState, include_active: bool) {
     if state.msix_event_count == 0 {
         return;
     }
-    static LOGGED_DRAIN_MODE: std::sync::Once = std::sync::Once::new();
-    LOGGED_DRAIN_MODE.call_once(|| {
-        info!(
-            "VFIO active posted-route eventfd drain mode: {}",
-            active_route_fallback_enabled()
-        );
-    });
+    log_posted_route_drain_mode_once();
     let mut active = VFIO_MSIX_POSTED_ROUTE_ACTIVE.write().unwrap();
     for msix_index in 0..state.msix_event_count {
-        match ioctl::ioctl_refresh_instance_irq_route(
-            state.instance_fd,
-            state.instance_id as u64,
-            msix_index as u32,
-        ) {
-            Ok(true) => {
-                if !active[msix_index] {
-                    drain_single_msix_event_and_forward(state, msix_index, "posted-route-switch");
-                    active[msix_index] = true;
-                    info!(
-                        "VFIO MSI-X route {} switched to posted-interrupt offload",
-                        msix_index
-                    );
-                }
-            }
-            Ok(false) => {
-                if active[msix_index] {
-                    active[msix_index] = false;
-                    info!(
-                        "VFIO MSI-X route {} switched to software interrupt fallback",
-                        msix_index
-                    );
-                } else {
-                    trace!(
-                        "VFIO MSI-X route {} posted-interrupt not ready yet",
-                        msix_index
-                    );
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "VFIO MSI-X route {} posted-interrupt refresh failed: {}",
-                    msix_index, e
-                );
-            }
+        if !active[msix_index] || include_active {
+            refresh_posted_irq_route_locked(state, msix_index, &mut active);
         }
     }
 }
@@ -939,12 +953,17 @@ fn drain_msix_event_and_forward(state: &VfioRuntimeState) {
     if state.msix_event_count == 0 {
         return;
     }
+    log_posted_route_drain_mode_once();
+    let mut active = VFIO_MSIX_POSTED_ROUTE_ACTIVE.write().unwrap();
     for msix_index in 0..state.msix_event_count {
         let fd = state.msix_event_fds[msix_index];
         if fd < 0 {
             continue;
         }
-        let posted_route_active = VFIO_MSIX_POSTED_ROUTE_ACTIVE.read().unwrap()[msix_index];
+        if !active[msix_index] {
+            refresh_posted_irq_route_locked(state, msix_index, &mut active);
+        }
+        let posted_route_active = active[msix_index];
         if posted_route_active && !active_route_fallback_enabled() {
             continue;
         }
@@ -1111,12 +1130,12 @@ pub fn run_foreground_daemon_loop() -> ! {
     let mut last_bar0_trace = Instant::now() - Duration::from_secs(1);
     let mut last_cmdq_trace = Instant::now() - Duration::from_secs(1);
     let mut last_route_refresh = Instant::now() - Duration::from_secs(1);
+    let mut last_full_route_refresh = Instant::now() - Duration::from_secs(1);
     let route_refresh_start = Instant::now();
     loop {
         crate::microvm::console::poll_console_once();
         crate::microvm::control::poll_control_once();
         if let Some(state) = VFIO_RUNTIME_STATE.get() {
-            drain_msix_event_and_forward(state);
             if last_bar0_trace.elapsed() >= Duration::from_millis(100) {
                 if let Err(e) = sample_msix_table_vectors(state, false) {
                     warn!("VFIO MSI-X table sample failed: {:?}", e);
@@ -1133,9 +1152,14 @@ pub fn run_foreground_daemon_loop() -> ! {
                 Duration::from_millis(100)
             };
             if last_route_refresh.elapsed() >= route_refresh_interval {
-                refresh_posted_irq_routes(state);
+                let include_active = last_full_route_refresh.elapsed() >= Duration::from_secs(1);
+                refresh_posted_irq_routes(state, include_active);
+                if include_active {
+                    last_full_route_refresh = Instant::now();
+                }
                 last_route_refresh = Instant::now();
             }
+            drain_msix_event_and_forward(state);
             if cmdq_ram_trace_enabled() && last_cmdq_trace.elapsed() >= Duration::from_millis(100) {
                 if let Err(e) = trace_mlx5_cmdq_activity(state, "poll", false) {
                     warn!("VFIO cmdq trace failed: {:?}", e);
