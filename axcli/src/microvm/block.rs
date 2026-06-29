@@ -1,16 +1,17 @@
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicUsize, Ordering, fence};
+use std::sync::atomic::{fence, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use axerrno::{AxResult, ax_err, ax_err_type};
+use axerrno::{ax_err, ax_err_type, AxResult};
 use eqvm_defs::{
-    MICROVM_BLOCK_NOTIFY_MAGIC, MICROVM_BLOCK_NOTIFY_PAGE_SIZE, MICROVM_BLOCK_NOTIFY_RING_SIZE,
-    MMAP_MICROVM_BLOCK_NOTIFY_MAGIC_NUMBER, MicroVmBlockNotifyEntry, MicroVmBlockNotifyPage,
+    MicroVmBlockNotifyEntry, MicroVmBlockNotifyPage, MICROVM_BLOCK_NOTIFY_MAGIC,
+    MICROVM_BLOCK_NOTIFY_PAGE_SIZE, MICROVM_BLOCK_NOTIFY_RING_SIZE, MICROVM_IRQ_INDEX_SOURCE_BLOCK,
+    MMAP_MICROVM_BLOCK_NOTIFY_MAGIC_NUMBER,
 };
-use libc::{MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE, mmap};
+use libc::{mmap, MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE};
 
 use crate::ioctl;
 use crate::microvm::config::BlockDeviceConfig;
@@ -693,12 +694,16 @@ fn drain_queue_available(
     }
 
     if queue.msix_vector != VIRTIO_MSI_NO_VECTOR {
-        ioctl::ioctl_inject_instance_irq(instance_fd, instance_id as u64, queue.msix_vector as u32)
+        let encoded_msix_index = MICROVM_IRQ_INDEX_SOURCE_BLOCK | queue.msix_vector as u32;
+        ioctl::ioctl_inject_instance_irq(instance_fd, instance_id as u64, encoded_msix_index)
             .map_err(|e| ax_err_type!(BadState, format_args!("{}", e)))?;
         if trace_id < BLOCK_TRACE_LIMIT {
             trace!(
-                "microVM block IRQ injected: instance={} msix={} completed={}",
-                instance_id, queue.msix_vector, completed
+                "microVM block IRQ injected: instance={} msix={} encoded_msix={:#x} completed={}",
+                instance_id,
+                queue.msix_vector,
+                encoded_msix_index,
+                completed
             );
         }
     } else {

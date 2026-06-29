@@ -13,10 +13,11 @@ use std::sync::Arc;
 use axerrno::{AxResult, ax_err, ax_err_type};
 use serde::{Deserialize, Serialize};
 
-use crate::microvm::arch::layout::{
-    MMIO32_MEM_SIZE, MMIO32_MEM_START, MMIO64_MEM_SIZE, MMIO64_MEM_START,
-};
+use crate::microvm::arch::layout::{MMIO64_MEM_SIZE, MMIO64_MEM_START};
 use crate::utils::u64_to_usize;
+
+const MICROVM_LOW_RAM_LIMIT: usize = 1 << 30;
+const MICROVM_HIGH_RAM_START: usize = 6 << 30;
 
 pub use vm_memory::bitmap::{AtomicBitmap, BS};
 pub use vm_memory::mmap::MmapRegionBuilder;
@@ -151,17 +152,20 @@ fn arch_memory_regions_with_gap(
 
 /// Returns a Vec of the valid memory addresses.
 /// These should be used to configure the GuestMemoryMmap structure for the platform.
-/// For x86_64 all addresses are valid from the start of the kernel except an 1GB
-/// carve out at the end of 32bit address space and a second 256GB one at the 256GB limit.
+///
+/// EqVisor microVM reserves fixed GPA windows for eqgate and paravirt state:
+/// - 1GiB: EPTP list and HLAT page tables;
+/// - 3GiB..4GiB: PCI/MMIO32, including synthetic virtio-blk and VFIO BARs;
+/// - 4GiB: gate kernel mapping;
+/// - 5GiB: per-instance EqInstanceInfo / EqVCpuContext.
+///
+/// Keep the first 1GiB as boot RAM and place any remaining RAM at 6GiB.
 pub fn arch_memory_regions(size: usize) -> Vec<(GuestAddress, usize)> {
     // If we get here with size == 0 something has seriously gone wrong. Firecracker should never
     // try to allocate guest memory of size 0
     assert!(size > 0, "Attempt to allocate guest memory of length 0");
 
-    let dram_size = std::cmp::min(
-        usize::MAX - u64_to_usize(MMIO32_MEM_SIZE) - u64_to_usize(MMIO64_MEM_SIZE),
-        size,
-    );
+    let dram_size = std::cmp::min(usize::MAX - u64_to_usize(MMIO64_MEM_SIZE), size);
 
     if dram_size != size {
         warn!(
@@ -171,27 +175,24 @@ pub fn arch_memory_regions(size: usize) -> Vec<(GuestAddress, usize)> {
         );
     }
 
-    let mut regions = vec![];
-
-    if let Some((start_past_32bit_gap, remaining_past_32bit_gap)) = arch_memory_regions_with_gap(
-        &mut regions,
-        0,
-        dram_size,
-        u64_to_usize(MMIO32_MEM_START),
-        u64_to_usize(MMIO32_MEM_SIZE),
-    ) && let Some((start_past_64bit_gap, remaining_past_64bit_gap)) =
-        arch_memory_regions_with_gap(
+    let mut regions = Vec::new();
+    if dram_size <= MICROVM_LOW_RAM_LIMIT {
+        regions.push((GuestAddress(0), dram_size));
+    } else {
+        regions.push((GuestAddress(0), MICROVM_LOW_RAM_LIMIT));
+        let high_size = dram_size - MICROVM_LOW_RAM_LIMIT;
+        if let Some((start_past_64bit_gap, remaining_past_64bit_gap)) = arch_memory_regions_with_gap(
             &mut regions,
-            start_past_32bit_gap,
-            remaining_past_32bit_gap,
+            MICROVM_HIGH_RAM_START,
+            high_size,
             u64_to_usize(MMIO64_MEM_START),
             u64_to_usize(MMIO64_MEM_SIZE),
-        )
-    {
-        regions.push((
-            GuestAddress(start_past_64bit_gap as u64),
-            remaining_past_64bit_gap,
-        ));
+        ) {
+            regions.push((
+                GuestAddress(start_past_64bit_gap as u64),
+                remaining_past_64bit_gap,
+            ));
+        }
     }
 
     for (region_start, region_size) in &regions {

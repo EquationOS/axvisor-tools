@@ -768,10 +768,17 @@ fn drain_single_msix_event_and_forward(
                 break;
             }
         }
-        info!(
-            "VFIO MSI-X eventfd residual flush: instance={} msix_index={} reason={} event_cnt={} injected={}",
-            state.instance_id, msix_index, reason, cnt, inject_times
-        );
+        if reason == "software-fallback" {
+            debug!(
+                "VFIO MSI-X eventfd residual flush: instance={} msix_index={} reason={} event_cnt={} injected={}",
+                state.instance_id, msix_index, reason, cnt, inject_times
+            );
+        } else {
+            info!(
+                "VFIO MSI-X eventfd residual flush: instance={} msix_index={} reason={} event_cnt={} injected={}",
+                state.instance_id, msix_index, reason, cnt, inject_times
+            );
+        }
     }
 }
 
