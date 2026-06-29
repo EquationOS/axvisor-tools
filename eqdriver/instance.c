@@ -58,6 +58,7 @@ typedef struct eq_vfio_posted_owner
 #define EQ_IRQ_ROUTE_FLAG_COMMIT_OWNER (1U << 0)
 #define EQ_IRQ_ROUTE_FLAG_SHARED_VMCS_PID (1U << 1)
 #define EQ_IRQ_ROUTE_FLAG_HAS_POSTED_VECTOR (1U << 2)
+#define EQ_IRQ_ROUTE_FLAG_REQUIRES_POSTED_VECTOR (1U << 3)
 #define EQ_MICROVM_BLOCK_FLAG_ENABLED (1ULL << 0)
 #define MICROVM_BLOCK_NOTIFY_VERSION (1U)
 
@@ -266,6 +267,7 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 	uint32_t old_target_vcpu = 0;
 	bool old_owner_linked = false;
 	bool query_shared_pid = false;
+	bool query_requires_posted_vector = false;
 	uint32_t query_posted_vector = 0;
 	bool query_use_posted_vector = false;
 	uint32_t pir_vector = 0;
@@ -327,12 +329,24 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 	old_target_vcpu = route->target_vcpu;
 	old_owner_linked = route->posted_owner_linked;
 	query_shared_pid = (query->flags & EQ_IRQ_ROUTE_FLAG_SHARED_VMCS_PID) != 0;
+	query_requires_posted_vector =
+		(query->flags & EQ_IRQ_ROUTE_FLAG_REQUIRES_POSTED_VECTOR) != 0;
 	query_posted_vector =
 		(query->flags & EQ_IRQ_ROUTE_FLAG_HAS_POSTED_VECTOR) ?
 			(uint32_t)(query->reserved[0] & 0xff) :
 			0;
 	query_use_posted_vector =
-		eq_vfio_use_eqgate_posted_vector && query_posted_vector != 0;
+		(eq_vfio_use_eqgate_posted_vector || query_requires_posted_vector) &&
+		query_posted_vector != 0;
+	if (query_requires_posted_vector && !query_use_posted_vector)
+	{
+		if (route->posted_active)
+			eq_irq_route_deactivate_owned_locked(
+				route, producer_irq, "owner-coded posted vector unavailable");
+		mutex_unlock(&eq_vfio_posted_owners_lock);
+		kfree(query);
+		return 0;
+	}
 
 	if (route->posted_active &&
 		route->target_vcpu == query->target_vcpu &&
@@ -343,6 +357,7 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 		route->posted_shared_pid == query_shared_pid)
 	{
 		if (!query_shared_pid ||
+			query_use_posted_vector ||
 			eq_vfio_posted_owner_is_route_locked(route, query->target_vcpu))
 		{
 			route->logged_not_ready = false;
@@ -351,7 +366,8 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 			return 0;
 		}
 	}
-	if (query->flags & EQ_IRQ_ROUTE_FLAG_SHARED_VMCS_PID)
+	if ((query->flags & EQ_IRQ_ROUTE_FLAG_SHARED_VMCS_PID) &&
+		!query_use_posted_vector)
 	{
 		uint32_t prepared_target_vcpu = query->target_vcpu;
 		ret = eq_vfio_posted_owner_prepare_locked(route, query->target_vcpu);
@@ -379,8 +395,21 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 		(query->flags & EQ_IRQ_ROUTE_FLAG_HAS_POSTED_VECTOR) ?
 			(uint32_t)(query->reserved[0] & 0xff) :
 			0;
+	query_requires_posted_vector =
+		(query->flags & EQ_IRQ_ROUTE_FLAG_REQUIRES_POSTED_VECTOR) != 0;
 	query_use_posted_vector =
-		eq_vfio_use_eqgate_posted_vector && query_posted_vector != 0;
+		(eq_vfio_use_eqgate_posted_vector || query_requires_posted_vector) &&
+		query_posted_vector != 0;
+	if (query_requires_posted_vector && !query_use_posted_vector)
+	{
+		if (route->posted_active)
+			eq_irq_route_deactivate_owned_locked(
+				route, producer_irq, "owner-coded posted vector unavailable");
+		if (owner_lock_held)
+			mutex_unlock(&eq_vfio_posted_owners_lock);
+		kfree(query);
+		return 0;
+	}
 	pir_vector = query_use_posted_vector ? query_posted_vector : query->guest_vector;
 	{
 		struct vcpu_data vcpu_info = {
@@ -416,7 +445,7 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 	route->posted_shared_pid = query_shared_pid;
 	route->posted_vector_hardware = query_use_posted_vector;
 	route->logged_not_ready = false;
-	if (query_shared_pid)
+	if (query_shared_pid && !query_use_posted_vector)
 		eq_vfio_posted_owner_add_route_locked(route, route->target_vcpu);
 	else if (route->posted_owner_linked)
 	{
