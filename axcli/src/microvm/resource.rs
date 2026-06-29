@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::ffi::CStr;
 use std::fs;
 use std::path::PathBuf;
@@ -7,8 +8,8 @@ use axerrno::{AxResult, ax_err, ax_err_type};
 use crate::ioctl;
 use crate::ioctl::EQINSTANCE_DEV_PREFIX;
 use crate::microvm::config::{
-    BootConfig, BootSource, BootSourceConfig, GuestConfig, IovaMode, MachineConfig, PciBdf,
-    parse_iova_mode, parse_pci_bdf,
+    BlockDeviceConfig, BootConfig, BootSource, BootSourceConfig, DEFAULT_KERNEL_CMDLINE,
+    GuestConfig, IovaMode, MachineConfig, PciBdf, parse_iova_mode, parse_pci_bdf,
 };
 use crate::microvm::vstate::memory;
 use crate::microvm::vstate::memory::{GuestAddress, GuestRegionMmap};
@@ -31,6 +32,8 @@ pub struct VmResources {
     pub vfio: Option<VfioResourceConfig>,
     /// GPA of the microVM PV console ring page.
     pub microvm_console_ring_gpa: usize,
+    /// Optional split virtio-blk drives served by axcli.
+    pub block_devices: Vec<BlockDeviceConfig>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -228,6 +231,102 @@ fn read_pci_cfg_space(dev_path: &PathBuf) -> AxResult<(usize, [u8; 256])> {
     Ok((len, cfg))
 }
 
+fn validate_block_devices(
+    drives: Option<Vec<BlockDeviceConfig>>,
+) -> AxResult<Vec<BlockDeviceConfig>> {
+    let drives = drives.unwrap_or_default();
+    let mut root_count = 0usize;
+    let mut drive_ids = BTreeSet::new();
+
+    for drive in &drives {
+        let drive_id = drive.drive_id.trim();
+        if drive_id.is_empty() {
+            return ax_err!(InvalidInput, "drive_id must not be empty");
+        }
+        if !drive_ids.insert(drive_id.to_string()) {
+            return ax_err!(
+                InvalidInput,
+                format_args!("duplicated drive_id '{}'", drive.drive_id)
+            );
+        }
+        if drive.is_root_device {
+            root_count += 1;
+        }
+
+        let metadata = fs::metadata(&drive.path_on_host).map_err(|e| {
+            ax_err_type!(
+                InvalidInput,
+                format_args!(
+                    "Invalid drive path_on_host '{}' for drive '{}': {}",
+                    drive.path_on_host, drive.drive_id, e
+                )
+            )
+        })?;
+        if !metadata.is_file() {
+            return ax_err!(
+                InvalidInput,
+                format_args!(
+                    "drive '{}' path_on_host must be a regular file: {}",
+                    drive.drive_id, drive.path_on_host
+                )
+            );
+        }
+        if let Some(cache_type) = &drive.cache_type {
+            warn!(
+                "drive '{}' cache_type='{}' parsed but not enforced until virtio-blk data path is enabled",
+                drive.drive_id, cache_type
+            );
+        }
+        if let Some(io_engine) = &drive.io_engine {
+            warn!(
+                "drive '{}' io_engine='{}' parsed but not enforced until virtio-blk data path is enabled",
+                drive.drive_id, io_engine
+            );
+        }
+    }
+
+    if root_count > 1 {
+        return ax_err!(InvalidInput, "only one root block drive is supported");
+    }
+
+    Ok(drives)
+}
+
+fn cmdline_has_key(cmdline: &str, key: &str) -> bool {
+    cmdline.split_whitespace().any(|token| {
+        token == key
+            || token
+                .strip_prefix(key)
+                .is_some_and(|rest| rest.starts_with('='))
+    })
+}
+
+fn cmdline_has_token(cmdline: &str, token: &str) -> bool {
+    cmdline.split_whitespace().any(|entry| entry == token)
+}
+
+fn ensure_rootfs_cmdline(boot_source_cfg: &mut BootSourceConfig) {
+    let cmdline = boot_source_cfg
+        .boot_args
+        .get_or_insert_with(|| DEFAULT_KERNEL_CMDLINE.to_string());
+    if cmdline_has_key(cmdline, "root") {
+        info!("root block drive configured, preserving user supplied kernel root= argument");
+        return;
+    }
+
+    if !cmdline.is_empty() && !cmdline.ends_with(' ') {
+        cmdline.push(' ');
+    }
+    cmdline.push_str("root=/dev/vda");
+    if !cmdline_has_token(cmdline, "rw") && !cmdline_has_token(cmdline, "ro") {
+        cmdline.push_str(" rw");
+    }
+    if !cmdline_has_token(cmdline, "rootwait") {
+        cmdline.push_str(" rootwait");
+    }
+    info!("root block drive configured, appended root=/dev/vda rw rootwait");
+}
+
 impl VmResources {
     /// Configures Vmm resources as described by the `config_json` param.
     pub fn from_json(config_json: &str) -> AxResult<Self> {
@@ -246,6 +345,8 @@ impl VmResources {
             init_mem_size_mib: 512,
             max_mem_size_mib: None,
         });
+        let block_devices = validate_block_devices(guest_config.drives)?;
+        let has_root_block_device = block_devices.iter().any(|drive| drive.is_root_device);
 
         let passthrough_devices = match guest_config.passthrough_devices {
             Some(devs) => {
@@ -455,10 +556,15 @@ impl VmResources {
             passthrough_devices,
             vfio,
             microvm_console_ring_gpa: create_result.console_ring_gpa,
+            block_devices,
             ..Default::default()
         };
 
-        resources.build_boot_source(guest_config.boot_source)?;
+        let mut boot_source_cfg = guest_config.boot_source;
+        if has_root_block_device {
+            ensure_rootfs_cmdline(&mut boot_source_cfg);
+        }
+        resources.build_boot_source(boot_source_cfg)?;
 
         Ok(resources)
     }
@@ -495,5 +601,71 @@ impl VmResources {
         let regions =
             memory::arch_memory_regions(mib_to_bytes(self.machine_config.init_mem_size_mib));
         self.allocate_memory_regions(&regions)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block_drive(path: String, root: bool) -> BlockDeviceConfig {
+        BlockDeviceConfig {
+            drive_id: if root { "rootfs" } else { "data" }.to_string(),
+            path_on_host: path,
+            is_root_device: root,
+            is_read_only: false,
+            cache_type: None,
+            io_engine: None,
+        }
+    }
+
+    #[test]
+    fn rootfs_cmdline_appends_default_root_args() {
+        let mut cfg = BootSourceConfig {
+            kernel_image_path: "/tmp/vmlinux".to_string(),
+            initrd_path: None,
+            boot_args: Some("console=hvc0 panic=1".to_string()),
+        };
+
+        ensure_rootfs_cmdline(&mut cfg);
+
+        let cmdline = cfg.boot_args.expect("boot args");
+        assert!(cmdline.contains("root=/dev/vda"));
+        assert!(cmdline.contains(" rw"));
+        assert!(cmdline.contains("rootwait"));
+    }
+
+    #[test]
+    fn rootfs_cmdline_preserves_existing_root_arg() {
+        let mut cfg = BootSourceConfig {
+            kernel_image_path: "/tmp/vmlinux".to_string(),
+            initrd_path: None,
+            boot_args: Some("console=hvc0 root=/dev/vdb ro".to_string()),
+        };
+
+        ensure_rootfs_cmdline(&mut cfg);
+
+        assert_eq!(
+            cfg.boot_args.as_deref(),
+            Some("console=hvc0 root=/dev/vdb ro")
+        );
+    }
+
+    #[test]
+    fn block_device_validation_rejects_multiple_roots() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("eqvisor-axcli-block-test-{}", std::process::id()));
+        std::fs::write(&path, b"").expect("create temp backing file");
+
+        let first = block_drive(path.to_string_lossy().to_string(), true);
+        let second = BlockDeviceConfig {
+            drive_id: "rootfs2".to_string(),
+            ..first.clone()
+        };
+
+        let result = validate_block_devices(Some(vec![first, second]));
+        let _ = std::fs::remove_file(&path);
+
+        assert!(result.is_err());
     }
 }

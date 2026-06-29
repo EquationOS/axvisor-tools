@@ -4,6 +4,7 @@
 #[allow(unused)]
 mod acpi;
 pub mod arch;
+mod block;
 mod cli;
 mod config;
 pub(crate) mod console;
@@ -87,7 +88,9 @@ If devices are still not visible in guest, complete BAR/interrupt mapping is lik
         .allocate_guest_memory()
         .expect("Failed to allocate guest memory");
 
-    let keep_foreground = vm_resources.vfio.is_some() || vm_resources.microvm_console_ring_gpa != 0;
+    let keep_foreground = vm_resources.vfio.is_some()
+        || vm_resources.microvm_console_ring_gpa != 0
+        || !vm_resources.block_devices.is_empty();
     // Build persistent VFIO DMA mappings in current process before guest boot.
     // In daemon mode this process itself keeps VFIO fds/mappings alive.
     setup_vfio_dma_holder(&vm_resources, &guest_memory)?;
@@ -130,6 +133,15 @@ If devices are still not visible in guest, complete BAR/interrupt mapping is lik
     .map_err(|e| ax_err_type!(BadState, format_args!("control socket error {}", e)))?;
 
     vm.register_dram_memory_regions(guest_memory)?;
+    let _block_backend = if !vm_resources.block_devices.is_empty() {
+        Some(block::start_block_backend(
+            vm_resources.vm_id,
+            vm_resources.fd,
+            vm_resources.block_devices.clone(),
+        )?)
+    } else {
+        None
+    };
 
     let entry_point = load_kernel(&boot_config.kernel_file, vm.guest_memory())?;
 

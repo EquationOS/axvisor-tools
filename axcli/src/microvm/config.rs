@@ -53,6 +53,9 @@ impl MachineConfig {
 pub struct GuestConfig {
     pub boot_source: BootSourceConfig,
     pub machine_config: Option<MachineConfig>,
+    /// Optional virtio-blk drives. Field names intentionally match
+    /// Firecracker's JSON shape to keep existing disk-image configs portable.
+    pub drives: Option<Vec<BlockDeviceConfig>>,
     /// Optional host PCI devices to passthrough, identified by BDF.
     /// Supported forms:
     /// - "bb:dd.f"        (e.g. "15:00.0")
@@ -60,6 +63,19 @@ pub struct GuestConfig {
     pub passthrough_devices: Option<Vec<String>>,
     /// Optional VFIO-related passthrough settings.
     pub vfio: Option<VfioConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockDeviceConfig {
+    pub drive_id: String,
+    pub path_on_host: String,
+    #[serde(default)]
+    pub is_root_device: bool,
+    #[serde(default)]
+    pub is_read_only: bool,
+    pub cache_type: Option<String>,
+    pub io_engine: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
