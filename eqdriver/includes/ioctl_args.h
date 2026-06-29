@@ -14,6 +14,7 @@
 #define MMAP_SCF_MAGIC_NUMBER (0x45534346) // "ESCF"
 #define MMAP_PAGE_CACHE_MAGIC_NUMBER (0x45504350) // "EPCP"
 #define MMAP_MICROVM_CONSOLE_MAGIC_NUMBER (0x45564343) // "EVCC"
+#define MMAP_MICROVM_BLOCK_NOTIFY_MAGIC_NUMBER (0x4556424e) // "EVBN"
 #define EQ_MAX_PASSTHROUGH_DEVICES (8)
 #define EQ_MAX_VFIO_BARS (6)
 #define EQ_MAX_PCI_CFG_SPACE_BYTES (256)
@@ -42,6 +43,9 @@ typedef struct eq_create_instance_arg
 	uint64_t vfio_pci_cfg_space_len; // Valid bytes in vfio_pci_cfg_space (<= 256)
 	uint8_t vfio_pci_cfg_space[EQ_MAX_PCI_CFG_SPACE_BYTES];
 	uint64_t microvm_console_ring_gpa;
+	uint64_t microvm_block_flags; // bit0: split virtio-blk backend enabled
+	uint64_t microvm_block_device_count;
+	uint64_t microvm_block_notify_ring_gpa;
 } eq_create_instance_arg_t;
 
 typedef struct eq_remove_instance_arg

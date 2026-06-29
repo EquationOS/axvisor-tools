@@ -9,6 +9,7 @@ pub const EQINSTANCE_DEV_PREFIX: &str = "/dev/eqinstance_";
 pub struct MicroVmCreateResult {
     pub instance_id: usize,
     pub console_ring_gpa: usize,
+    pub block_notify_ring_gpa: usize,
 }
 
 include!(concat!(env!("OUT_DIR"), "/eqioctl.rs"));
@@ -72,6 +73,7 @@ pub fn ioctl_create_microvm(
     max_mem_size_mib: usize,
     passthrough_devices: &[PciBdf],
     vfio: Option<VfioResourceConfig>,
+    block_device_count: usize,
 ) -> Result<MicroVmCreateResult, String> {
     let fd = open_eqmanager_dev()?;
 
@@ -95,6 +97,9 @@ pub fn ioctl_create_microvm(
         vfio_pci_cfg_space_len: 0,
         vfio_pci_cfg_space: [0; 256],
         microvm_console_ring_gpa: 0,
+        microvm_block_flags: 0,
+        microvm_block_device_count: 0,
+        microvm_block_notify_ring_gpa: 0,
     };
 
     if passthrough_devices.len() > arg.passthrough_bdf.len() {
@@ -127,6 +132,11 @@ pub fn ioctl_create_microvm(
         arg.vfio_pci_cfg_space_len = cfg_len as u64;
         arg.vfio_pci_cfg_space[..cfg_len].copy_from_slice(&vfio_cfg.pci_cfg_space[..cfg_len]);
     }
+    if block_device_count > 0 {
+        const MICROVM_BLOCK_FLAG_ENABLED: u64 = 1 << 0;
+        arg.microvm_block_flags |= MICROVM_BLOCK_FLAG_ENABLED;
+        arg.microvm_block_device_count = block_device_count as u64;
+    }
 
     let ret = unsafe { libc::ioctl(fd, EQ_CREATE_INSTANCE as libc::c_ulong, &mut arg as *mut _) };
 
@@ -146,6 +156,7 @@ pub fn ioctl_create_microvm(
     Ok(MicroVmCreateResult {
         instance_id: arg.instance_id as usize,
         console_ring_gpa: arg.microvm_console_ring_gpa as usize,
+        block_notify_ring_gpa: arg.microvm_block_notify_ring_gpa as usize,
     })
 }
 
@@ -172,6 +183,9 @@ pub fn ioctl_create_libos() -> Result<usize, String> {
         vfio_pci_cfg_space_len: 0,
         vfio_pci_cfg_space: [0; 256],
         microvm_console_ring_gpa: 0,
+        microvm_block_flags: 0,
+        microvm_block_device_count: 0,
+        microvm_block_notify_ring_gpa: 0,
     };
 
     let ret = unsafe { libc::ioctl(fd, EQ_CREATE_INSTANCE as libc::c_ulong, &mut arg as *mut _) };

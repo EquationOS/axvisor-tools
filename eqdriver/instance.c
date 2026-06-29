@@ -58,6 +58,8 @@ typedef struct eq_vfio_posted_owner
 #define EQ_IRQ_ROUTE_FLAG_COMMIT_OWNER (1U << 0)
 #define EQ_IRQ_ROUTE_FLAG_SHARED_VMCS_PID (1U << 1)
 #define EQ_IRQ_ROUTE_FLAG_HAS_POSTED_VECTOR (1U << 2)
+#define EQ_MICROVM_BLOCK_FLAG_ENABLED (1ULL << 0)
+#define MICROVM_BLOCK_NOTIFY_VERSION (1U)
 
 static DEFINE_HASHTABLE(eq_vfio_posted_owners, EQ_VFIO_POSTED_OWNER_BITS);
 static DEFINE_MUTEX(eq_vfio_posted_owners_lock);
@@ -66,6 +68,28 @@ module_param(eq_vfio_use_eqgate_posted_vector, bool, 0644);
 MODULE_PARM_DESC(
 	eq_vfio_use_eqgate_posted_vector,
 	"Use hypervisor-provided owner-coded posted vector for VFIO IRQ posting");
+
+typedef struct microvm_block_notify_page_header
+{
+	uint32_t magic;
+	uint32_t version;
+	uint32_t size;
+	uint32_t flags;
+	uint32_t head;
+	uint32_t tail;
+	uint32_t dropped;
+} microvm_block_notify_page_header_t;
+
+static void microvm_block_notify_ring_init(void *page)
+{
+	microvm_block_notify_page_header_t *ring =
+		(microvm_block_notify_page_header_t *)page;
+
+	memset(page, 0, PAGE_SIZE);
+	ring->magic = MMAP_MICROVM_BLOCK_NOTIFY_MAGIC_NUMBER;
+	ring->version = MICROVM_BLOCK_NOTIFY_VERSION;
+	ring->size = PAGE_SIZE;
+}
 
 static void eq_irq_route_deactivate_owned_locked(eq_irq_route_t *route, int producer_irq, const char *reason);
 
@@ -95,6 +119,8 @@ typedef struct eq_instance_vdev
 
 	/// @brief Backing page for the microVM PV console ring.
 	void *microvm_console_ring_virt;
+	/// @brief Backing page for split virtio-blk queue notifications.
+	void *microvm_block_notify_ring_virt;
 	struct list_head irq_routes;
 	struct mutex irq_routes_lock;
 
@@ -875,6 +901,33 @@ static int instance_mmap(struct file *file, struct vm_area_struct *vma)
 				(unsigned long long)virt_to_phys(
 					instance_vdev->microvm_console_ring_virt));
 		}
+		else if (vma->vm_pgoff == MMAP_MICROVM_BLOCK_NOTIFY_MAGIC_NUMBER)
+		{
+			if (!instance_vdev->microvm_block_notify_ring_virt)
+			{
+				ERROR(
+					"MicroVM block notify ring is not allocated for instance %s\n",
+					instance_vdev->name);
+				return -EINVAL;
+			}
+			if (mmap_size > PAGE_SIZE)
+			{
+				ERROR(
+					"MicroVM block notify ring mmap size 0x%lx exceeds one page for instance %s\n",
+					mmap_size, instance_vdev->name);
+				return -EINVAL;
+			}
+			pfn_start =
+				virt_to_phys(instance_vdev->microvm_block_notify_ring_virt) >>
+				PAGE_SHIFT;
+			INFO(
+				"[%s] Instance [%d] MicroVM block notify ring in instance %s, "
+				"va[0x%lx-0x%lx] size 0x%lx map to gpa: 0x%llx\n",
+				__func__, instance_id, instance_vdev->name, vma->vm_start,
+				vma->vm_end, mmap_size,
+				(unsigned long long)virt_to_phys(
+					instance_vdev->microvm_block_notify_ring_virt));
+		}
 		else
 		{
 			mem_size =
@@ -958,6 +1011,7 @@ int create_instance(eq_create_instance_arg_t *arg)
 	eq_instance_metadata_t *instance_metadata;
 	phys_addr_t instance_metadata_ptr_gpa;
 	void *microvm_console_ring_virt = NULL;
+	void *microvm_block_notify_ring_virt = NULL;
 
 	// pid_t pid = task_pid_nr(current);
 	// const char *comm = current->comm;
@@ -1017,6 +1071,24 @@ int create_instance(eq_create_instance_arg_t *arg)
 		}
 		instance_metadata->microvm_console_ring_gpa =
 			virt_to_phys(microvm_console_ring_virt);
+		if (arg->microvm_block_device_count > 0)
+		{
+			instance_metadata->microvm_block_flags =
+				arg->microvm_block_flags | EQ_MICROVM_BLOCK_FLAG_ENABLED;
+			instance_metadata->microvm_block_device_count =
+				arg->microvm_block_device_count;
+			microvm_block_notify_ring_virt = (void *)__get_free_page(
+				GFP_KERNEL | __GFP_ZERO);
+			if (!microvm_block_notify_ring_virt)
+			{
+				ERROR("Failed to allocate MicroVM block notify ring page\n");
+				ret = -ENOMEM;
+				goto err_free;
+			}
+			microvm_block_notify_ring_init(microvm_block_notify_ring_virt);
+			instance_metadata->microvm_block_notify_ring_gpa =
+				virt_to_phys(microvm_block_notify_ring_virt);
+		}
 	}
 
 	instance_metadata_ptr_gpa = virt_to_phys(instance_metadata);
@@ -1104,6 +1176,9 @@ int create_instance(eq_create_instance_arg_t *arg)
 	instance_vdev->status = STATUS_CREATED;
 	instance_vdev->microvm_console_ring_virt = microvm_console_ring_virt;
 	microvm_console_ring_virt = NULL;
+	instance_vdev->microvm_block_notify_ring_virt =
+		microvm_block_notify_ring_virt;
+	microvm_block_notify_ring_virt = NULL;
 	INIT_LIST_HEAD(&instance_vdev->irq_routes);
 	mutex_init(&instance_vdev->irq_routes_lock);
 
@@ -1112,6 +1187,8 @@ int create_instance(eq_create_instance_arg_t *arg)
 		sizeof(eq_instance_metadata_t));
 	arg->microvm_console_ring_gpa =
 		instance_vdev->metadata.microvm_console_ring_gpa;
+	arg->microvm_block_notify_ring_gpa =
+		instance_vdev->metadata.microvm_block_notify_ring_gpa;
 
 	snprintf(
 		instance_vdev->name, sizeof(instance_vdev->name), "%s%d",
@@ -1145,10 +1222,20 @@ err_free:
 		free_page((unsigned long)microvm_console_ring_virt);
 		microvm_console_ring_virt = NULL;
 	}
+	if (microvm_block_notify_ring_virt)
+	{
+		free_page((unsigned long)microvm_block_notify_ring_virt);
+		microvm_block_notify_ring_virt = NULL;
+	}
 	if (ret < 0 && instance_vdev && instance_vdev->microvm_console_ring_virt)
 	{
 		free_page((unsigned long)instance_vdev->microvm_console_ring_virt);
 		instance_vdev->microvm_console_ring_virt = NULL;
+	}
+	if (ret < 0 && instance_vdev && instance_vdev->microvm_block_notify_ring_virt)
+	{
+		free_page((unsigned long)instance_vdev->microvm_block_notify_ring_virt);
+		instance_vdev->microvm_block_notify_ring_virt = NULL;
 	}
 	kfree(instance_metadata);
 
@@ -1206,6 +1293,11 @@ int unregister_instance_dev(eq_instance_vdev_t *vdev)
 	{
 		free_page((unsigned long)vdev->microvm_console_ring_virt);
 		vdev->microvm_console_ring_virt = NULL;
+	}
+	if (vdev->microvm_block_notify_ring_virt)
+	{
+		free_page((unsigned long)vdev->microvm_block_notify_ring_virt);
+		vdev->microvm_block_notify_ring_virt = NULL;
 	}
 	vdev->active = false;
 	INFO(

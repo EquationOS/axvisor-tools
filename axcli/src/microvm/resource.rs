@@ -32,6 +32,8 @@ pub struct VmResources {
     pub vfio: Option<VfioResourceConfig>,
     /// GPA of the microVM PV console ring page.
     pub microvm_console_ring_gpa: usize,
+    /// Host HPA of the split virtio-blk notify ring page.
+    pub microvm_block_notify_ring_gpa: usize,
     /// Optional split virtio-blk drives served by axcli.
     pub block_devices: Vec<BlockDeviceConfig>,
 }
@@ -486,6 +488,7 @@ impl VmResources {
             machine_config.max_mem_size_mib(),
             &passthrough_devices,
             vfio,
+            block_devices.len(),
         )
         .expect("Failed to create instance for dynamic loading");
         let microvm_id = create_result.instance_id;
@@ -556,6 +559,7 @@ impl VmResources {
             passthrough_devices,
             vfio,
             microvm_console_ring_gpa: create_result.console_ring_gpa,
+            microvm_block_notify_ring_gpa: create_result.block_notify_ring_gpa,
             block_devices,
             ..Default::default()
         };

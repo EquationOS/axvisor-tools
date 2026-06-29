@@ -137,6 +137,7 @@ If devices are still not visible in guest, complete BAR/interrupt mapping is lik
         Some(block::start_block_backend(
             vm_resources.vm_id,
             vm_resources.fd,
+            vm_resources.microvm_block_notify_ring_gpa,
             vm_resources.block_devices.clone(),
         )?)
     } else {
