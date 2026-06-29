@@ -74,6 +74,8 @@ pub fn ioctl_create_microvm(
     passthrough_devices: &[PciBdf],
     vfio: Option<VfioResourceConfig>,
     block_device_count: usize,
+    block_flags: u64,
+    block_capacity_sectors: u64,
 ) -> Result<MicroVmCreateResult, String> {
     let fd = open_eqmanager_dev()?;
 
@@ -100,6 +102,7 @@ pub fn ioctl_create_microvm(
         microvm_block_flags: 0,
         microvm_block_device_count: 0,
         microvm_block_notify_ring_gpa: 0,
+        microvm_block_capacity_sectors: 0,
     };
 
     if passthrough_devices.len() > arg.passthrough_bdf.len() {
@@ -133,9 +136,9 @@ pub fn ioctl_create_microvm(
         arg.vfio_pci_cfg_space[..cfg_len].copy_from_slice(&vfio_cfg.pci_cfg_space[..cfg_len]);
     }
     if block_device_count > 0 {
-        const MICROVM_BLOCK_FLAG_ENABLED: u64 = 1 << 0;
-        arg.microvm_block_flags |= MICROVM_BLOCK_FLAG_ENABLED;
+        arg.microvm_block_flags |= block_flags;
         arg.microvm_block_device_count = block_device_count as u64;
+        arg.microvm_block_capacity_sectors = block_capacity_sectors;
     }
 
     let ret = unsafe { libc::ioctl(fd, EQ_CREATE_INSTANCE as libc::c_ulong, &mut arg as *mut _) };
@@ -186,6 +189,7 @@ pub fn ioctl_create_libos() -> Result<usize, String> {
         microvm_block_flags: 0,
         microvm_block_device_count: 0,
         microvm_block_notify_ring_gpa: 0,
+        microvm_block_capacity_sectors: 0,
     };
 
     let ret = unsafe { libc::ioctl(fd, EQ_CREATE_INSTANCE as libc::c_ulong, &mut arg as *mut _) };

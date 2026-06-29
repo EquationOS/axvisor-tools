@@ -1077,6 +1077,8 @@ int create_instance(eq_create_instance_arg_t *arg)
 				arg->microvm_block_flags | EQ_MICROVM_BLOCK_FLAG_ENABLED;
 			instance_metadata->microvm_block_device_count =
 				arg->microvm_block_device_count;
+			instance_metadata->microvm_block_capacity_sectors =
+				arg->microvm_block_capacity_sectors;
 			microvm_block_notify_ring_virt = (void *)__get_free_page(
 				GFP_KERNEL | __GFP_ZERO);
 			if (!microvm_block_notify_ring_virt)

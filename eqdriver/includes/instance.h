@@ -60,6 +60,7 @@ typedef struct eq_instance_metadata
     uint64_t microvm_block_flags;
     uint64_t microvm_block_device_count;
     uint64_t microvm_block_notify_ring_gpa;
+    uint64_t microvm_block_capacity_sectors;
 } eq_instance_metadata_t;
 
 int create_instance(eq_create_instance_arg_t *arg);

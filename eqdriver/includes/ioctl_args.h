@@ -46,6 +46,7 @@ typedef struct eq_create_instance_arg
 	uint64_t microvm_block_flags; // bit0: split virtio-blk backend enabled
 	uint64_t microvm_block_device_count;
 	uint64_t microvm_block_notify_ring_gpa;
+	uint64_t microvm_block_capacity_sectors;
 } eq_create_instance_arg_t;
 
 typedef struct eq_remove_instance_arg

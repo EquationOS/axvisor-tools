@@ -4,6 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use axerrno::{AxResult, ax_err, ax_err_type};
+use eqvm_defs::{MICROVM_BLOCK_FLAG_ENABLED, MICROVM_BLOCK_FLAG_READ_ONLY};
 
 use crate::ioctl;
 use crate::ioctl::EQINSTANCE_DEV_PREFIX;
@@ -237,6 +238,12 @@ fn validate_block_devices(
     drives: Option<Vec<BlockDeviceConfig>>,
 ) -> AxResult<Vec<BlockDeviceConfig>> {
     let drives = drives.unwrap_or_default();
+    if drives.len() > 1 {
+        return ax_err!(
+            InvalidInput,
+            "only one split virtio-blk drive is supported in this stage"
+        );
+    }
     let mut root_count = 0usize;
     let mut drive_ids = BTreeSet::new();
 
@@ -292,6 +299,26 @@ fn validate_block_devices(
     }
 
     Ok(drives)
+}
+
+fn block_metadata(drives: &[BlockDeviceConfig]) -> AxResult<(u64, u64)> {
+    let Some(drive) = drives.first() else {
+        return Ok((0, 0));
+    };
+    let metadata = fs::metadata(&drive.path_on_host).map_err(|e| {
+        ax_err_type!(
+            InvalidInput,
+            format_args!(
+                "Invalid drive path_on_host '{}' for drive '{}': {}",
+                drive.path_on_host, drive.drive_id, e
+            )
+        )
+    })?;
+    let mut flags = MICROVM_BLOCK_FLAG_ENABLED as u64;
+    if drive.is_read_only {
+        flags |= MICROVM_BLOCK_FLAG_READ_ONLY as u64;
+    }
+    Ok((flags, metadata.len() / 512))
 }
 
 fn cmdline_has_key(cmdline: &str, key: &str) -> bool {
@@ -481,6 +508,7 @@ impl VmResources {
         };
 
         // First, create the instance through ioctl, eqdriver will trigger the hvc to create the instance.
+        let (block_flags, block_capacity_sectors) = block_metadata(&block_devices)?;
         let create_result = ioctl::ioctl_create_microvm(
             machine_config.default_vcpu_count(),
             machine_config.max_vcpu_count(),
@@ -489,6 +517,8 @@ impl VmResources {
             &passthrough_devices,
             vfio,
             block_devices.len(),
+            block_flags,
+            block_capacity_sectors,
         )
         .expect("Failed to create instance for dynamic loading");
         let microvm_id = create_result.instance_id;
