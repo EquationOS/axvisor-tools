@@ -280,6 +280,25 @@ fn validate_block_devices(
                 )
             );
         }
+        let image_len = metadata.len();
+        if image_len == 0 {
+            return ax_err!(
+                InvalidInput,
+                format_args!(
+                    "drive '{}' path_on_host must not be empty: {}",
+                    drive.drive_id, drive.path_on_host
+                )
+            );
+        }
+        if image_len % 512 != 0 {
+            return ax_err!(
+                InvalidInput,
+                format_args!(
+                    "drive '{}' path_on_host size must be 512-byte aligned: {} bytes ({})",
+                    drive.drive_id, image_len, drive.path_on_host
+                )
+            );
+        }
         if let Some(cache_type) = &drive.cache_type {
             warn!(
                 "drive '{}' cache_type='{}' parsed but not enforced until virtio-blk data path is enabled",
@@ -299,6 +318,28 @@ fn validate_block_devices(
     }
 
     Ok(drives)
+}
+
+fn validate_machine_config(machine_config: &MachineConfig) -> AxResult {
+    let default_vcpus = machine_config.default_vcpu_count();
+    let max_vcpus = machine_config.max_vcpu_count();
+    if default_vcpus == 0 {
+        return ax_err!(InvalidInput, "default vCPU count must be at least 1");
+    }
+    if max_vcpus == 0 {
+        return ax_err!(InvalidInput, "max vCPU count must be at least 1");
+    }
+    if default_vcpus > max_vcpus {
+        return ax_err!(
+            InvalidInput,
+            format_args!(
+                "default vCPU count {} must not exceed max vCPU count {}",
+                default_vcpus, max_vcpus
+            )
+        );
+    }
+
+    Ok(())
 }
 
 fn block_metadata(drives: &[BlockDeviceConfig]) -> AxResult<(u64, u64)> {
@@ -374,6 +415,7 @@ impl VmResources {
             init_mem_size_mib: 512,
             max_mem_size_mib: None,
         });
+        validate_machine_config(&machine_config)?;
         let block_devices = validate_block_devices(guest_config.drives)?;
         let has_root_block_device = block_devices.iter().any(|drive| drive.is_root_device);
 
@@ -641,6 +683,7 @@ impl VmResources {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn block_drive(path: String, root: bool) -> BlockDeviceConfig {
         BlockDeviceConfig {
@@ -651,6 +694,21 @@ mod tests {
             cache_type: None,
             io_engine: None,
         }
+    }
+
+    fn temp_block_path(name: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos();
+        path.push(format!(
+            "eqvisor-axcli-block-test-{}-{}-{}",
+            name,
+            std::process::id(),
+            suffix
+        ));
+        path
     }
 
     #[test]
@@ -687,9 +745,8 @@ mod tests {
 
     #[test]
     fn block_device_validation_rejects_multiple_roots() {
-        let mut path = std::env::temp_dir();
-        path.push(format!("eqvisor-axcli-block-test-{}", std::process::id()));
-        std::fs::write(&path, b"").expect("create temp backing file");
+        let path = temp_block_path("multiple-roots");
+        std::fs::write(&path, vec![0u8; 512]).expect("create temp backing file");
 
         let first = block_drive(path.to_string_lossy().to_string(), true);
         let second = BlockDeviceConfig {
@@ -701,5 +758,47 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn block_device_validation_rejects_empty_backing_file() {
+        let path = temp_block_path("empty");
+        std::fs::write(&path, b"").expect("create temp backing file");
+
+        let result = validate_block_devices(Some(vec![block_drive(
+            path.to_string_lossy().to_string(),
+            true,
+        )]));
+        let _ = std::fs::remove_file(&path);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn block_device_validation_rejects_unaligned_backing_file() {
+        let path = temp_block_path("unaligned");
+        std::fs::write(&path, vec![0u8; 513]).expect("create temp backing file");
+
+        let result = validate_block_devices(Some(vec![block_drive(
+            path.to_string_lossy().to_string(),
+            true,
+        )]));
+        let _ = std::fs::remove_file(&path);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn machine_config_rejects_default_vcpus_above_max() {
+        let machine_config = MachineConfig {
+            vcpu_count: 2,
+            default_vcpu_num: None,
+            max_vcpu_count: Some(1),
+            max_vcpu_num: None,
+            init_mem_size_mib: 512,
+            max_mem_size_mib: None,
+        };
+
+        assert!(validate_machine_config(&machine_config).is_err());
     }
 }

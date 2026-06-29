@@ -1,17 +1,18 @@
 use std::fs::{File, OpenOptions};
 use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
-use std::sync::atomic::{fence, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering, fence};
 use std::thread;
 use std::time::Duration;
 
-use axerrno::{ax_err, ax_err_type, AxResult};
+use axerrno::{AxResult, ax_err, ax_err_type};
 use eqvm_defs::{
-    MicroVmBlockNotifyEntry, MicroVmBlockNotifyPage, MICROVM_BLOCK_NOTIFY_MAGIC,
-    MICROVM_BLOCK_NOTIFY_PAGE_SIZE, MICROVM_BLOCK_NOTIFY_RING_SIZE, MICROVM_IRQ_INDEX_SOURCE_BLOCK,
-    MMAP_MICROVM_BLOCK_NOTIFY_MAGIC_NUMBER,
+    MICROVM_BLOCK_NOTIFY_MAGIC, MICROVM_BLOCK_NOTIFY_PAGE_SIZE, MICROVM_BLOCK_NOTIFY_RING_SIZE,
+    MICROVM_IRQ_INDEX_SOURCE_BLOCK, MMAP_MICROVM_BLOCK_NOTIFY_MAGIC_NUMBER,
+    MicroVmBlockNotifyEntry, MicroVmBlockNotifyPage,
 };
-use libc::{mmap, MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE};
+use libc::{MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE, mmap};
 
 use crate::ioctl;
 use crate::microvm::config::BlockDeviceConfig;
@@ -213,14 +214,16 @@ pub fn start_block_backend(
                 )
             })?
             .len();
+        let lock_mode = lock_drive_file(instance_id, &drive, &file)?;
         info!(
-            "microVM block drive armed: instance={} drive_id={} path={} root={} readonly={} bytes={}",
+            "microVM block drive armed: instance={} drive_id={} path={} root={} readonly={} bytes={} lock={}",
             instance_id,
             drive.drive_id,
             drive.path_on_host,
             drive.is_root_device,
             drive.is_read_only,
-            file_len
+            file_len,
+            lock_mode
         );
         opened_drives.push(BlockDrive {
             config: drive,
@@ -250,6 +253,33 @@ pub fn start_block_backend(
         })?;
 
     Ok(BlockBackend { _worker: worker })
+}
+
+fn lock_drive_file(
+    instance_id: usize,
+    drive: &BlockDeviceConfig,
+    file: &File,
+) -> AxResult<&'static str> {
+    let (operation, mode) = if drive.is_read_only {
+        (libc::LOCK_SH | libc::LOCK_NB, "shared-readonly")
+    } else {
+        (libc::LOCK_EX | libc::LOCK_NB, "exclusive-writable")
+    };
+    let ret = unsafe { libc::flock(file.as_raw_fd(), operation) };
+    if ret != 0 {
+        return ax_err!(
+            InvalidInput,
+            format_args!(
+                "failed to acquire {} lock for block drive '{}' at '{}' (instance={}): {}; use a separate writable rootfs image per eqLinux instance",
+                mode,
+                drive.drive_id,
+                drive.path_on_host,
+                instance_id,
+                io::Error::last_os_error()
+            )
+        );
+    }
+    Ok(mode)
 }
 
 fn block_backend_loop(
@@ -700,10 +730,7 @@ fn drain_queue_available(
         if trace_id < BLOCK_TRACE_LIMIT {
             trace!(
                 "microVM block IRQ injected: instance={} msix={} encoded_msix={:#x} completed={}",
-                instance_id,
-                queue.msix_vector,
-                encoded_msix_index,
-                completed
+                instance_id, queue.msix_vector, encoded_msix_index, completed
             );
         }
     } else {
@@ -772,4 +799,70 @@ fn handle_queue_notify(
 
     let _ = drain_queue_available(instance_id, instance_fd, mem, drive, queue, "notify")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_block_path(name: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos();
+        path.push(format!(
+            "eqvisor-axcli-block-lock-test-{}-{}-{}",
+            name,
+            std::process::id(),
+            suffix
+        ));
+        path
+    }
+
+    fn block_drive(path: &std::path::Path, readonly: bool) -> BlockDeviceConfig {
+        BlockDeviceConfig {
+            drive_id: "rootfs".to_string(),
+            path_on_host: path.to_string_lossy().to_string(),
+            is_root_device: true,
+            is_read_only: readonly,
+            cache_type: None,
+            io_engine: None,
+        }
+    }
+
+    #[test]
+    fn drive_lock_allows_shared_readonly_openers() {
+        let path = temp_block_path("shared-readonly");
+        std::fs::write(&path, vec![0u8; 512]).expect("create backing file");
+        let first = File::open(&path).expect("open first readonly backing file");
+        let second = File::open(&path).expect("open second readonly backing file");
+        let drive = block_drive(&path, true);
+
+        assert!(lock_drive_file(1, &drive, &first).is_ok());
+        assert!(lock_drive_file(2, &drive, &second).is_ok());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn drive_lock_rejects_second_writable_opener() {
+        let path = temp_block_path("exclusive-writable");
+        std::fs::write(&path, vec![0u8; 512]).expect("create backing file");
+        let first = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open first writable backing file");
+        let second = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open second writable backing file");
+        let drive = block_drive(&path, false);
+
+        assert!(lock_drive_file(1, &drive, &first).is_ok());
+        assert!(lock_drive_file(2, &drive, &second).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
 }
