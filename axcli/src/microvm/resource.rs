@@ -44,6 +44,7 @@ pub struct VfioResourceConfig {
     pub iommu_group: u32,
     pub guest_visible_bdf: PciBdf,
     pub iova_mode: IovaMode,
+    pub physical_release: bool,
     pub bars: [VfioBarInfo; 6],
     /// Snapshot of host PCI config space. This is the authoritative source used
     /// by axvisor for guest probe reads, so we do not depend on host CF8/CFC
@@ -464,6 +465,7 @@ impl VmResources {
                 iommu_group: None,
                 guest_visible_bdf: None,
                 iova_mode: None,
+                physical_release: false,
             })
         } else {
             None
@@ -541,6 +543,7 @@ impl VmResources {
                     iommu_group,
                     guest_visible_bdf,
                     iova_mode,
+                    physical_release: vfio_cfg.physical_release,
                     bars,
                     pci_cfg_space_len,
                     pci_cfg_space,
@@ -562,12 +565,17 @@ impl VmResources {
             block_flags,
             block_capacity_sectors,
         )
-        .expect("Failed to create instance for dynamic loading");
+        .map_err(|e| {
+            ax_err_type!(
+                BadState,
+                format_args!("Failed to create microVM instance: {}", e)
+            )
+        })?;
         let microvm_id = create_result.instance_id;
 
         if let Some(vfio_cfg) = &vfio {
             info!(
-                "VFIO precheck passed: host={} guest-visible={} iommu-group={} iova-mode={:?}",
+                "VFIO precheck passed: host={} guest-visible={} iommu-group={} iova-mode={:?} physical-release={}",
                 passthrough_devices
                     .first()
                     .copied()
@@ -575,7 +583,8 @@ impl VmResources {
                     .unwrap_or_else(|| "n/a".to_string()),
                 vfio_cfg.guest_visible_bdf.format(),
                 vfio_cfg.iommu_group,
-                vfio_cfg.iova_mode
+                vfio_cfg.iova_mode,
+                vfio_cfg.physical_release
             );
             for (i, bar) in vfio_cfg.bars.iter().enumerate() {
                 if bar.size != 0 {

@@ -1,10 +1,20 @@
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock, RwLock};
+use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axerrno::{AxResult, ax_err_type};
+use axerrno::{ax_err_type, AxResult};
+use eqvm_defs::{
+    EqHyperAllocVfioDmaOp, EQ_HYPERALLOC_HUGE_PAGE_SIZE, EQ_HYPERALLOC_VERSION,
+    EQ_HYPERALLOC_VFIO_DMA_OP_MAP, EQ_HYPERALLOC_VFIO_DMA_OP_NONE, EQ_HYPERALLOC_VFIO_DMA_OP_UNMAP,
+    EQ_HYPERALLOC_VFIO_DMA_STATUS_FAILED, EQ_HYPERALLOC_VFIO_DMA_STATUS_NONE,
+    EQ_HYPERALLOC_VFIO_DMA_STATUS_PENDING, EQ_HYPERALLOC_VFIO_DMA_STATUS_SUCCESS,
+    EQ_HYPERALLOC_VFIO_DMA_STATUS_UNSUPPORTED, EQ_MICROVM_GUEST_RAM_MMAP_ZAP_OP_VERSION,
+    EQ_MICROVM_GUEST_RAM_MMAP_ZAP_STATUS_FAILED, EQ_MICROVM_GUEST_RAM_MMAP_ZAP_STATUS_NONE,
+    EQ_MICROVM_GUEST_RAM_MMAP_ZAP_STATUS_PENDING, EQ_MICROVM_GUEST_RAM_MMAP_ZAP_STATUS_SUCCESS,
+    EQ_MICROVM_GUEST_RAM_MMAP_ZAP_STATUS_UNSUPPORTED,
+};
 
 use crate::ioctl;
 use crate::microvm::resource::VmResources;
@@ -31,6 +41,7 @@ const VFIO_DEVICE_GET_REGION_INFO_NR: u32 = 108;
 const VFIO_DEVICE_GET_IRQ_INFO_NR: u32 = 109;
 const VFIO_DEVICE_SET_IRQS_NR: u32 = 110;
 const VFIO_IOMMU_MAP_DMA_NR: u32 = 113;
+const VFIO_IOMMU_UNMAP_DMA_NR: u32 = 114;
 
 const VFIO_GROUP_FLAGS_VIABLE: u32 = 1 << 0;
 const VFIO_TYPE1_IOMMU: i32 = 1;
@@ -53,6 +64,7 @@ const VFIO_PCI_MSIX_IRQ_INDEX: u32 = 2;
 const VFIO_IRQ_SET_DATA_EVENTFD: u32 = 1 << 2;
 const VFIO_IRQ_SET_ACTION_TRIGGER: u32 = 1 << 5;
 const MAX_MSIX_EVENT_FDS: usize = 64;
+const MAX_VFIO_DMA_RAM_REGIONS: usize = 4;
 const PCI_MSIX_TABLE_ENTRY_SIZE: u64 = 16;
 const MLX5_INIT_SEG_CMDQ_ADDR_H_OFF: u64 = 0x10;
 const MLX5_INIT_SEG_CMDQ_ADDR_L_SZ_OFF: u64 = 0x14;
@@ -70,6 +82,15 @@ struct VfioIommuType1DmaMap {
     argsz: u32,
     flags: u32,
     vaddr: u64,
+    iova: u64,
+    size: u64,
+}
+
+#[derive(Debug)]
+#[repr(C)]
+struct VfioIommuType1DmaUnmap {
+    argsz: u32,
+    flags: u32,
     iova: u64,
     size: u64,
 }
@@ -102,6 +123,13 @@ struct VfioIrqSetHeader {
 }
 
 #[derive(Clone, Copy)]
+struct VfioDmaRamRegion {
+    iova_base: u64,
+    vaddr_base: u64,
+    size: u64,
+}
+
+#[derive(Clone, Copy)]
 struct VfioRuntimeState {
     container_fd: i32,
     group_fd: i32,
@@ -121,6 +149,8 @@ struct VfioRuntimeState {
     guest_ram_iova_base: u64,
     guest_ram_vaddr_base: u64,
     guest_ram_size: u64,
+    guest_ram_region_count: usize,
+    guest_ram_regions: [VfioDmaRamRegion; MAX_VFIO_DMA_RAM_REGIONS],
 }
 
 static VFIO_RUNTIME_STATE: OnceLock<VfioRuntimeState> = OnceLock::new();
@@ -132,8 +162,105 @@ static VFIO_MSIX_VECTOR_SHADOW: RwLock<[Option<u8>; MAX_MSIX_EVENT_FDS]> =
 static VFIO_MSIX_POSTED_ROUTE_ACTIVE: RwLock<[bool; MAX_MSIX_EVENT_FDS]> =
     RwLock::new([false; MAX_MSIX_EVENT_FDS]);
 static VFIO_CMDQ_TRACE_WARNED: AtomicBool = AtomicBool::new(false);
+static VFIO_HYPERALLOC_DMA_POLL_WARNED: AtomicBool = AtomicBool::new(false);
+static VFIO_HYPERALLOC_VMA_ZAP_POLL_WARNED: AtomicBool = AtomicBool::new(false);
+static VFIO_HYPERALLOC_DMA_POLL_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
+static VFIO_HYPERALLOC_DMA_POLL_LOCK: Mutex<()> = Mutex::new(());
+static VFIO_HYPERALLOC_VMA_ZAP_POLL_LOCK: Mutex<()> = Mutex::new(());
 static VFIO_ACTIVE_ROUTE_FALLBACK_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static VFIO_MSIX_EVENTFD_READ_BATCHES: AtomicUsize = AtomicUsize::new(0);
+static VFIO_MSIX_EVENTFD_EVENT_TOTAL: AtomicUsize = AtomicUsize::new(0);
+static VFIO_MSIX_EVENTFD_INJECT_TOTAL: AtomicUsize = AtomicUsize::new(0);
+static VFIO_MSIX_EVENTFD_INJECT_FAILURES: AtomicUsize = AtomicUsize::new(0);
+static VFIO_MSIX_EVENTFD_PROGRESS_LAST_MS: AtomicUsize = AtomicUsize::new(0);
 const VFIO_ACTIVE_ROUTE_FALLBACK_TRACE_LIMIT: usize = 64;
+const VFIO_MSIX_EVENTFD_PROGRESS_INTERVAL_MS: usize = 1_000;
+
+fn lock_mlx5_bar0_last() -> Option<MutexGuard<'static, Option<(u32, u32, u32)>>> {
+    VFIO_MLX5_BAR0_LAST
+        .lock()
+        .map_err(|e| warn!("VFIO mlx5 BAR0 trace lock poisoned: {}", e))
+        .ok()
+}
+
+fn lock_cmdq_last_sig() -> Option<MutexGuard<'static, Option<(u64, u32)>>> {
+    VFIO_CMDQ_LAST_SIG
+        .lock()
+        .map_err(|e| warn!("VFIO cmdq trace lock poisoned: {}", e))
+        .ok()
+}
+
+fn write_msix_vector_shadow() -> Option<RwLockWriteGuard<'static, [Option<u8>; MAX_MSIX_EVENT_FDS]>>
+{
+    VFIO_MSIX_VECTOR_SHADOW
+        .write()
+        .map_err(|e| warn!("VFIO MSI-X vector shadow lock poisoned: {}", e))
+        .ok()
+}
+
+fn write_posted_route_active() -> Option<RwLockWriteGuard<'static, [bool; MAX_MSIX_EVENT_FDS]>> {
+    VFIO_MSIX_POSTED_ROUTE_ACTIVE
+        .write()
+        .map_err(|e| warn!("VFIO posted route active lock poisoned: {}", e))
+        .ok()
+}
+
+fn read_posted_route_active() -> Option<RwLockReadGuard<'static, [bool; MAX_MSIX_EVENT_FDS]>> {
+    VFIO_MSIX_POSTED_ROUTE_ACTIVE
+        .read()
+        .map_err(|e| warn!("VFIO posted route active lock poisoned: {}", e))
+        .ok()
+}
+
+fn posted_route_active_count(limit: usize) -> usize {
+    let Some(active) = read_posted_route_active() else {
+        return 0;
+    };
+    active
+        .iter()
+        .take(core::cmp::min(limit, MAX_MSIX_EVENT_FDS))
+        .filter(|enabled| **enabled)
+        .count()
+}
+
+fn current_unix_millis() -> usize {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as usize)
+        .unwrap_or(0)
+}
+
+fn maybe_log_msix_eventfd_progress(
+    state: &VfioRuntimeState,
+    msix_index: usize,
+    reason: &'static str,
+    event_cnt: u64,
+    injected: usize,
+) {
+    let now_ms = current_unix_millis();
+    let last_ms = VFIO_MSIX_EVENTFD_PROGRESS_LAST_MS.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(last_ms) < VFIO_MSIX_EVENTFD_PROGRESS_INTERVAL_MS {
+        return;
+    }
+    if VFIO_MSIX_EVENTFD_PROGRESS_LAST_MS
+        .compare_exchange(last_ms, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    info!(
+        "VFIO MSI-X eventfd progress instance={} reason={} last_msix_index={} last_event_cnt={} last_injected={} read_batches={} event_total={} inject_total={} inject_failures={}",
+        state.instance_id,
+        reason,
+        msix_index,
+        event_cnt,
+        injected,
+        VFIO_MSIX_EVENTFD_READ_BATCHES.load(Ordering::Relaxed),
+        VFIO_MSIX_EVENTFD_EVENT_TOTAL.load(Ordering::Relaxed),
+        VFIO_MSIX_EVENTFD_INJECT_TOTAL.load(Ordering::Relaxed),
+        VFIO_MSIX_EVENTFD_INJECT_FAILURES.load(Ordering::Relaxed)
+    );
+}
 
 const fn ioc(dir: u32, ty: u32, nr: u32, size: usize) -> u64 {
     ((dir as u64) << IOC_DIRSHIFT)
@@ -279,8 +406,8 @@ fn setup_vfio_fds(resources: &VmResources) -> AxResult<(i32, i32, i32)> {
 
 fn map_guest_ram_dma(container_fd: i32, guest_memory: &[GuestRegionMmap]) -> AxResult<()> {
     for (idx, region) in guest_memory.iter().enumerate() {
-        let iova = region.start_addr().raw_value();
-        let size = region.len();
+        let region_iova = region.start_addr().raw_value();
+        let region_size = region.len();
         let host_ptr = region
             .get_host_address(MemoryRegionAddress(0))
             .map_err(|e| {
@@ -289,34 +416,154 @@ fn map_guest_ram_dma(container_fd: i32, guest_memory: &[GuestRegionMmap]) -> AxR
                     format_args!("Failed to get host addr for region {}: {}", idx, e)
                 )
             })?;
-
-        let mut map = VfioIommuType1DmaMap {
-            argsz: core::mem::size_of::<VfioIommuType1DmaMap>() as u32,
-            flags: VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE,
-            vaddr: host_ptr as usize as u64,
-            iova,
-            size,
-        };
-
-        info!("VFIO DMA map region{}: {:#x?}", idx, &map);
-
-        let _ = ioctl_ret(
-            container_fd,
-            io(VFIO_TYPE, VFIO_IOMMU_MAP_DMA_NR),
-            (&mut map as *mut VfioIommuType1DmaMap) as usize,
-            "VFIO_IOMMU_MAP_DMA",
-        )?;
+        let region_vaddr = host_ptr as usize as u64;
+        let chunk_size_limit = EQ_HYPERALLOC_HUGE_PAGE_SIZE;
+        let total_chunks = region_size.saturating_add(chunk_size_limit - 1) / chunk_size_limit;
 
         info!(
-            "VFIO DMA map region{} iova=[{:#x}~{:#x}) vaddr={:#x} size={:#x}",
+            "VFIO DMA map region{} chunked iova=[{:#x}~{:#x}) vaddr={:#x} size={:#x} chunk_size={:#x} chunks={}",
             idx,
-            iova,
-            iova + size,
-            map.vaddr,
-            size
+            region_iova,
+            region_iova.saturating_add(region_size),
+            region_vaddr,
+            region_size,
+            chunk_size_limit,
+            total_chunks
+        );
+
+        let mut mapped = 0u64;
+        let mut chunk_index = 0u64;
+        while mapped < region_size {
+            let chunk_size = core::cmp::min(chunk_size_limit, region_size - mapped);
+            let chunk_iova = region_iova.saturating_add(mapped);
+            let chunk_vaddr = region_vaddr.saturating_add(mapped);
+            let mut map = VfioIommuType1DmaMap {
+                argsz: core::mem::size_of::<VfioIommuType1DmaMap>() as u32,
+                flags: VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE,
+                vaddr: chunk_vaddr,
+                iova: chunk_iova,
+                size: chunk_size,
+            };
+
+            let _ = ioctl_ret(
+                container_fd,
+                io(VFIO_TYPE, VFIO_IOMMU_MAP_DMA_NR),
+                (&mut map as *mut VfioIommuType1DmaMap) as usize,
+                "VFIO_IOMMU_MAP_DMA",
+            )?;
+
+            if chunk_index < 4 || chunk_index + 1 == total_chunks {
+                info!(
+                    "VFIO DMA map region{} chunk{} iova=[{:#x}~{:#x}) vaddr={:#x} size={:#x}",
+                    idx,
+                    chunk_index,
+                    chunk_iova,
+                    chunk_iova.saturating_add(chunk_size),
+                    chunk_vaddr,
+                    chunk_size
+                );
+            } else if chunk_index == 4 {
+                info!(
+                    "VFIO DMA map region{} suppressing middle chunk logs until final chunk",
+                    idx
+                );
+            }
+
+            mapped = mapped.saturating_add(chunk_size);
+            chunk_index = chunk_index.saturating_add(1);
+        }
+
+        info!(
+            "VFIO DMA map region{} complete iova=[{:#x}~{:#x}) vaddr={:#x} size={:#x} chunks={}",
+            idx,
+            region_iova,
+            region_iova.saturating_add(region_size),
+            region_vaddr,
+            region_size,
+            chunk_index
         );
     }
     Ok(())
+}
+
+fn vfio_dma_map_one(container_fd: i32, iova: u64, vaddr: u64, size: u64) -> AxResult<()> {
+    let mut map = VfioIommuType1DmaMap {
+        argsz: core::mem::size_of::<VfioIommuType1DmaMap>() as u32,
+        flags: VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE,
+        vaddr,
+        iova,
+        size,
+    };
+
+    let _ = ioctl_ret(
+        container_fd,
+        io(VFIO_TYPE, VFIO_IOMMU_MAP_DMA_NR),
+        (&mut map as *mut VfioIommuType1DmaMap) as usize,
+        "VFIO_IOMMU_MAP_DMA(dynamic)",
+    )?;
+    info!(
+        "VFIO dynamic DMA map iova=[{:#x}~{:#x}) vaddr={:#x} size={:#x}",
+        iova,
+        iova.saturating_add(size),
+        vaddr,
+        size
+    );
+    Ok(())
+}
+
+fn vfio_dma_unmap_one(container_fd: i32, iova: u64, size: u64) -> AxResult<u64> {
+    let mut unmap = VfioIommuType1DmaUnmap {
+        argsz: core::mem::size_of::<VfioIommuType1DmaUnmap>() as u32,
+        flags: 0,
+        iova,
+        size,
+    };
+
+    let _ = ioctl_ret(
+        container_fd,
+        io(VFIO_TYPE, VFIO_IOMMU_UNMAP_DMA_NR),
+        (&mut unmap as *mut VfioIommuType1DmaUnmap) as usize,
+        "VFIO_IOMMU_UNMAP_DMA(dynamic)",
+    )?;
+    if unmap.size != size {
+        warn!(
+            "VFIO dynamic DMA unmap incomplete iova=[{:#x}~{:#x}) requested={:#x} unmapped={:#x}",
+            iova,
+            iova.saturating_add(size),
+            size,
+            unmap.size
+        );
+        return Err(ax_err_type!(
+            InvalidInput,
+            format_args!(
+                "VFIO dynamic DMA unmap incomplete: requested={:#x} unmapped={:#x}",
+                size, unmap.size
+            )
+        ));
+    }
+    info!(
+        "VFIO dynamic DMA unmap iova=[{:#x}~{:#x}) requested={:#x} unmapped={:#x}",
+        iova,
+        iova.saturating_add(size),
+        size,
+        unmap.size
+    );
+    Ok(unmap.size)
+}
+
+fn vfio_guest_iova_to_vaddr(state: &VfioRuntimeState, iova: u64, size: u64) -> Option<u64> {
+    let req_end = iova.checked_add(size)?;
+    for region in state
+        .guest_ram_regions
+        .iter()
+        .take(state.guest_ram_region_count)
+    {
+        let region_end = region.iova_base.checked_add(region.size)?;
+        if iova >= region.iova_base && req_end <= region_end {
+            return Some(region.vaddr_base + (iova - region.iova_base));
+        }
+    }
+    None
 }
 
 fn read_cfg_u16(device_fd: i32, cfg_base: u64, reg_off: u64) -> AxResult<u16> {
@@ -454,7 +701,9 @@ fn trace_mlx5_initseg_bar0(state: &VfioRuntimeState, reason: &str, force: bool) 
     let cmd_dbell = read_region_u32_be(state.device_fd, bar0, MLX5_INIT_SEG_CMD_DBELL_OFF)?;
     let nic_ifc = (cmdq_l_sz >> 8) & 0x7;
 
-    let mut last = VFIO_MLX5_BAR0_LAST.lock().unwrap();
+    let Some(mut last) = lock_mlx5_bar0_last() else {
+        return Ok(());
+    };
     let cur = (cmdq_h, cmdq_l_sz, cmd_dbell);
     let changed = last.map(|v| v != cur).unwrap_or(true);
     if force || changed {
@@ -496,7 +745,9 @@ fn trace_mlx5_cmdq_activity(state: &VfioRuntimeState, reason: &str, force: bool)
     }
     let head = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
 
-    let mut last = VFIO_CMDQ_LAST_SIG.lock().unwrap();
+    let Some(mut last) = lock_cmdq_last_sig() else {
+        return Ok(());
+    };
     let cur = (sig, head);
     let changed = last.map(|v| v != cur).unwrap_or(true);
     if force || changed {
@@ -621,7 +872,9 @@ fn sample_msix_table_vectors(state: &VfioRuntimeState, _force: bool) -> AxResult
         state.msix_table_size,
         core::cmp::min(state.msix_event_count, MAX_MSIX_EVENT_FDS),
     );
-    let mut shadow = VFIO_MSIX_VECTOR_SHADOW.write().unwrap();
+    let Some(mut shadow) = write_msix_vector_shadow() else {
+        return Ok(());
+    };
     let mut changed = 0usize;
     let mut unmasked_nonzero = 0usize;
     for idx in 0..count {
@@ -659,6 +912,43 @@ fn sample_msix_table_vectors(state: &VfioRuntimeState, _force: bool) -> AxResult
             count, changed, unmasked_nonzero
         );
     }
+    Ok(())
+}
+
+fn log_vfio_runtime_snapshot(state: &VfioRuntimeState, reason: &str) -> AxResult<()> {
+    let command = read_cfg_u16(state.device_fd, state.cfg_region_offset, PCI_COMMAND_REG_OFFSET)?;
+    let msix_ctrl = match state.msix_ctrl_off {
+        Some(off) => Some(read_cfg_u16(state.device_fd, state.cfg_region_offset, off)?),
+        None => None,
+    };
+    let msix_enabled = msix_ctrl
+        .map(|ctrl| (ctrl & PCI_MSIX_FLAGS_ENABLE) != 0)
+        .unwrap_or(false);
+    let msix_mask_all = msix_ctrl
+        .map(|ctrl| (ctrl & PCI_MSIX_FLAGS_MASKALL) != 0)
+        .unwrap_or(false);
+    info!(
+        "VFIO runtime snapshot ({}) instance={} command={:#06x} memory={} bus_master={} msix_ctrl={:?} msix_enabled={} msix_mask_all={} msix_events={} posted_active={} eventfd_batches={} event_total={} inject_total={} inject_failures={} table_bir={:?} table_off={:#x} table_size={}",
+        reason,
+        state.instance_id,
+        command,
+        (command & PCI_COMMAND_MEMORY) != 0,
+        (command & PCI_COMMAND_BUS_MASTER) != 0,
+        msix_ctrl,
+        msix_enabled,
+        msix_mask_all,
+        state.msix_event_count,
+        posted_route_active_count(state.msix_event_count),
+        VFIO_MSIX_EVENTFD_READ_BATCHES.load(Ordering::Relaxed),
+        VFIO_MSIX_EVENTFD_EVENT_TOTAL.load(Ordering::Relaxed),
+        VFIO_MSIX_EVENTFD_INJECT_TOTAL.load(Ordering::Relaxed),
+        VFIO_MSIX_EVENTFD_INJECT_FAILURES.load(Ordering::Relaxed),
+        state.msix_table_bir,
+        state.msix_table_offset,
+        state.msix_table_size
+    );
+    sample_msix_table_vectors(state, true)?;
+    trace_mlx5_initseg_bar0(state, reason, true)?;
     Ok(())
 }
 
@@ -710,11 +1000,215 @@ fn refresh_posted_irq_routes(state: &VfioRuntimeState, include_active: bool) {
         return;
     }
     log_posted_route_drain_mode_once();
-    let mut active = VFIO_MSIX_POSTED_ROUTE_ACTIVE.write().unwrap();
+    let Some(mut active) = write_posted_route_active() else {
+        return;
+    };
     for msix_index in 0..state.msix_event_count {
         if !active[msix_index] || include_active {
             refresh_posted_irq_route_locked(state, msix_index, &mut active);
         }
+    }
+}
+
+fn complete_hyperalloc_vfio_dma(state: &VfioRuntimeState, op: &mut EqHyperAllocVfioDmaOp) {
+    if let Err(e) = ioctl::ioctl_hyperalloc_vfio_dma_complete(state.instance_fd, op) {
+        warn!(
+            "HyperAlloc VFIO DMA complete failed: instance={} seq={} op={} status={} err={}",
+            state.instance_id, op.sequence, op.op, op.status, e
+        );
+    }
+}
+
+fn complete_hyperalloc_vma_zap(
+    state: &VfioRuntimeState,
+    op: &mut eqvm_defs::EqMicroVmGuestRamMmapZapOp,
+) {
+    if let Err(e) = ioctl::ioctl_microvm_guest_ram_mmap_zap_complete(state.instance_fd, op) {
+        warn!(
+            "HyperAlloc guest RAM mmap zap complete failed: instance={} seq={} status={} err={}",
+            state.instance_id, op.sequence, op.status, e
+        );
+    }
+}
+
+fn poll_hyperalloc_vfio_dma(state: &VfioRuntimeState) {
+    let Ok(_poll_guard) = VFIO_HYPERALLOC_DMA_POLL_LOCK.try_lock() else {
+        return;
+    };
+    let mut op =
+        match ioctl::ioctl_hyperalloc_vfio_dma_poll(state.instance_fd, state.instance_id as u64) {
+            Ok(op) => op,
+            Err(e) => {
+                if !VFIO_HYPERALLOC_DMA_POLL_WARNED.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        "HyperAlloc VFIO DMA poll failed: instance={} err={}",
+                        state.instance_id, e
+                    );
+                }
+                return;
+            }
+        };
+
+    if op.status == EQ_HYPERALLOC_VFIO_DMA_STATUS_NONE || op.op == EQ_HYPERALLOC_VFIO_DMA_OP_NONE {
+        return;
+    }
+    if op.version != EQ_HYPERALLOC_VERSION {
+        warn!(
+            "HyperAlloc VFIO DMA op version mismatch: got={} expected={}",
+            op.version, EQ_HYPERALLOC_VERSION
+        );
+        op.status = EQ_HYPERALLOC_VFIO_DMA_STATUS_UNSUPPORTED;
+        op.result_errno = libc::EINVAL;
+        complete_hyperalloc_vfio_dma(state, &mut op);
+        return;
+    }
+    if op.status != EQ_HYPERALLOC_VFIO_DMA_STATUS_PENDING {
+        warn!(
+            "HyperAlloc VFIO DMA op has non-pending status: instance={} seq={} op={} status={}",
+            state.instance_id, op.sequence, op.op, op.status
+        );
+        return;
+    }
+
+    let size = if op.size == 0 {
+        EQ_HYPERALLOC_HUGE_PAGE_SIZE
+    } else {
+        op.size
+    };
+    let result = match op.op {
+        EQ_HYPERALLOC_VFIO_DMA_OP_UNMAP => {
+            vfio_dma_unmap_one(state.container_fd, op.iova, size).map(|_| ())
+        }
+        EQ_HYPERALLOC_VFIO_DMA_OP_MAP => {
+            if let Some(vaddr) = vfio_guest_iova_to_vaddr(state, op.iova, size) {
+                vfio_dma_map_one(state.container_fd, op.iova, vaddr, size)
+            } else {
+                Err(ax_err_type!(
+                    InvalidInput,
+                    format_args!(
+                        "HyperAlloc VFIO DMA map iova range is outside guest RAM: iova={:#x} size={:#x}",
+                        op.iova, size
+                    )
+                ))
+            }
+        }
+        _ => {
+            op.status = EQ_HYPERALLOC_VFIO_DMA_STATUS_UNSUPPORTED;
+            op.result_errno = libc::EINVAL;
+            complete_hyperalloc_vfio_dma(state, &mut op);
+            return;
+        }
+    };
+
+    match result {
+        Ok(()) => {
+            op.status = EQ_HYPERALLOC_VFIO_DMA_STATUS_SUCCESS;
+            op.result_errno = 0;
+        }
+        Err(e) => {
+            warn!(
+                "HyperAlloc VFIO DMA op failed: instance={} seq={} op={} iova={:#x} size={:#x} err={:?}",
+                state.instance_id, op.sequence, op.op, op.iova, size, e
+            );
+            op.status = EQ_HYPERALLOC_VFIO_DMA_STATUS_FAILED;
+            op.result_errno = libc::EIO;
+        }
+    }
+    op.size = size;
+    complete_hyperalloc_vfio_dma(state, &mut op);
+}
+
+fn poll_hyperalloc_vma_zap(state: &VfioRuntimeState) {
+    let Ok(_poll_guard) = VFIO_HYPERALLOC_VMA_ZAP_POLL_LOCK.try_lock() else {
+        return;
+    };
+    let mut op = match ioctl::ioctl_microvm_guest_ram_mmap_zap_poll(
+        state.instance_fd,
+        state.instance_id as u64,
+    ) {
+        Ok(op) => op,
+        Err(e) => {
+            if !VFIO_HYPERALLOC_VMA_ZAP_POLL_WARNED.swap(true, Ordering::Relaxed) {
+                warn!(
+                    "HyperAlloc guest RAM mmap zap poll failed: instance={} err={}",
+                    state.instance_id, e
+                );
+            }
+            return;
+        }
+    };
+
+    if op.status == EQ_MICROVM_GUEST_RAM_MMAP_ZAP_STATUS_NONE {
+        return;
+    }
+    if op.version != EQ_MICROVM_GUEST_RAM_MMAP_ZAP_OP_VERSION {
+        warn!(
+            "HyperAlloc guest RAM mmap zap op version mismatch: got={} expected={}",
+            op.version, EQ_MICROVM_GUEST_RAM_MMAP_ZAP_OP_VERSION
+        );
+        op.status = EQ_MICROVM_GUEST_RAM_MMAP_ZAP_STATUS_UNSUPPORTED;
+        op.result_errno = libc::EINVAL;
+        complete_hyperalloc_vma_zap(state, &mut op);
+        return;
+    }
+    if op.status != EQ_MICROVM_GUEST_RAM_MMAP_ZAP_STATUS_PENDING {
+        warn!(
+            "HyperAlloc guest RAM mmap zap op has non-pending status: instance={} seq={} status={}",
+            state.instance_id, op.sequence, op.status
+        );
+        return;
+    }
+
+    match ioctl::ioctl_microvm_guest_ram_mmap_zap(
+        state.instance_fd,
+        state.instance_id as u64,
+        op.gpa,
+        op.len,
+    ) {
+        Ok(result) => {
+            op.status = EQ_MICROVM_GUEST_RAM_MMAP_ZAP_STATUS_SUCCESS;
+            op.zapped_vmas = result.zapped_vmas;
+            op.zapped_bytes = result.zapped_bytes;
+            op.result_errno = 0;
+            info!(
+                "HyperAlloc guest RAM mmap zap op completed: instance={} seq={} gpa={:#x} len={:#x} zapped_vmas={} zapped_bytes={:#x}",
+                state.instance_id,
+                op.sequence,
+                op.gpa,
+                op.len,
+                op.zapped_vmas,
+                op.zapped_bytes
+            );
+        }
+        Err(e) => {
+            warn!(
+                "HyperAlloc guest RAM mmap zap op failed: instance={} seq={} gpa={:#x} len={:#x} err={}",
+                state.instance_id, op.sequence, op.gpa, op.len, e
+            );
+            op.status = EQ_MICROVM_GUEST_RAM_MMAP_ZAP_STATUS_FAILED;
+            op.result_errno = libc::EIO;
+        }
+    }
+
+    complete_hyperalloc_vma_zap(state, &mut op);
+}
+
+fn start_hyperalloc_dma_poll_worker() {
+    if VFIO_HYPERALLOC_DMA_POLL_WORKER_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    match thread::Builder::new()
+        .name("vfio-hyperalloc-dma-poll".to_string())
+        .spawn(|| loop {
+            if let Some(state) = VFIO_RUNTIME_STATE.get() {
+                poll_hyperalloc_vfio_dma(state);
+                poll_hyperalloc_vma_zap(state);
+            }
+            thread::sleep(Duration::from_millis(20));
+        }) {
+        Ok(_) => info!("VFIO HyperAlloc DMA poll worker started"),
+        Err(e) => warn!("Failed to start VFIO HyperAlloc DMA poll worker: {}", e),
     }
 }
 
@@ -755,28 +1249,39 @@ fn drain_single_msix_event_and_forward(
         }
 
         let inject_times = core::cmp::min(cnt as usize, 128);
+        VFIO_MSIX_EVENTFD_READ_BATCHES.fetch_add(1, Ordering::Relaxed);
+        VFIO_MSIX_EVENTFD_EVENT_TOTAL.fetch_add(cnt as usize, Ordering::Relaxed);
+        let mut injected = 0usize;
         for _ in 0..inject_times {
-            if let Err(e) = ioctl::ioctl_inject_instance_irq(
+            match ioctl::ioctl_inject_instance_irq(
                 state.instance_fd,
                 state.instance_id as u64,
                 msix_index as u32,
             ) {
-                warn!(
-                    "Forward VFIO MSI-X to EqVisor failed: instance={} msix_index={} reason={} err={}",
-                    state.instance_id, msix_index, reason, e
-                );
-                break;
+                Ok(()) => {
+                    injected += 1;
+                }
+                Err(e) => {
+                    VFIO_MSIX_EVENTFD_INJECT_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "Forward VFIO MSI-X to EqVisor failed: instance={} msix_index={} reason={} err={}",
+                        state.instance_id, msix_index, reason, e
+                    );
+                    break;
+                }
             }
         }
+        VFIO_MSIX_EVENTFD_INJECT_TOTAL.fetch_add(injected, Ordering::Relaxed);
+        maybe_log_msix_eventfd_progress(state, msix_index, reason, cnt, injected);
         if reason == "software-fallback" {
             debug!(
                 "VFIO MSI-X eventfd residual flush: instance={} msix_index={} reason={} event_cnt={} injected={}",
-                state.instance_id, msix_index, reason, cnt, inject_times
+                state.instance_id, msix_index, reason, cnt, injected
             );
         } else {
             info!(
                 "VFIO MSI-X eventfd residual flush: instance={} msix_index={} reason={} event_cnt={} injected={}",
-                state.instance_id, msix_index, reason, cnt, inject_times
+                state.instance_id, msix_index, reason, cnt, injected
             );
         }
     }
@@ -931,7 +1436,14 @@ fn setup_vfio_msix_eventfds(
             i as u32,
         ) {
             Ok(active) => {
-                VFIO_MSIX_POSTED_ROUTE_ACTIVE.write().unwrap()[i] = active;
+                if let Some(mut route_active) = write_posted_route_active() {
+                    route_active[i] = active;
+                } else {
+                    warn!(
+                        "VFIO MSI-X route {} active-state update skipped after registration",
+                        i
+                    );
+                }
                 if active {
                     info!(
                         "VFIO MSI-X route {} registered as posted-interrupt offload",
@@ -961,7 +1473,9 @@ fn drain_msix_event_and_forward(state: &VfioRuntimeState) {
         return;
     }
     log_posted_route_drain_mode_once();
-    let mut active = VFIO_MSIX_POSTED_ROUTE_ACTIVE.write().unwrap();
+    let Some(mut active) = write_posted_route_active() else {
+        return;
+    };
     for msix_index in 0..state.msix_event_count {
         let fd = state.msix_event_fds[msix_index];
         if fd < 0 {
@@ -1039,7 +1553,44 @@ pub fn setup_vfio_dma_holder(
         guest_ram_iova_base: 0,
         guest_ram_vaddr_base: 0,
         guest_ram_size: 0,
+        guest_ram_region_count: 0,
+        guest_ram_regions: [VfioDmaRamRegion {
+            iova_base: 0,
+            vaddr_base: 0,
+            size: 0,
+        }; MAX_VFIO_DMA_RAM_REGIONS],
     };
+    for (idx, region) in guest_memory
+        .iter()
+        .take(MAX_VFIO_DMA_RAM_REGIONS)
+        .enumerate()
+    {
+        let host_ptr = region
+            .get_host_address(MemoryRegionAddress(0))
+            .map_err(|e| {
+                ax_err_type!(
+                    InvalidInput,
+                    format_args!("Failed to record VFIO guest RAM region {}: {}", idx, e)
+                )
+            })?;
+        state.guest_ram_regions[idx] = VfioDmaRamRegion {
+            iova_base: region.start_addr().raw_value(),
+            vaddr_base: host_ptr as usize as u64,
+            size: region.len(),
+        };
+        state.guest_ram_region_count += 1;
+    }
+    if guest_memory.len() > MAX_VFIO_DMA_RAM_REGIONS {
+        warn!(
+            "VFIO dynamic DMA records only first {} guest RAM regions out of {}",
+            MAX_VFIO_DMA_RAM_REGIONS,
+            guest_memory.len()
+        );
+    }
+    info!(
+        "VFIO dynamic DMA helper records {} guest RAM regions",
+        state.guest_ram_region_count
+    );
     if let Some(region0) = guest_memory.first() {
         let host_ptr = region0
             .get_host_address(MemoryRegionAddress(0))
@@ -1083,7 +1634,8 @@ pub fn setup_vfio_dma_holder(
         if let Some(msix_cap_off) =
             find_capability_in_snapshot(&vfio_cfg.pci_cfg_space, cfg_len, PCI_CAP_ID_MSIX)
         {
-            state.msix_ctrl_off = Some((msix_cap_off as u64) + PCI_MSIX_FLAGS_OFFSET_IN_CAP);
+            let msix_ctrl_off = (msix_cap_off as u64) + PCI_MSIX_FLAGS_OFFSET_IN_CAP;
+            state.msix_ctrl_off = Some(msix_ctrl_off);
             if let (Some(ctrl), Some(table)) = (
                 read_snapshot_u16(&vfio_cfg.pci_cfg_space, msix_cap_off + 2),
                 read_snapshot_u32(&vfio_cfg.pci_cfg_space, msix_cap_off + 4),
@@ -1095,7 +1647,7 @@ pub fn setup_vfio_dma_holder(
             info!(
                 "VFIO MSI-X metadata from snapshot: cap={:#x} ctrl_off={:#x} table_bir={:?} table_off={:#x} table_size={}",
                 msix_cap_off,
-                state.msix_ctrl_off.unwrap(),
+                msix_ctrl_off,
                 state.msix_table_bir,
                 state.msix_table_offset,
                 state.msix_table_size
@@ -1123,7 +1675,22 @@ pub fn setup_vfio_dma_holder(
             "VFIO cmdq RAM trace is disabled by default (set AXCLI_VFIO_TRACE_CMDQ_RAM=1 to enable, risky after HMicroVMBoot unmap)"
         );
     }
+    match ioctl::ioctl_microvm_guest_ram_mmap_state(resources.fd, resources.vm_id as u64) {
+        Ok(state) => info!(
+            "MicroVM guest RAM mmap query after VFIO setup: instance={} generation={} current_mmaps={} stale_mmaps={} active_mmaps={}",
+            resources.vm_id,
+            state.generation,
+            state.current_mmaps,
+            state.stale_mmaps,
+            state.active_mmaps
+        ),
+        Err(e) => warn!(
+            "MicroVM guest RAM mmap query after VFIO setup failed: instance={} err={}",
+            resources.vm_id, e
+        ),
+    }
     let _ = VFIO_RUNTIME_STATE.set(state);
+    start_hyperalloc_dma_poll_worker();
     info!(
         "VFIO DMA holder armed in current process (container_fd={} group_fd={} device_fd={})",
         container_fd, group_fd, device_fd
@@ -1138,10 +1705,16 @@ pub fn run_foreground_daemon_loop() -> ! {
     let mut last_cmdq_trace = Instant::now() - Duration::from_secs(1);
     let mut last_route_refresh = Instant::now() - Duration::from_secs(1);
     let mut last_full_route_refresh = Instant::now() - Duration::from_secs(1);
+    let mut last_hyperalloc_dma_poll = Instant::now() - Duration::from_millis(100);
+    let mut last_runtime_snapshot = Instant::now() - Duration::from_secs(1);
     let route_refresh_start = Instant::now();
     loop {
         crate::microvm::console::poll_console_once();
         crate::microvm::control::poll_control_once();
+        crate::microvm::control::poll_policy_once();
+        crate::microvm::control::poll_metrics_once();
+        crate::microvm::control::poll_policy_eval_once();
+        crate::microvm::control::poll_scheduler_once();
         if let Some(state) = VFIO_RUNTIME_STATE.get() {
             if last_bar0_trace.elapsed() >= Duration::from_millis(100) {
                 if let Err(e) = sample_msix_table_vectors(state, false) {
@@ -1165,6 +1738,16 @@ pub fn run_foreground_daemon_loop() -> ! {
                     last_full_route_refresh = Instant::now();
                 }
                 last_route_refresh = Instant::now();
+            }
+            if last_hyperalloc_dma_poll.elapsed() >= Duration::from_millis(100) {
+                poll_hyperalloc_vfio_dma(state);
+                last_hyperalloc_dma_poll = Instant::now();
+            }
+            if last_runtime_snapshot.elapsed() >= Duration::from_secs(1) {
+                if let Err(e) = log_vfio_runtime_snapshot(state, "poll") {
+                    warn!("VFIO runtime snapshot failed: {:?}", e);
+                }
+                last_runtime_snapshot = Instant::now();
             }
             drain_msix_event_and_forward(state);
             if cmdq_ram_trace_enabled() && last_cmdq_trace.elapsed() >= Duration::from_millis(100) {

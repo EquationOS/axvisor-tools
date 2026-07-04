@@ -89,6 +89,7 @@ pub fn hvc_daemon_shmat(
 }
 
 #[cfg(feature = "microvm")]
+#[allow(dead_code)]
 pub fn hvc_microvm_boot(instance_id: u64, entry_point: u64, boot_protocol: u8) -> isize {
     info!("[*] Booting microVM instance ID: {}", instance_id);
 
@@ -101,4 +102,18 @@ pub fn hvc_microvm_boot(instance_id: u64, entry_point: u64, boot_protocol: u8) -
         0,
         0,
     )
+}
+
+#[cfg(feature = "microvm")]
+pub fn hvc_microvm_remove(instance_id: u64) -> isize {
+    info!("[*] Removing microVM instance ID: {}", instance_id);
+
+    trigger_hypercall(HyperCallCode::HMicroVMRemove, instance_id, 0, 0, 0, 0, 0)
+}
+
+#[cfg(feature = "microvm")]
+pub fn hvc_microvm_stop(instance_id: u64) -> isize {
+    info!("[*] Stopping microVM instance ID: {}", instance_id);
+
+    trigger_hypercall(HyperCallCode::HMicroVMStop, instance_id, 0, 0, 0, 0, 0)
 }

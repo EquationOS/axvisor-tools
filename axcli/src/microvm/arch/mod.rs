@@ -57,6 +57,10 @@ pub enum ConfigurationError {
     KernelLoader(linux_loader::loader::Error),
     /// Cannot load command line string: {0}
     LoadCommandline(linux_loader::loader::Error),
+    /// Cannot create kernel command line C string: {0}
+    CommandLineCString(String),
+    /// Invalid Linux boot parameter value: {0}
+    BootParamValue(&'static str),
     // /// Failed to create guest config: {0}
     // CreateGuestConfig(#[from] GuestConfigError),
     /// Error configuring the vcpu for boot
@@ -96,15 +100,14 @@ pub fn configure_system_for_boot(
 
     // Write the kernel command line to guest memory. This is x86_64 specific, since on
     // aarch64 the command line will be specified through the FDT.
-    let cmdline_size = boot_cmdline
+    let cmdline_cstring = boot_cmdline
         .as_cstring()
-        .map(|cmdline_cstring| cmdline_cstring.as_bytes_with_nul().len())
-        .expect("Cannot create cstring from cmdline string");
+        .map_err(|err| ConfigurationError::CommandLineCString(format!("{:?}", err)))?;
+    let cmdline_size = cmdline_cstring.as_bytes_with_nul().len();
 
     warn!(
         "[LOG] Kernel cmdline size {:#x} Bytes, cmdline: {:?}",
-        cmdline_size,
-        boot_cmdline.as_cstring().expect("Failed to parse cmdline")
+        cmdline_size, cmdline_cstring
     );
 
     load_cmdline(
@@ -178,12 +181,16 @@ fn configure_64bit_boot(
     params.hdr.type_of_loader = KERNEL_LOADER_OTHER;
     params.hdr.boot_flag = KERNEL_BOOT_FLAG_MAGIC;
     params.hdr.header = KERNEL_HDR_MAGIC;
-    params.hdr.cmd_line_ptr = u32::try_from(cmdline_addr.raw_value()).unwrap();
-    params.hdr.cmdline_size = u32::try_from(cmdline_size).unwrap();
+    params.hdr.cmd_line_ptr = u32::try_from(cmdline_addr.raw_value())
+        .map_err(|_| ConfigurationError::BootParamValue("cmd_line_ptr"))?;
+    params.hdr.cmdline_size =
+        u32::try_from(cmdline_size).map_err(|_| ConfigurationError::BootParamValue("cmdline_size"))?;
     params.hdr.kernel_alignment = KERNEL_MIN_ALIGNMENT_BYTES;
     if let Some(initrd_config) = initrd {
-        params.hdr.ramdisk_image = u32::try_from(initrd_config.address.raw_value()).unwrap();
-        params.hdr.ramdisk_size = u32::try_from(initrd_config.size).unwrap();
+        params.hdr.ramdisk_image = u32::try_from(initrd_config.address.raw_value())
+            .map_err(|_| ConfigurationError::BootParamValue("ramdisk_image"))?;
+        params.hdr.ramdisk_size = u32::try_from(initrd_config.size)
+            .map_err(|_| ConfigurationError::BootParamValue("ramdisk_size"))?;
     }
 
     // We mark first [0x0, SYSTEM_MEM_START) region as usable RAM and the subsequent

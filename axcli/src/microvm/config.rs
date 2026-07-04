@@ -90,6 +90,10 @@ pub struct VfioConfig {
     /// Supported values:
     /// - "gpa-identity" (IOVA == GPA)
     pub iova_mode: Option<String>,
+    /// Opt in to VFIO physical HPA release after dynamic DMA rollback and
+    /// guest-RAM VMA safety validation. Defaults to false.
+    #[serde(default)]
+    pub physical_release: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

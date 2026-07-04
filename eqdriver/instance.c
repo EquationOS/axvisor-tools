@@ -1,4 +1,5 @@
 #include <linux/fs.h>
+#include <linux/atomic.h>
 #include <linux/eventfd.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
@@ -14,6 +15,7 @@
 #include <linux/uaccess.h>
 #include <linux/pid.h>	 // for pid_nr()
 #include <linux/sched.h> // for current
+#include <linux/sched/mm.h>
 #include <linux/uaccess.h>
 #include <linux/hashtable.h>
 
@@ -61,6 +63,21 @@ typedef struct eq_vfio_posted_owner
 #define EQ_IRQ_ROUTE_FLAG_REQUIRES_POSTED_VECTOR (1U << 3)
 #define EQ_MICROVM_BLOCK_FLAG_ENABLED (1ULL << 0)
 #define MICROVM_BLOCK_NOTIFY_VERSION (1U)
+#define EQ_HYPERALLOC_VFIO_DMA_STATUS_NONE (0U)
+#define EQ_HYPERALLOC_VFIO_DMA_STATUS_PENDING (1U)
+#define EQ_HYPERALLOC_VFIO_DMA_STATUS_UNSUPPORTED (4U)
+#define MICROVM_LOW_RAM_LIMIT (1ULL << 30)
+#define MICROVM_HIGH_RAM_START (6ULL << 30)
+
+static bool eq_guest_mem_copy_direction_valid(uint32_t flags)
+{
+	uint32_t direction =
+		flags & (EQ_MICROVM_GUEST_MEM_COPY_READ_FROM_GUEST |
+			 EQ_MICROVM_GUEST_MEM_COPY_WRITE_TO_GUEST);
+
+	return direction == EQ_MICROVM_GUEST_MEM_COPY_READ_FROM_GUEST ||
+	       direction == EQ_MICROVM_GUEST_MEM_COPY_WRITE_TO_GUEST;
+}
 
 static DEFINE_HASHTABLE(eq_vfio_posted_owners, EQ_VFIO_POSTED_OWNER_BITS);
 static DEFINE_MUTEX(eq_vfio_posted_owners_lock);
@@ -124,13 +141,693 @@ typedef struct eq_instance_vdev
 	void *microvm_block_notify_ring_virt;
 	struct list_head irq_routes;
 	struct mutex irq_routes_lock;
+	struct mutex microvm_guest_ram_mmap_lock;
+	struct list_head microvm_guest_ram_vma_list;
+	uint64_t microvm_guest_ram_mmap_generation;
+	atomic_t microvm_guest_ram_mmap_count;
+	atomic_t microvm_guest_ram_current_mmap_count;
+	atomic_t microvm_guest_ram_stale_mmap_count;
+	atomic64_t microvm_guest_ram_mmap_update_seq;
 
 	eq_instance_metadata_t metadata;
 } eq_instance_vdev_t;
 
 static eq_instance_vdev_t instances_array[MAX_EQ_INSTANCES_NUM];
+static bool instances_exiting;
 
 int unregister_instance_dev(eq_instance_vdev_t *vdev);
+
+typedef struct eq_instance_file_context
+{
+	eq_instance_vdev_t *instance_vdev;
+	uint64_t generation;
+} eq_instance_file_context_t;
+
+typedef struct microvm_guest_ram_vma_context
+{
+	eq_instance_vdev_t *instance_vdev;
+	struct mm_struct *mm;
+	struct list_head list;
+	uint64_t generation;
+	uint64_t gpa_start;
+	uint64_t size;
+	unsigned long vm_start;
+	unsigned long vm_end;
+	bool listed;
+	atomic_t refs;
+} microvm_guest_ram_vma_context_t;
+
+typedef struct microvm_guest_ram_generation_zap_target
+{
+	microvm_guest_ram_vma_context_t *ctx;
+	unsigned long va_start;
+	unsigned long size;
+} microvm_guest_ram_generation_zap_target_t;
+
+static bool microvm_guest_ram_file_offset_to_gpa(
+	eq_instance_vdev_t *instance_vdev, uint64_t file_offset, uint64_t len,
+	uint64_t *gpa)
+{
+	uint64_t mem_size;
+	uint64_t end_offset;
+
+	if (!instance_vdev || len == 0 || !gpa)
+		return false;
+	mem_size = instance_vdev->metadata.init_memory_region_size_mib * 1024ULL * 1024ULL;
+	if (__builtin_add_overflow(file_offset, len - 1, &end_offset))
+		return false;
+	if (end_offset >= mem_size)
+		return false;
+	if (file_offset < MICROVM_LOW_RAM_LIMIT)
+	{
+		if (end_offset >= MICROVM_LOW_RAM_LIMIT && mem_size > MICROVM_LOW_RAM_LIMIT)
+			return false;
+		*gpa = file_offset;
+		return true;
+	}
+	*gpa = MICROVM_HIGH_RAM_START + (file_offset - MICROVM_LOW_RAM_LIMIT);
+	return true;
+}
+
+static bool microvm_guest_ram_gpa_range_valid(
+	eq_instance_vdev_t *instance_vdev, uint64_t gpa, uint64_t len)
+{
+	uint64_t mem_size;
+	uint64_t end_gpa;
+	uint64_t low_size;
+	uint64_t high_size;
+
+	if (!instance_vdev || len == 0)
+		return false;
+	mem_size = instance_vdev->metadata.init_memory_region_size_mib * 1024ULL * 1024ULL;
+	if (__builtin_add_overflow(gpa, len - 1, &end_gpa))
+		return false;
+	low_size = min(mem_size, MICROVM_LOW_RAM_LIMIT);
+	if (gpa < MICROVM_LOW_RAM_LIMIT)
+		return gpa < low_size && end_gpa < low_size;
+	if (mem_size <= MICROVM_LOW_RAM_LIMIT || gpa < MICROVM_HIGH_RAM_START)
+		return false;
+	high_size = mem_size - MICROVM_LOW_RAM_LIMIT;
+	if (gpa - MICROVM_HIGH_RAM_START >= high_size)
+		return false;
+	return end_gpa >= MICROVM_HIGH_RAM_START &&
+	       end_gpa - MICROVM_HIGH_RAM_START < high_size;
+}
+
+static void microvm_guest_ram_vma_context_get(
+	microvm_guest_ram_vma_context_t *ctx)
+{
+	if (ctx)
+		atomic_inc(&ctx->refs);
+}
+
+static void microvm_guest_ram_vma_context_put(
+	microvm_guest_ram_vma_context_t *ctx)
+{
+	int refs;
+
+	if (!ctx)
+		return;
+	refs = atomic_dec_return(&ctx->refs);
+	if (refs < 0)
+	{
+		WARNING(
+			"MicroVM guest RAM VMA context ref underflow generation=%llu\n",
+			(unsigned long long)ctx->generation);
+		atomic_set(&ctx->refs, 0);
+		refs = 0;
+	}
+	if (refs == 0)
+	{
+		if (ctx->mm)
+			mmdrop(ctx->mm);
+		kfree(ctx);
+	}
+}
+
+static uint64_t instance_generation_from_file(struct file *file)
+{
+	eq_instance_file_context_t *ctx = file->private_data;
+
+	return ctx ? ctx->generation : 0;
+}
+
+static eq_instance_vdev_t *active_instance_vdev_from_file(struct file *file)
+{
+	eq_instance_file_context_t *ctx = file->private_data;
+	eq_instance_vdev_t *instance_vdev;
+
+	if (!ctx || !ctx->instance_vdev)
+		return NULL;
+
+	instance_vdev = ctx->instance_vdev;
+	if (!instance_vdev->active)
+		return NULL;
+	if (ctx->generation != instance_vdev->microvm_guest_ram_mmap_generation)
+		return NULL;
+	return instance_vdev;
+}
+
+static void microvm_guest_ram_mmap_snapshot_locked(
+	eq_instance_vdev_t *instance_vdev,
+	uint64_t *generation,
+	int *active_mmaps,
+	int *current_mmaps,
+	int *stale_mmaps)
+{
+	*generation = instance_vdev->microvm_guest_ram_mmap_generation;
+	*active_mmaps = atomic_read(&instance_vdev->microvm_guest_ram_mmap_count);
+	*current_mmaps =
+		atomic_read(&instance_vdev->microvm_guest_ram_current_mmap_count);
+	*stale_mmaps =
+		atomic_read(&instance_vdev->microvm_guest_ram_stale_mmap_count);
+}
+
+static void microvm_guest_ram_report_state(
+	eq_instance_vdev_t *instance_vdev, uint32_t reason)
+{
+	eq_microvm_guest_ram_mmap_state_update_t *update;
+	uint64_t generation;
+	int active_mmaps;
+	int current_mmaps;
+	int stale_mmaps;
+	int ret;
+
+	if (!instance_vdev || instance_vdev->instance_type != 2)
+		return;
+
+	mutex_lock(&instance_vdev->microvm_guest_ram_mmap_lock);
+	microvm_guest_ram_mmap_snapshot_locked(
+		instance_vdev, &generation, &active_mmaps, &current_mmaps,
+		&stale_mmaps);
+	mutex_unlock(&instance_vdev->microvm_guest_ram_mmap_lock);
+
+	if (instances_exiting || !instance_vdev->active)
+	{
+		if (reason == EQ_MICROVM_GUEST_RAM_MMAP_STATE_REASON_UNREGISTER ||
+			instances_exiting)
+			INFO(
+				"MicroVM instance %d guest RAM mmap state HVC update skipped reason=%u active=%d exiting=%d active_mmaps=%d current_mmaps=%d stale_mmaps=%d\n",
+				instance_vdev->id, reason, instance_vdev->active,
+				instances_exiting, active_mmaps, current_mmaps,
+				stale_mmaps);
+		return;
+	}
+
+	update = kzalloc(sizeof(*update), GFP_KERNEL);
+	if (!update)
+	{
+		WARNING(
+			"MicroVM instance %d guest RAM mmap state allocation failed reason=%u active_mmaps=%d current_mmaps=%d stale_mmaps=%d\n",
+			instance_vdev->id, reason, active_mmaps, current_mmaps,
+			stale_mmaps);
+		return;
+	}
+
+	update->version = EQ_MICROVM_GUEST_RAM_MMAP_STATE_UPDATE_VERSION;
+	update->reason = reason;
+	update->sequence =
+		(uint64_t)atomic64_inc_return(
+			&instance_vdev->microvm_guest_ram_mmap_update_seq);
+	update->instance_id = (uint64_t)instance_vdev->id;
+	update->generation = generation;
+	update->active_mmaps = (uint64_t)active_mmaps;
+	update->current_mmaps = (uint64_t)current_mmaps;
+	update->stale_mmaps = (uint64_t)stale_mmaps;
+
+	ret = hvc_microvm_guest_ram_mmap_state_update(virt_to_phys(update));
+	if (ret < 0)
+		WARNING(
+			"MicroVM instance %d guest RAM mmap state HVC update failed reason=%u seq=%llu ret=%d active_mmaps=%d current_mmaps=%d stale_mmaps=%d\n",
+			instance_vdev->id, reason,
+			(unsigned long long)update->sequence, ret, active_mmaps,
+			current_mmaps, stale_mmaps);
+	kfree(update);
+}
+
+static void microvm_guest_ram_mmap_account(
+	microvm_guest_ram_vma_context_t *ctx,
+	const char *reason_name,
+	uint32_t reason,
+	unsigned long vm_start,
+	unsigned long vm_end)
+{
+	eq_instance_vdev_t *instance_vdev;
+	uint64_t current_generation;
+	int active_mmaps;
+	int current_mmaps;
+	int stale_mmaps;
+	bool is_current_generation;
+
+	if (!ctx || !ctx->instance_vdev)
+		return;
+
+	instance_vdev = ctx->instance_vdev;
+	mutex_lock(&instance_vdev->microvm_guest_ram_mmap_lock);
+	current_generation = instance_vdev->microvm_guest_ram_mmap_generation;
+	is_current_generation = ctx->generation == current_generation;
+	active_mmaps =
+		atomic_inc_return(&instance_vdev->microvm_guest_ram_mmap_count);
+	if (is_current_generation)
+		current_mmaps = atomic_inc_return(
+			&instance_vdev->microvm_guest_ram_current_mmap_count);
+	else
+		current_mmaps =
+			atomic_read(&instance_vdev->microvm_guest_ram_current_mmap_count);
+	if (is_current_generation)
+		stale_mmaps =
+			atomic_read(&instance_vdev->microvm_guest_ram_stale_mmap_count);
+	else
+		stale_mmaps = atomic_inc_return(
+			&instance_vdev->microvm_guest_ram_stale_mmap_count);
+	mutex_unlock(&instance_vdev->microvm_guest_ram_mmap_lock);
+
+	INFO(
+		"MicroVM instance %d guest RAM VMA %s generation=%llu current_generation=%llu active_mmaps=%d current_mmaps=%d stale_mmaps=%d gpa[0x%llx-0x%llx] va[0x%lx-0x%lx]\n",
+		instance_vdev->id, reason_name,
+		(unsigned long long)ctx->generation,
+		(unsigned long long)current_generation, active_mmaps, current_mmaps,
+		stale_mmaps, (unsigned long long)ctx->gpa_start,
+		(unsigned long long)(ctx->gpa_start + ctx->size), vm_start, vm_end);
+	microvm_guest_ram_report_state(instance_vdev, reason);
+}
+
+static int microvm_guest_ram_atomic_dec_nonnegative(
+	atomic_t *counter,
+	const char *name,
+	int instance_id)
+{
+	int value = atomic_dec_return(counter);
+
+	if (value < 0)
+	{
+		WARNING(
+			"MicroVM instance %d guest RAM mmap %s underflow value=%d\n",
+			instance_id, name, value);
+		atomic_set(counter, 0);
+		value = 0;
+	}
+	return value;
+}
+
+static void microvm_guest_ram_mmap_unaccount(
+	microvm_guest_ram_vma_context_t *ctx,
+	const char *reason_name,
+	uint32_t reason,
+	unsigned long vm_start,
+	unsigned long vm_end)
+{
+	eq_instance_vdev_t *instance_vdev;
+	uint64_t current_generation;
+	int active_mmaps;
+	int current_mmaps;
+	int stale_mmaps;
+	bool is_current_generation;
+
+	if (!ctx || !ctx->instance_vdev)
+		return;
+
+	instance_vdev = ctx->instance_vdev;
+	mutex_lock(&instance_vdev->microvm_guest_ram_mmap_lock);
+	current_generation = instance_vdev->microvm_guest_ram_mmap_generation;
+	is_current_generation = ctx->generation == current_generation;
+	active_mmaps = microvm_guest_ram_atomic_dec_nonnegative(
+		&instance_vdev->microvm_guest_ram_mmap_count, "active",
+		instance_vdev->id);
+	if (is_current_generation)
+		current_mmaps = microvm_guest_ram_atomic_dec_nonnegative(
+			&instance_vdev->microvm_guest_ram_current_mmap_count, "current",
+			instance_vdev->id);
+	else
+		current_mmaps =
+			atomic_read(&instance_vdev->microvm_guest_ram_current_mmap_count);
+	if (is_current_generation)
+		stale_mmaps =
+			atomic_read(&instance_vdev->microvm_guest_ram_stale_mmap_count);
+	else
+		stale_mmaps = microvm_guest_ram_atomic_dec_nonnegative(
+			&instance_vdev->microvm_guest_ram_stale_mmap_count, "stale",
+			instance_vdev->id);
+	mutex_unlock(&instance_vdev->microvm_guest_ram_mmap_lock);
+
+	INFO(
+		"MicroVM instance %d guest RAM VMA %s generation=%llu current_generation=%llu active_mmaps=%d current_mmaps=%d stale_mmaps=%d gpa[0x%llx-0x%llx] va[0x%lx-0x%lx]\n",
+		instance_vdev->id, reason_name,
+		(unsigned long long)ctx->generation,
+		(unsigned long long)current_generation, active_mmaps, current_mmaps,
+		stale_mmaps, (unsigned long long)ctx->gpa_start,
+		(unsigned long long)(ctx->gpa_start + ctx->size), vm_start, vm_end);
+	microvm_guest_ram_report_state(instance_vdev, reason);
+}
+
+static int microvm_guest_ram_collect_generation_zap_targets(
+	eq_instance_vdev_t *instance_vdev,
+	uint64_t current_generation,
+	microvm_guest_ram_generation_zap_target_t **targets_out,
+	uint64_t *target_count_out)
+{
+	microvm_guest_ram_vma_context_t *ctx;
+	microvm_guest_ram_generation_zap_target_t *targets;
+	uint64_t count = 0;
+	uint64_t idx = 0;
+
+	*targets_out = NULL;
+	*target_count_out = 0;
+	mutex_lock(&instance_vdev->microvm_guest_ram_mmap_lock);
+	list_for_each_entry(ctx, &instance_vdev->microvm_guest_ram_vma_list, list)
+	{
+		if (ctx->generation != current_generation)
+			count++;
+	}
+	if (count == 0)
+	{
+		mutex_unlock(&instance_vdev->microvm_guest_ram_mmap_lock);
+		return 0;
+	}
+	targets = kcalloc(count, sizeof(*targets), GFP_KERNEL);
+	if (!targets)
+	{
+		mutex_unlock(&instance_vdev->microvm_guest_ram_mmap_lock);
+		return -ENOMEM;
+	}
+	list_for_each_entry(ctx, &instance_vdev->microvm_guest_ram_vma_list, list)
+	{
+		if (ctx->generation == current_generation)
+			continue;
+		microvm_guest_ram_vma_context_get(ctx);
+		targets[idx].ctx = ctx;
+		targets[idx].va_start = ctx->vm_start;
+		targets[idx].size = (unsigned long)ctx->size;
+		idx++;
+	}
+	mutex_unlock(&instance_vdev->microvm_guest_ram_mmap_lock);
+
+	*targets_out = targets;
+	*target_count_out = idx;
+	return 0;
+}
+
+static void microvm_guest_ram_put_generation_zap_targets(
+	microvm_guest_ram_generation_zap_target_t *targets,
+	uint64_t target_count)
+{
+	uint64_t i;
+
+	if (!targets)
+		return;
+	for (i = 0; i < target_count; i++)
+		microvm_guest_ram_vma_context_put(targets[i].ctx);
+	kfree(targets);
+}
+
+static void microvm_guest_ram_zap_generation_targets(
+	eq_instance_vdev_t *instance_vdev,
+	uint64_t current_generation,
+	microvm_guest_ram_generation_zap_target_t *targets,
+	uint64_t target_count)
+{
+	uint64_t i;
+	uint64_t zapped_vmas = 0;
+	uint64_t zapped_bytes = 0;
+
+	for (i = 0; i < target_count; i++)
+	{
+		microvm_guest_ram_vma_context_t *ctx = targets[i].ctx;
+		struct vm_area_struct *vma;
+		unsigned long va_start = targets[i].va_start;
+		unsigned long va_end = va_start + targets[i].size;
+
+		if (!ctx || !ctx->mm || targets[i].size == 0)
+			continue;
+		mmap_write_lock(ctx->mm);
+		vma = find_vma(ctx->mm, va_start);
+		if (vma && vma->vm_start <= va_start && vma->vm_end >= va_end &&
+			vma->vm_private_data == ctx)
+		{
+			zap_vma_ptes(vma, va_start, targets[i].size);
+			zapped_vmas++;
+			zapped_bytes += targets[i].size;
+		}
+		mmap_write_unlock(ctx->mm);
+	}
+
+	if (target_count != 0)
+		INFO(
+			"MicroVM instance %d guest RAM generation advance stale zap current_generation=%llu targets=%llu zapped_vmas=%llu zapped_bytes=0x%llx\n",
+			instance_vdev->id, (unsigned long long)current_generation,
+			(unsigned long long)target_count,
+			(unsigned long long)zapped_vmas,
+			(unsigned long long)zapped_bytes);
+}
+
+static int microvm_guest_ram_collect_all_zap_targets(
+	eq_instance_vdev_t *instance_vdev,
+	microvm_guest_ram_generation_zap_target_t **targets_out,
+	uint64_t *target_count_out)
+{
+	microvm_guest_ram_vma_context_t *ctx;
+	microvm_guest_ram_generation_zap_target_t *targets;
+	uint64_t count = 0;
+	uint64_t idx = 0;
+
+	*targets_out = NULL;
+	*target_count_out = 0;
+	mutex_lock(&instance_vdev->microvm_guest_ram_mmap_lock);
+	list_for_each_entry(ctx, &instance_vdev->microvm_guest_ram_vma_list, list)
+		count++;
+	if (count == 0)
+	{
+		mutex_unlock(&instance_vdev->microvm_guest_ram_mmap_lock);
+		return 0;
+	}
+	targets = kcalloc(count, sizeof(*targets), GFP_KERNEL);
+	if (!targets)
+	{
+		mutex_unlock(&instance_vdev->microvm_guest_ram_mmap_lock);
+		return -ENOMEM;
+	}
+	list_for_each_entry(ctx, &instance_vdev->microvm_guest_ram_vma_list, list)
+	{
+		microvm_guest_ram_vma_context_get(ctx);
+		targets[idx].ctx = ctx;
+		targets[idx].va_start = ctx->vm_start;
+		targets[idx].size = (unsigned long)ctx->size;
+		idx++;
+	}
+	mutex_unlock(&instance_vdev->microvm_guest_ram_mmap_lock);
+
+	*targets_out = targets;
+	*target_count_out = idx;
+	return 0;
+}
+
+static void microvm_guest_ram_zap_unregister_vmas(
+	eq_instance_vdev_t *instance_vdev)
+{
+	microvm_guest_ram_generation_zap_target_t *targets = NULL;
+	uint64_t target_count = 0;
+	uint64_t zapped_vmas = 0;
+	uint64_t zapped_bytes = 0;
+	uint64_t i;
+	int ret;
+
+	ret = microvm_guest_ram_collect_all_zap_targets(
+		instance_vdev, &targets, &target_count);
+	if (ret)
+	{
+		WARNING(
+			"MicroVM instance %d failed to collect unregister guest RAM VMA zap targets ret=%d\n",
+			instance_vdev->id, ret);
+		microvm_guest_ram_report_state(
+			instance_vdev,
+			EQ_MICROVM_GUEST_RAM_MMAP_STATE_REASON_UNREGISTER);
+		return;
+	}
+
+	for (i = 0; i < target_count; i++)
+	{
+		microvm_guest_ram_vma_context_t *ctx = targets[i].ctx;
+		struct vm_area_struct *vma;
+		unsigned long va_start = targets[i].va_start;
+		unsigned long va_end = va_start + targets[i].size;
+
+		if (!ctx || !ctx->mm || targets[i].size == 0)
+			continue;
+		mmap_write_lock(ctx->mm);
+		vma = find_vma(ctx->mm, va_start);
+		if (vma && vma->vm_start <= va_start && vma->vm_end >= va_end &&
+			vma->vm_private_data == ctx)
+		{
+			zap_vma_ptes(vma, va_start, targets[i].size);
+			zapped_vmas++;
+			zapped_bytes += targets[i].size;
+		}
+		mmap_write_unlock(ctx->mm);
+	}
+
+	if (target_count != 0)
+		INFO(
+			"MicroVM instance %d guest RAM unregister stale-fence zap targets=%llu zapped_vmas=%llu zapped_bytes=0x%llx\n",
+			instance_vdev->id, (unsigned long long)target_count,
+			(unsigned long long)zapped_vmas,
+			(unsigned long long)zapped_bytes);
+	microvm_guest_ram_report_state(
+		instance_vdev, EQ_MICROVM_GUEST_RAM_MMAP_STATE_REASON_UNREGISTER);
+	microvm_guest_ram_put_generation_zap_targets(targets, target_count);
+}
+
+static void microvm_guest_ram_prepare_generation(eq_instance_vdev_t *instance_vdev)
+{
+	microvm_guest_ram_generation_zap_target_t *zap_targets = NULL;
+	uint64_t generation;
+	uint64_t zap_target_count = 0;
+	int old_current;
+	int active_mmaps;
+	int current_mmaps;
+	int stale_mmaps;
+	int ret;
+
+	mutex_lock(&instance_vdev->microvm_guest_ram_mmap_lock);
+	old_current =
+		atomic_xchg(&instance_vdev->microvm_guest_ram_current_mmap_count, 0);
+	if (old_current > 0)
+		atomic_add(
+			old_current,
+			&instance_vdev->microvm_guest_ram_stale_mmap_count);
+	else if (old_current < 0)
+		WARNING(
+			"MicroVM instance %d guest RAM current mmap count was negative during generation advance: %d\n",
+			instance_vdev->id, old_current);
+
+	generation = instance_vdev->microvm_guest_ram_mmap_generation + 1;
+	if (generation == 0)
+		generation = 1;
+	instance_vdev->microvm_guest_ram_mmap_generation = generation;
+	microvm_guest_ram_mmap_snapshot_locked(
+		instance_vdev, &generation, &active_mmaps, &current_mmaps,
+		&stale_mmaps);
+	mutex_unlock(&instance_vdev->microvm_guest_ram_mmap_lock);
+
+	if (active_mmaps != 0 || stale_mmaps != 0)
+		WARNING(
+			"Creating instance %s with MicroVM guest RAM mmap generation=%llu active_mmaps=%d current_mmaps=%d stale_mmaps=%d\n",
+			instance_vdev->name, (unsigned long long)generation,
+			active_mmaps, current_mmaps, stale_mmaps);
+
+	ret = microvm_guest_ram_collect_generation_zap_targets(
+		instance_vdev, generation, &zap_targets, &zap_target_count);
+	if (ret)
+		WARNING(
+			"MicroVM instance %d failed to collect stale guest RAM VMA zap targets generation=%llu ret=%d\n",
+			instance_vdev->id, (unsigned long long)generation, ret);
+	else
+		microvm_guest_ram_zap_generation_targets(
+			instance_vdev, generation, zap_targets, zap_target_count);
+	microvm_guest_ram_put_generation_zap_targets(
+		zap_targets, zap_target_count);
+}
+
+static void microvm_guest_ram_vma_open(struct vm_area_struct *vma)
+{
+	microvm_guest_ram_vma_context_t *ctx = vma->vm_private_data;
+
+	if (!ctx)
+		return;
+
+	microvm_guest_ram_vma_context_get(ctx);
+	microvm_guest_ram_mmap_account(
+		ctx, "open", EQ_MICROVM_GUEST_RAM_MMAP_STATE_REASON_OPEN,
+		vma->vm_start, vma->vm_end);
+}
+
+static void microvm_guest_ram_vma_close(struct vm_area_struct *vma)
+{
+	microvm_guest_ram_vma_context_t *ctx = vma->vm_private_data;
+
+	if (!ctx)
+		return;
+
+	if (ctx->instance_vdev)
+	{
+		mutex_lock(&ctx->instance_vdev->microvm_guest_ram_mmap_lock);
+		if (ctx->listed)
+		{
+			list_del_init(&ctx->list);
+			ctx->listed = false;
+		}
+		mutex_unlock(&ctx->instance_vdev->microvm_guest_ram_mmap_lock);
+	}
+	microvm_guest_ram_mmap_unaccount(
+		ctx, "close", EQ_MICROVM_GUEST_RAM_MMAP_STATE_REASON_CLOSE,
+		vma->vm_start, vma->vm_end);
+	vma->vm_private_data = NULL;
+	microvm_guest_ram_vma_context_put(ctx);
+}
+
+static vm_fault_t microvm_guest_ram_vma_fault(struct vm_fault *vmf)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	microvm_guest_ram_vma_context_t *ctx = vma->vm_private_data;
+	eq_microvm_guest_ram_translate_t *translate;
+	uint64_t current_generation;
+	uint64_t fault_offset;
+	uint64_t fault_gpa;
+	unsigned long pfn;
+	int ret;
+
+	if (!ctx || !ctx->instance_vdev || !ctx->instance_vdev->active)
+		return VM_FAULT_SIGBUS;
+	mutex_lock(&ctx->instance_vdev->microvm_guest_ram_mmap_lock);
+	current_generation = ctx->instance_vdev->microvm_guest_ram_mmap_generation;
+	mutex_unlock(&ctx->instance_vdev->microvm_guest_ram_mmap_lock);
+	if (ctx->generation != current_generation)
+	{
+		WARNING(
+			"MicroVM instance %d guest RAM stale VMA fault rejected generation=%llu current_generation=%llu gpa_start=%#llx size=%#llx addr=%#lx\n",
+			ctx->instance_vdev->id,
+			(unsigned long long)ctx->generation,
+			(unsigned long long)current_generation,
+			(unsigned long long)ctx->gpa_start,
+			(unsigned long long)ctx->size, vmf->address);
+		return VM_FAULT_SIGBUS;
+	}
+	if (vmf->address < vma->vm_start || vmf->address >= vma->vm_end)
+		return VM_FAULT_SIGBUS;
+	fault_offset = (uint64_t)(vmf->address - vma->vm_start);
+	if (fault_offset >= ctx->size)
+		return VM_FAULT_SIGBUS;
+	fault_gpa = ctx->gpa_start + fault_offset;
+
+	translate = kzalloc(sizeof(*translate), GFP_KERNEL);
+	if (!translate)
+		return VM_FAULT_OOM;
+	translate->version = EQ_MICROVM_GUEST_RAM_TRANSLATE_VERSION;
+	translate->instance_id = (uint64_t)ctx->instance_vdev->id;
+	translate->gpa = fault_gpa & PAGE_MASK;
+	translate->len = PAGE_SIZE;
+
+	ret = hvc_microvm_guest_ram_translate(virt_to_phys(translate));
+	if (ret < 0 || translate->result_errno != 0 || translate->hpa == 0)
+	{
+		WARNING(
+			"MicroVM instance %d guest RAM fault translate failed gpa=%#llx ret=%d errno=%d\n",
+			ctx->instance_vdev->id,
+			(unsigned long long)translate->gpa, ret,
+			translate->result_errno);
+		kfree(translate);
+		return VM_FAULT_SIGBUS;
+	}
+
+	pfn = (unsigned long)(translate->hpa >> PAGE_SHIFT);
+	kfree(translate);
+	return vmf_insert_pfn(vma, vmf->address & PAGE_MASK, pfn);
+}
+
+static const struct vm_operations_struct microvm_guest_ram_vm_ops = {
+	.open = microvm_guest_ram_vma_open,
+	.close = microvm_guest_ram_vma_close,
+	.fault = microvm_guest_ram_vma_fault,
+};
 
 static eq_vfio_posted_owner_t *eq_vfio_posted_owner_find_locked(uint32_t target_vcpu)
 {
@@ -610,21 +1307,707 @@ static int eq_refresh_irq_route(
 	return ret;
 }
 
+static int eq_hyperalloc_vfio_dma_ioctl(
+	eq_instance_vdev_t *instance_vdev, unsigned int cmd,
+	void __user *user_arg)
+{
+	eq_hyperalloc_vfio_dma_op_t *op;
+	phys_addr_t op_hpa;
+	int ret;
+
+	op = kzalloc(sizeof(*op), GFP_KERNEL);
+	if (!op)
+		return -ENOMEM;
+
+	if (copy_from_user(op, user_arg, sizeof(*op)))
+	{
+		ERROR("Failed to copy HyperAlloc VFIO DMA op from user\n");
+		kfree(op);
+		return -EFAULT;
+	}
+
+	if (op->instance_id != 0 &&
+		op->instance_id != (uint64_t)instance_vdev->id)
+	{
+		ERROR(
+			"HyperAlloc VFIO DMA ioctl mismatched instance id: fd=%d arg=%llu\n",
+			instance_vdev->id, op->instance_id);
+		kfree(op);
+		return -EINVAL;
+	}
+	op->instance_id = instance_vdev->id;
+	op_hpa = virt_to_phys(op);
+
+	if (cmd == EQ_INSTANCE_HYPERALLOC_VFIO_DMA_POLL)
+		ret = hvc_hyperalloc_vfio_dma_poll(op_hpa);
+	else
+		ret = hvc_hyperalloc_vfio_dma_complete(op_hpa);
+
+	if (ret < 0)
+	{
+		if (cmd == EQ_INSTANCE_HYPERALLOC_VFIO_DMA_POLL)
+		{
+			op->status = EQ_HYPERALLOC_VFIO_DMA_STATUS_NONE;
+			ret = 0;
+		}
+		else
+			op->status = EQ_HYPERALLOC_VFIO_DMA_STATUS_UNSUPPORTED;
+	}
+
+	if (copy_to_user(user_arg, op, sizeof(*op)))
+	{
+		ERROR("Failed to copy HyperAlloc VFIO DMA op result to user\n");
+		kfree(op);
+		return -EFAULT;
+	}
+
+	kfree(op);
+	return ret < 0 ? ret : 0;
+}
+
+static int eq_hyperalloc_vfio_dma_debug_request_ioctl(
+	eq_instance_vdev_t *instance_vdev, void __user *user_arg)
+{
+	eq_hyperalloc_vfio_dma_op_t *op;
+	phys_addr_t op_hpa;
+	int ret;
+
+	op = kzalloc(sizeof(*op), GFP_KERNEL);
+	if (!op)
+		return -ENOMEM;
+
+	if (copy_from_user(op, user_arg, sizeof(*op)))
+	{
+		ERROR("Failed to copy HyperAlloc VFIO DMA debug request from user\n");
+		kfree(op);
+		return -EFAULT;
+	}
+
+	if (op->version != EQ_HYPERALLOC_VERSION)
+	{
+		ERROR(
+			"Invalid HyperAlloc VFIO DMA debug request version instance=%d version=%u\n",
+			instance_vdev->id, op->version);
+		kfree(op);
+		return -EINVAL;
+	}
+	if (op->instance_id != 0 &&
+		op->instance_id != (uint64_t)instance_vdev->id)
+	{
+		ERROR(
+			"HyperAlloc VFIO DMA debug request mismatched instance id: fd=%d arg=%llu\n",
+			instance_vdev->id, op->instance_id);
+		kfree(op);
+		return -EINVAL;
+	}
+
+	op->instance_id = instance_vdev->id;
+	op->status = EQ_HYPERALLOC_VFIO_DMA_STATUS_PENDING;
+	op->result_errno = 0;
+	op_hpa = virt_to_phys(op);
+
+	ret = hvc_hyperalloc_vfio_dma_debug_request(
+		instance_vdev->id, op_hpa);
+	if (ret < 0)
+	{
+		op->status = EQ_HYPERALLOC_VFIO_DMA_STATUS_UNSUPPORTED;
+		op->result_errno = ret;
+	}
+
+	if (copy_to_user(user_arg, op, sizeof(*op)))
+	{
+		ERROR("Failed to copy HyperAlloc VFIO DMA debug request result to user\n");
+		kfree(op);
+		return -EFAULT;
+	}
+
+	kfree(op);
+	return ret < 0 ? ret : 0;
+}
+
+static int eq_hyperalloc_memory_target_ioctl(
+	eq_instance_vdev_t *instance_vdev, void __user *user_arg)
+{
+	eq_hyperalloc_pagecache_shrink_req_t *req;
+	int ret;
+
+	req = kzalloc(sizeof(*req), GFP_KERNEL);
+	if (!req)
+		return -ENOMEM;
+
+	if (copy_from_user(req, user_arg, sizeof(*req)))
+	{
+		ERROR("Failed to copy HyperAlloc memory target request from user\n");
+		kfree(req);
+		return -EFAULT;
+	}
+
+	if (req->version != EQ_HYPERALLOC_VERSION)
+	{
+		ERROR(
+			"Invalid HyperAlloc memory target request version instance=%d version=%u target_huge=%llu\n",
+			instance_vdev->id, req->version,
+			(unsigned long long)req->target_huge_frames);
+		kfree(req);
+		return -EINVAL;
+	}
+
+	ret = hvc_hyperalloc_memory_target(instance_vdev->id, virt_to_phys(req));
+	if (ret < 0)
+	{
+		req->status = EQ_HYPERALLOC_PAGECACHE_SHRINK_STATUS_UNSUPPORTED;
+		req->result_errno = ret;
+	}
+
+	if (copy_to_user(user_arg, req, sizeof(*req)))
+	{
+		ERROR("Failed to copy HyperAlloc memory target result to user\n");
+		kfree(req);
+		return -EFAULT;
+	}
+
+	kfree(req);
+	return ret < 0 ? ret : 0;
+}
+
+static int eq_hyperalloc_query_ioctl(
+	eq_instance_vdev_t *instance_vdev, void __user *user_arg)
+{
+	eq_hyperalloc_query_t *query;
+	int ret;
+
+	query = kzalloc(sizeof(*query), GFP_KERNEL);
+	if (!query)
+		return -ENOMEM;
+
+	ret = hvc_hyperalloc_host_query(instance_vdev->id, virt_to_phys(query));
+	if (ret < 0)
+	{
+		kfree(query);
+		return ret;
+	}
+
+	if (copy_to_user(user_arg, query, sizeof(*query)))
+	{
+		ERROR("Failed to copy HyperAlloc query result to user\n");
+		kfree(query);
+		return -EFAULT;
+	}
+
+	kfree(query);
+	return 0;
+}
+
+static int eq_hyperalloc_debug_reclaim_ioctl(
+	eq_instance_vdev_t *instance_vdev, void __user *user_arg)
+{
+	eq_hyperalloc_debug_reclaim_req_t *req;
+	int ret;
+
+	req = kzalloc(sizeof(*req), GFP_KERNEL);
+	if (!req)
+		return -ENOMEM;
+
+	if (copy_from_user(req, user_arg, sizeof(*req)))
+	{
+		ERROR("Failed to copy HyperAlloc debug reclaim request from user\n");
+		kfree(req);
+		return -EFAULT;
+	}
+
+	if (req->version != EQ_HYPERALLOC_DEBUG_RECLAIM_VERSION)
+	{
+		ERROR(
+			"Invalid HyperAlloc debug reclaim request version instance=%d version=%u\n",
+			instance_vdev->id, req->version);
+		kfree(req);
+		return -EINVAL;
+	}
+	if (req->instance_id != 0 &&
+		req->instance_id != (uint64_t)instance_vdev->id)
+	{
+		ERROR(
+			"HyperAlloc debug reclaim mismatched instance id: fd=%d arg=%llu\n",
+			instance_vdev->id, req->instance_id);
+		kfree(req);
+		return -EINVAL;
+	}
+
+	req->instance_id = instance_vdev->id;
+	req->result_errno = 0;
+	ret = hvc_hyperalloc_debug_reclaim(
+		instance_vdev->id, virt_to_phys(req));
+	if (ret < 0)
+		req->result_errno = ret;
+
+	if (copy_to_user(user_arg, req, sizeof(*req)))
+	{
+		ERROR("Failed to copy HyperAlloc debug reclaim result to user\n");
+		kfree(req);
+		return -EFAULT;
+	}
+
+	kfree(req);
+	return ret < 0 ? ret : 0;
+}
+
+static int eq_hyperalloc_eqgate_drain_ioctl(
+	eq_instance_vdev_t *instance_vdev, void __user *user_arg)
+{
+	eq_hyperalloc_eqgate_drain_req_t *req;
+	int ret;
+
+	req = kzalloc(sizeof(*req), GFP_KERNEL);
+	if (!req)
+		return -ENOMEM;
+
+	if (copy_from_user(req, user_arg, sizeof(*req)))
+	{
+		ERROR("Failed to copy HyperAlloc EqGate drain request from user\n");
+		kfree(req);
+		return -EFAULT;
+	}
+
+	if (req->version != EQ_HYPERALLOC_EQGATE_DRAIN_VERSION)
+	{
+		ERROR(
+			"Invalid HyperAlloc EqGate drain request version instance=%d version=%u\n",
+			instance_vdev->id, req->version);
+		kfree(req);
+		return -EINVAL;
+	}
+	if (req->instance_id != 0 &&
+		req->instance_id != (uint64_t)instance_vdev->id)
+	{
+		ERROR(
+			"HyperAlloc EqGate drain mismatched instance id: fd=%d arg=%llu\n",
+			instance_vdev->id, req->instance_id);
+		kfree(req);
+		return -EINVAL;
+	}
+
+	req->instance_id = instance_vdev->id;
+	req->result_errno = 0;
+	ret = hvc_hyperalloc_eqgate_drain(
+		instance_vdev->id, virt_to_phys(req));
+	if (ret < 0)
+		req->result_errno = ret;
+
+	if (copy_to_user(user_arg, req, sizeof(*req)))
+	{
+		ERROR("Failed to copy HyperAlloc EqGate drain result to user\n");
+		kfree(req);
+		return -EFAULT;
+	}
+
+	kfree(req);
+	return ret < 0 ? ret : 0;
+}
+
+static int eq_hyperalloc_eqgate_debug_enqueue_ioctl(
+	eq_instance_vdev_t *instance_vdev, void __user *user_arg)
+{
+	eq_hyperalloc_eqgate_debug_enqueue_req_t *req;
+	int ret;
+
+	req = kzalloc(sizeof(*req), GFP_KERNEL);
+	if (!req)
+		return -ENOMEM;
+
+	if (copy_from_user(req, user_arg, sizeof(*req)))
+	{
+		ERROR("Failed to copy HyperAlloc EqGate debug enqueue request from user\n");
+		kfree(req);
+		return -EFAULT;
+	}
+
+	if (req->version != EQ_HYPERALLOC_EQGATE_DEBUG_ENQUEUE_VERSION)
+	{
+		ERROR(
+			"Invalid HyperAlloc EqGate debug enqueue request version instance=%d version=%u\n",
+			instance_vdev->id, req->version);
+		kfree(req);
+		return -EINVAL;
+	}
+	if (req->instance_id != 0 &&
+		req->instance_id != (uint64_t)instance_vdev->id)
+	{
+		ERROR(
+			"HyperAlloc EqGate debug enqueue mismatched instance id: fd=%d arg=%llu\n",
+			instance_vdev->id, req->instance_id);
+		kfree(req);
+		return -EINVAL;
+	}
+
+	req->instance_id = instance_vdev->id;
+	req->result_errno = 0;
+	ret = hvc_hyperalloc_eqgate_debug_enqueue(
+		instance_vdev->id, virt_to_phys(req));
+	if (ret < 0)
+		req->result_errno = ret;
+
+	if (copy_to_user(user_arg, req, sizeof(*req)))
+	{
+		ERROR("Failed to copy HyperAlloc EqGate debug enqueue result to user\n");
+		kfree(req);
+		return -EFAULT;
+	}
+
+	kfree(req);
+	return ret < 0 ? ret : 0;
+}
+
+static int eq_microvm_guest_mem_copy_ioctl(
+	eq_instance_vdev_t *instance_vdev, void __user *user_arg)
+{
+	eq_microvm_guest_mem_copy_t *copy;
+	void *bounce;
+	int ret = 0;
+	bool read_from_guest;
+
+	copy = kzalloc(sizeof(*copy), GFP_KERNEL);
+	if (!copy)
+		return -ENOMEM;
+
+	if (copy_from_user(copy, user_arg, sizeof(*copy)))
+	{
+		ERROR("Failed to copy MicroVM guest-mem copy arg from user\n");
+		kfree(copy);
+		return -EFAULT;
+	}
+
+	if (copy->version != EQ_MICROVM_GUEST_MEM_COPY_VERSION ||
+		copy->len == 0 || copy->len > EQ_MICROVM_GUEST_MEM_COPY_MAX_LEN ||
+		!eq_guest_mem_copy_direction_valid(copy->flags) ||
+		copy->user_ptr == 0)
+	{
+		ERROR(
+			"Invalid MicroVM guest-mem copy arg instance=%d version=%u flags=%#x gpa=%#llx len=%u user_ptr=%#llx\n",
+			instance_vdev->id, copy->version, copy->flags,
+			(unsigned long long)copy->gpa, copy->len,
+			(unsigned long long)copy->user_ptr);
+		kfree(copy);
+		return -EINVAL;
+	}
+
+	if (copy->instance_id != 0 &&
+		copy->instance_id != (uint64_t)instance_vdev->id)
+	{
+		ERROR(
+			"MicroVM guest-mem copy mismatched instance id: fd=%d arg=%llu\n",
+			instance_vdev->id, copy->instance_id);
+		kfree(copy);
+		return -EINVAL;
+	}
+
+	bounce = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
+	if (!bounce)
+	{
+		kfree(copy);
+		return -ENOMEM;
+	}
+
+	read_from_guest =
+		(copy->flags & EQ_MICROVM_GUEST_MEM_COPY_READ_FROM_GUEST) != 0;
+	copy->instance_id = instance_vdev->id;
+	copy->bounce_hpa = virt_to_phys(bounce);
+	copy->result_errno = 0;
+
+	if (!read_from_guest &&
+		copy_from_user(
+			bounce, (void __user *)(unsigned long)copy->user_ptr,
+			copy->len))
+	{
+		ERROR("Failed to copy MicroVM guest-mem write buffer from user\n");
+		ret = -EFAULT;
+		goto out;
+	}
+
+	ret = hvc_microvm_guest_mem_copy(virt_to_phys(copy));
+	if (ret < 0)
+		goto out;
+
+	if (copy->result_errno != 0)
+	{
+		ret = copy->result_errno < 0 ? copy->result_errno :
+					      -copy->result_errno;
+		goto out_copy_result;
+	}
+
+	if (read_from_guest &&
+		copy_to_user(
+			(void __user *)(unsigned long)copy->user_ptr, bounce,
+			copy->len))
+	{
+		ERROR("Failed to copy MicroVM guest-mem read buffer to user\n");
+		ret = -EFAULT;
+		goto out;
+	}
+
+out_copy_result:
+	if (copy_to_user(user_arg, copy, sizeof(*copy)))
+	{
+		ERROR("Failed to copy MicroVM guest-mem copy result to user\n");
+		ret = -EFAULT;
+	}
+out:
+	free_page((unsigned long)bounce);
+	kfree(copy);
+	return ret;
+}
+
+typedef struct microvm_guest_ram_zap_target
+{
+	microvm_guest_ram_vma_context_t *ctx;
+	unsigned long va_start;
+	unsigned long size;
+} microvm_guest_ram_zap_target_t;
+
+static int microvm_guest_ram_collect_zap_targets(
+	eq_instance_vdev_t *instance_vdev,
+	const eq_microvm_guest_ram_mmap_zap_t *zap,
+	microvm_guest_ram_zap_target_t **targets_out,
+	uint64_t *target_count_out)
+{
+	microvm_guest_ram_vma_context_t *ctx;
+	microvm_guest_ram_zap_target_t *targets;
+	uint64_t zap_end;
+	uint64_t count = 0;
+	uint64_t idx = 0;
+
+	*targets_out = NULL;
+	*target_count_out = 0;
+	if (__builtin_add_overflow(zap->gpa, zap->len, &zap_end))
+		return -EINVAL;
+
+	mutex_lock(&instance_vdev->microvm_guest_ram_mmap_lock);
+	list_for_each_entry(ctx, &instance_vdev->microvm_guest_ram_vma_list, list)
+	{
+		uint64_t ctx_end = ctx->gpa_start + ctx->size;
+		if (zap->gpa < ctx_end && zap_end > ctx->gpa_start)
+			count++;
+	}
+	if (count == 0)
+	{
+		mutex_unlock(&instance_vdev->microvm_guest_ram_mmap_lock);
+		return 0;
+	}
+	targets = kcalloc(count, sizeof(*targets), GFP_KERNEL);
+	if (!targets)
+	{
+		mutex_unlock(&instance_vdev->microvm_guest_ram_mmap_lock);
+		return -ENOMEM;
+	}
+	list_for_each_entry(ctx, &instance_vdev->microvm_guest_ram_vma_list, list)
+	{
+		uint64_t ctx_end = ctx->gpa_start + ctx->size;
+		uint64_t overlap_start;
+		uint64_t overlap_end;
+		if (!(zap->gpa < ctx_end && zap_end > ctx->gpa_start))
+			continue;
+		overlap_start = max(zap->gpa, ctx->gpa_start);
+		overlap_end = min(zap_end, ctx_end);
+		microvm_guest_ram_vma_context_get(ctx);
+		targets[idx].ctx = ctx;
+		targets[idx].va_start =
+			ctx->vm_start + (unsigned long)(overlap_start - ctx->gpa_start);
+		targets[idx].size = (unsigned long)(overlap_end - overlap_start);
+		idx++;
+	}
+	mutex_unlock(&instance_vdev->microvm_guest_ram_mmap_lock);
+
+	*targets_out = targets;
+	*target_count_out = idx;
+	return 0;
+}
+
+static void microvm_guest_ram_put_zap_targets(
+	microvm_guest_ram_zap_target_t *targets, uint64_t target_count)
+{
+	uint64_t i;
+
+	if (!targets)
+		return;
+	for (i = 0; i < target_count; i++)
+		microvm_guest_ram_vma_context_put(targets[i].ctx);
+	kfree(targets);
+}
+
+static int eq_microvm_guest_ram_mmap_zap_ioctl(
+	eq_instance_vdev_t *instance_vdev, void __user *user_arg)
+{
+	eq_microvm_guest_ram_mmap_zap_t zap;
+	microvm_guest_ram_zap_target_t *targets = NULL;
+	uint64_t target_count = 0;
+	uint64_t i;
+	int ret;
+
+	if (copy_from_user(&zap, user_arg, sizeof(zap)))
+	{
+		ERROR("Failed to copy MicroVM guest RAM mmap zap arg from user\n");
+		return -EFAULT;
+	}
+	if (zap.version != EQ_MICROVM_GUEST_RAM_MMAP_ZAP_VERSION ||
+		zap.flags != 0 || zap.len == 0 || (zap.gpa & ~PAGE_MASK) ||
+		(zap.len & ~PAGE_MASK) ||
+		!microvm_guest_ram_gpa_range_valid(instance_vdev, zap.gpa, zap.len))
+	{
+		ERROR(
+			"Invalid MicroVM guest RAM mmap zap arg instance=%d version=%u flags=%#x gpa=%#llx len=%#llx\n",
+			instance_vdev->id, zap.version, zap.flags,
+			(unsigned long long)zap.gpa, (unsigned long long)zap.len);
+		return -EINVAL;
+	}
+	if (zap.instance_id != 0 &&
+		zap.instance_id != (uint64_t)instance_vdev->id)
+	{
+		ERROR(
+			"MicroVM guest RAM mmap zap mismatched instance id: fd=%d arg=%llu\n",
+			instance_vdev->id, zap.instance_id);
+		return -EINVAL;
+	}
+
+	zap.instance_id = (uint64_t)instance_vdev->id;
+	zap.result_errno = 0;
+	zap.zapped_vmas = 0;
+	zap.zapped_bytes = 0;
+
+	ret = microvm_guest_ram_collect_zap_targets(
+		instance_vdev, &zap, &targets, &target_count);
+	if (ret)
+	{
+		zap.result_errno = ret;
+		goto out_copy;
+	}
+
+	for (i = 0; i < target_count; i++)
+	{
+		microvm_guest_ram_vma_context_t *ctx = targets[i].ctx;
+		struct vm_area_struct *vma;
+		unsigned long va_start = targets[i].va_start;
+		unsigned long va_end = va_start + targets[i].size;
+
+		if (!ctx || !ctx->mm || targets[i].size == 0)
+			continue;
+		mmap_write_lock(ctx->mm);
+		vma = find_vma(ctx->mm, va_start);
+		if (vma && vma->vm_start <= va_start && vma->vm_end >= va_end &&
+			vma->vm_private_data == ctx)
+		{
+			zap_vma_ptes(vma, va_start, targets[i].size);
+			zap.zapped_vmas++;
+			zap.zapped_bytes += targets[i].size;
+		}
+		else if (zap.result_errno == 0)
+			zap.result_errno = -ENOENT;
+		mmap_write_unlock(ctx->mm);
+	}
+
+	INFO(
+		"MicroVM instance %d guest RAM mmap zap gpa[0x%llx-0x%llx] targets=%llu zapped_vmas=%llu zapped_bytes=0x%llx errno=%d\n",
+		instance_vdev->id, (unsigned long long)zap.gpa,
+		(unsigned long long)(zap.gpa + zap.len),
+		(unsigned long long)target_count,
+		(unsigned long long)zap.zapped_vmas,
+		(unsigned long long)zap.zapped_bytes, zap.result_errno);
+	microvm_guest_ram_report_state(
+		instance_vdev, EQ_MICROVM_GUEST_RAM_MMAP_STATE_REASON_ZAP);
+
+out_copy:
+	microvm_guest_ram_put_zap_targets(targets, target_count);
+	if (copy_to_user(user_arg, &zap, sizeof(zap)))
+	{
+		ERROR("Failed to copy MicroVM guest RAM mmap zap result to user\n");
+		return -EFAULT;
+	}
+	return zap.result_errno < 0 ? zap.result_errno : 0;
+}
+
+static int eq_microvm_guest_ram_mmap_zap_op_ioctl(
+	eq_instance_vdev_t *instance_vdev, unsigned int cmd, void __user *user_arg)
+{
+	eq_microvm_guest_ram_mmap_zap_op_t *op;
+	int ret;
+
+	op = kzalloc(sizeof(*op), GFP_KERNEL);
+	if (!op)
+		return -ENOMEM;
+
+	if (copy_from_user(op, user_arg, sizeof(*op)))
+	{
+		ERROR("Failed to copy MicroVM guest RAM mmap zap op from user\n");
+		kfree(op);
+		return -EFAULT;
+	}
+	if (op->version != 0 &&
+		op->version != EQ_MICROVM_GUEST_RAM_MMAP_ZAP_OP_VERSION)
+	{
+		ERROR(
+			"Invalid MicroVM guest RAM mmap zap op version instance=%d version=%u\n",
+			instance_vdev->id, op->version);
+		kfree(op);
+		return -EINVAL;
+	}
+	if (op->instance_id != 0 &&
+		op->instance_id != (uint64_t)instance_vdev->id)
+	{
+		ERROR(
+			"MicroVM guest RAM mmap zap op mismatched instance id: fd=%d arg=%llu\n",
+			instance_vdev->id, op->instance_id);
+		kfree(op);
+		return -EINVAL;
+	}
+
+	op->instance_id = (uint64_t)instance_vdev->id;
+	if (cmd == EQ_INSTANCE_MICROVM_GUEST_RAM_MMAP_ZAP_POLL)
+	{
+		ret = hvc_microvm_guest_ram_mmap_zap_poll(virt_to_phys(op));
+	}
+	else
+	{
+		if (op->version != EQ_MICROVM_GUEST_RAM_MMAP_ZAP_OP_VERSION)
+		{
+			kfree(op);
+			return -EINVAL;
+		}
+		ret = hvc_microvm_guest_ram_mmap_zap_complete(virt_to_phys(op));
+	}
+	if (ret < 0)
+		op->result_errno = ret;
+
+	if (copy_to_user(user_arg, op, sizeof(*op)))
+	{
+		ERROR("Failed to copy MicroVM guest RAM mmap zap op result to user\n");
+		kfree(op);
+		return -EFAULT;
+	}
+
+	kfree(op);
+	return ret < 0 ? ret : 0;
+}
+
 static int instance_dev_open(struct inode *inode, struct file *file)
 {
 	eq_instance_vdev_t *instance_vdev =
 		container_of(file->private_data, eq_instance_vdev_t, misc);
+	eq_instance_file_context_t *ctx;
 
 	if (!instance_vdev->active)
 	{
 		ERROR("Instance %s is not active\n", instance_vdev->name);
 		return -ENODEV;
 	}
-	file->private_data = instance_vdev;
+	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	if (!ctx)
+		return -ENOMEM;
+	ctx->instance_vdev = instance_vdev;
+	ctx->generation = instance_vdev->microvm_guest_ram_mmap_generation;
+	file->private_data = ctx;
 
 	INFO(
-		"Opened instance device %s with ID %d\n", instance_vdev->name,
-		instance_vdev->id);
+		"Opened instance device %s with ID %d generation=%llu\n",
+		instance_vdev->name, instance_vdev->id,
+		(unsigned long long)ctx->generation);
 
 	return 0;
 }
@@ -632,11 +2015,11 @@ static int instance_dev_open(struct inode *inode, struct file *file)
 static ssize_t instance_dev_read(
 	struct file *file, char __user *buf, size_t count, loff_t *ppos)
 {
-	eq_instance_vdev_t *instance_vdev = file->private_data;
+	eq_instance_vdev_t *instance_vdev = active_instance_vdev_from_file(file);
 
-	if (!instance_vdev->active)
+	if (!instance_vdev)
 	{
-		ERROR("Instance %s is not active\n", instance_vdev->name);
+		ERROR("Instance fd read on inactive or stale device\n");
 		return -ENODEV;
 	}
 
@@ -647,11 +2030,11 @@ static ssize_t instance_dev_read(
 static ssize_t instance_dev_write(
 	struct file *file, const char __user *buf, size_t count, loff_t *ppos)
 {
-	eq_instance_vdev_t *instance_vdev = file->private_data;
+	eq_instance_vdev_t *instance_vdev = active_instance_vdev_from_file(file);
 
-	if (!instance_vdev->active)
+	if (!instance_vdev)
 	{
-		ERROR("Instance %s is not active\n", instance_vdev->name);
+		ERROR("Instance fd write on inactive or stale device\n");
 		return -ENODEV;
 	}
 
@@ -661,19 +2044,19 @@ static ssize_t instance_dev_write(
 
 static int instance_dev_release(struct inode *inode, struct file *file)
 {
-	eq_instance_vdev_t *instance_vdev = file->private_data;
+	eq_instance_file_context_t *ctx = file->private_data;
+	eq_instance_vdev_t *instance_vdev = ctx ? ctx->instance_vdev : NULL;
 
-	if (!instance_vdev->active)
-	{
-		ERROR("Instance %s is not active\n", instance_vdev->name);
-		return -ENODEV;
-	}
-
-	INFO(
-		"Closing instance device %s with ID %d\n", instance_vdev->name,
-		instance_vdev->id);
+	if (instance_vdev)
+		INFO(
+			"Closing instance device %s with ID %d fd_generation=%llu current_generation=%llu active=%d\n",
+			instance_vdev->name, instance_vdev->id,
+			(unsigned long long)ctx->generation,
+			(unsigned long long)instance_vdev->microvm_guest_ram_mmap_generation,
+			instance_vdev->active);
 
 	// Implement release logic here if needed
+	kfree(ctx);
 	file->private_data = NULL;
 	return 0;
 }
@@ -681,11 +2064,11 @@ static int instance_dev_release(struct inode *inode, struct file *file)
 static long instance_dev_ioctl(
 	struct file *file, unsigned int cmd, unsigned long arg)
 {
-	eq_instance_vdev_t *instance_vdev = file->private_data;
+	eq_instance_vdev_t *instance_vdev = active_instance_vdev_from_file(file);
 
-	if (!instance_vdev || !instance_vdev->active)
+	if (!instance_vdev)
 	{
-		ERROR("Instance fd ioctl on inactive device\n");
+		ERROR("Instance fd ioctl on inactive or stale device\n");
 		return -ENODEV;
 	}
 
@@ -797,6 +2180,224 @@ static long instance_dev_ioctl(
 			instance_vdev->id, resize_arg.vcpu_count);
 		return 0;
 	}
+	case EQ_INSTANCE_MICROVM_STOP:
+	{
+		eq_microvm_stop_arg_t stop_arg;
+		int ret;
+		if (copy_from_user(
+				&stop_arg, (void __user *)arg,
+				sizeof(eq_microvm_stop_arg_t)))
+		{
+			ERROR("Failed to copy EQ_INSTANCE_MICROVM_STOP arg from user\n");
+			return -EFAULT;
+		}
+
+		if (stop_arg.instance_id != 0 &&
+			stop_arg.instance_id != (uint64_t)instance_vdev->id)
+		{
+			ERROR(
+				"EQ_INSTANCE_MICROVM_STOP mismatched instance id: fd=%d arg=%llu\n",
+				instance_vdev->id, stop_arg.instance_id);
+			return -EINVAL;
+		}
+
+		ret = hvc_microvm_stop(instance_vdev->id);
+		if (ret < 0)
+		{
+			ERROR(
+				"HMicroVMStop failed for instance %d ret=%d\n",
+				instance_vdev->id, ret);
+			return ret;
+		}
+
+		stop_arg.instance_id = instance_vdev->id;
+		stop_arg.active_pcpus_signalled = (uint64_t)ret;
+		if (copy_to_user((void __user *)arg, &stop_arg, sizeof(stop_arg)))
+		{
+			ERROR("Failed to copy EQ_INSTANCE_MICROVM_STOP result back to user\n");
+			return -EFAULT;
+		}
+		INFO(
+			"MicroVM instance %d stopped active_pcpus_signalled=%d\n",
+			instance_vdev->id, ret);
+		return 0;
+	}
+	case EQ_INSTANCE_MICROVM_BOOT:
+	{
+		eq_microvm_boot_arg_t boot_arg;
+		int ret;
+		if (copy_from_user(
+				&boot_arg, (void __user *)arg,
+				sizeof(eq_microvm_boot_arg_t)))
+		{
+			ERROR("Failed to copy EQ_INSTANCE_MICROVM_BOOT arg from user\n");
+			return -EFAULT;
+		}
+
+		if (boot_arg.instance_id != 0 &&
+			boot_arg.instance_id != (uint64_t)instance_vdev->id)
+		{
+			ERROR(
+				"EQ_INSTANCE_MICROVM_BOOT mismatched instance id: fd=%d arg=%llu\n",
+				instance_vdev->id, boot_arg.instance_id);
+			return -EINVAL;
+		}
+
+		ret = hvc_microvm_boot(
+			instance_vdev->id, boot_arg.entry_point,
+			boot_arg.boot_protocol);
+		if (ret < 0)
+		{
+			ERROR(
+				"HMicroVMBoot failed for instance %d entry_point=%llx boot_protocol=%u ret=%d\n",
+				instance_vdev->id, boot_arg.entry_point,
+				boot_arg.boot_protocol, ret);
+			return ret;
+		}
+
+		boot_arg.instance_id = instance_vdev->id;
+		if (copy_to_user((void __user *)arg, &boot_arg, sizeof(boot_arg)))
+		{
+			ERROR("Failed to copy EQ_INSTANCE_MICROVM_BOOT result back to user\n");
+			return -EFAULT;
+		}
+		INFO(
+			"MicroVM instance %d booted entry_point=%llx boot_protocol=%u\n",
+			instance_vdev->id, boot_arg.entry_point,
+			boot_arg.boot_protocol);
+		return 0;
+	}
+	case EQ_INSTANCE_HYPERALLOC_VFIO_DMA_POLL:
+	case EQ_INSTANCE_HYPERALLOC_VFIO_DMA_COMPLETE:
+		return eq_hyperalloc_vfio_dma_ioctl(
+			instance_vdev, cmd, (void __user *)arg);
+	case EQ_INSTANCE_HYPERALLOC_VFIO_DMA_DEBUG_REQUEST:
+		return eq_hyperalloc_vfio_dma_debug_request_ioctl(
+			instance_vdev, (void __user *)arg);
+	case EQ_INSTANCE_HYPERALLOC_MEMORY_TARGET:
+		return eq_hyperalloc_memory_target_ioctl(
+			instance_vdev, (void __user *)arg);
+	case EQ_INSTANCE_HYPERALLOC_QUERY:
+		return eq_hyperalloc_query_ioctl(
+			instance_vdev, (void __user *)arg);
+	case EQ_INSTANCE_HYPERALLOC_DEBUG_RECLAIM:
+		return eq_hyperalloc_debug_reclaim_ioctl(
+			instance_vdev, (void __user *)arg);
+	case EQ_INSTANCE_HYPERALLOC_EQGATE_DRAIN:
+		return eq_hyperalloc_eqgate_drain_ioctl(
+			instance_vdev, (void __user *)arg);
+	case EQ_INSTANCE_HYPERALLOC_EQGATE_DEBUG_ENQUEUE:
+		return eq_hyperalloc_eqgate_debug_enqueue_ioctl(
+			instance_vdev, (void __user *)arg);
+	case EQ_INSTANCE_MICROVM_GUEST_MEM_COPY:
+		return eq_microvm_guest_mem_copy_ioctl(
+			instance_vdev, (void __user *)arg);
+	case EQ_INSTANCE_MICROVM_GUEST_RAM_MMAP_ZAP:
+		return eq_microvm_guest_ram_mmap_zap_ioctl(
+			instance_vdev, (void __user *)arg);
+	case EQ_INSTANCE_MICROVM_GUEST_RAM_MMAP_ZAP_POLL:
+	case EQ_INSTANCE_MICROVM_GUEST_RAM_MMAP_ZAP_COMPLETE:
+		return eq_microvm_guest_ram_mmap_zap_op_ioctl(
+			instance_vdev, cmd, (void __user *)arg);
+	case EQ_INSTANCE_MICROVM_GUEST_RAM_MMAP_QUERY_V1:
+	{
+		eq_microvm_guest_ram_mmap_query_v1_t query;
+		uint64_t generation;
+		int active_mmaps;
+		int current_mmaps;
+		int stale_mmaps;
+
+		if (copy_from_user(
+				&query, (void __user *)arg,
+				sizeof(eq_microvm_guest_ram_mmap_query_v1_t)))
+		{
+			ERROR(
+				"Failed to copy EQ_INSTANCE_MICROVM_GUEST_RAM_MMAP_QUERY_V1 arg from user\n");
+			return -EFAULT;
+		}
+		if (query.version != EQ_MICROVM_GUEST_RAM_MMAP_QUERY_VERSION_V1)
+		{
+			ERROR(
+				"Invalid MicroVM guest RAM mmap v1 query version %u\n",
+				query.version);
+			return -EINVAL;
+		}
+		if (query.instance_id != 0 &&
+			query.instance_id != (uint64_t)instance_vdev->id)
+		{
+			ERROR(
+				"MicroVM guest RAM mmap v1 query mismatched instance id: fd=%d arg=%llu\n",
+				instance_vdev->id, query.instance_id);
+			return -EINVAL;
+		}
+
+		mutex_lock(&instance_vdev->microvm_guest_ram_mmap_lock);
+		microvm_guest_ram_mmap_snapshot_locked(
+			instance_vdev, &generation, &active_mmaps, &current_mmaps,
+			&stale_mmaps);
+		mutex_unlock(&instance_vdev->microvm_guest_ram_mmap_lock);
+		query.flags = 0;
+		query.instance_id = instance_vdev->id;
+		query.active_mmaps = (uint64_t)active_mmaps;
+		if (copy_to_user((void __user *)arg, &query, sizeof(query)))
+		{
+			ERROR(
+				"Failed to copy EQ_INSTANCE_MICROVM_GUEST_RAM_MMAP_QUERY_V1 result back to user\n");
+			return -EFAULT;
+		}
+		return 0;
+	}
+	case EQ_INSTANCE_MICROVM_GUEST_RAM_MMAP_QUERY:
+	{
+		eq_microvm_guest_ram_mmap_query_t query;
+		uint64_t generation;
+		int active_mmaps;
+		int current_mmaps;
+		int stale_mmaps;
+
+		if (copy_from_user(
+				&query, (void __user *)arg,
+				sizeof(eq_microvm_guest_ram_mmap_query_t)))
+		{
+			ERROR(
+				"Failed to copy EQ_INSTANCE_MICROVM_GUEST_RAM_MMAP_QUERY arg from user\n");
+			return -EFAULT;
+		}
+		if (query.version != EQ_MICROVM_GUEST_RAM_MMAP_QUERY_VERSION)
+		{
+			ERROR(
+				"Invalid MicroVM guest RAM mmap query version %u\n",
+				query.version);
+			return -EINVAL;
+		}
+		if (query.instance_id != 0 &&
+			query.instance_id != (uint64_t)instance_vdev->id)
+		{
+			ERROR(
+				"MicroVM guest RAM mmap query mismatched instance id: fd=%d arg=%llu\n",
+				instance_vdev->id, query.instance_id);
+			return -EINVAL;
+		}
+
+		mutex_lock(&instance_vdev->microvm_guest_ram_mmap_lock);
+		microvm_guest_ram_mmap_snapshot_locked(
+			instance_vdev, &generation, &active_mmaps, &current_mmaps,
+			&stale_mmaps);
+		mutex_unlock(&instance_vdev->microvm_guest_ram_mmap_lock);
+		query.flags = 0;
+		query.instance_id = instance_vdev->id;
+		query.generation = generation;
+		query.active_mmaps = (uint64_t)active_mmaps;
+		query.current_mmaps = (uint64_t)current_mmaps;
+		query.stale_mmaps = (uint64_t)stale_mmaps;
+		if (copy_to_user((void __user *)arg, &query, sizeof(query)))
+		{
+			ERROR(
+				"Failed to copy EQ_INSTANCE_MICROVM_GUEST_RAM_MMAP_QUERY result back to user\n");
+			return -EFAULT;
+		}
+		return 0;
+	}
 	default:
 		return -ENOTTY;
 	}
@@ -807,17 +2408,23 @@ static long instance_dev_ioctl(
 /// ("/dev/eqinstance_<instance_id>").
 static int instance_mmap(struct file *file, struct vm_area_struct *vma)
 {
-	eq_instance_vdev_t *instance_vdev = file->private_data;
+	eq_instance_vdev_t *instance_vdev = active_instance_vdev_from_file(file);
+	microvm_guest_ram_vma_context_t *guest_ram_ctx = NULL;
 	int ret = 0;
-	int instance_id = instance_vdev->id;
+	int instance_id;
 	unsigned long pfn_start, mmap_size;
 	unsigned long mem_size;
+	uint64_t file_offset = 0;
+	uint64_t mmap_end = 0;
+	uint64_t guest_ram_gpa_start = 0;
+	bool microvm_guest_ram_mmap = false;
 
-	if (!instance_vdev->active)
+	if (!instance_vdev)
 	{
-		ERROR("Instance %s is not active\n", instance_vdev->name);
+		ERROR("Instance mmap on inactive or stale device\n");
 		return -ENODEV;
 	}
+	instance_id = instance_vdev->id;
 
 	// Check alignment and size
 	if (vma->vm_start & ~PAGE_MASK || vma->vm_end & ~PAGE_MASK)
@@ -961,20 +2568,34 @@ static int instance_mmap(struct file *file, struct vm_area_struct *vma)
 		{
 			mem_size =
 				instance_vdev->metadata.init_memory_region_size_mib * 1024 * 1024;
+			file_offset = (uint64_t)vma->vm_pgoff << PAGE_SHIFT;
 			// For microVM instances, we only have one memory region to map.
-			if (mmap_size > mem_size)
+			if (__builtin_add_overflow(
+				    file_offset, (uint64_t)mmap_size, &mmap_end) ||
+			    mmap_size > mem_size || mmap_end > mem_size)
 			{
 				ERROR(
 					"MicroVM memory region size 0x%llx is smaller than requested "
 					"mmap "
-					"size "
-					"0x%lx\n",
-					(unsigned long long)mem_size, mmap_size);
+					"offset 0x%llx size 0x%lx\n",
+					(unsigned long long)mem_size,
+					(unsigned long long)file_offset, mmap_size);
 				return -EINVAL;
 			}
 			pfn_start =
 				(instance_vdev->metadata.memory_region_base_gpa >> PAGE_SHIFT) +
 				vma->vm_pgoff;
+			if (!microvm_guest_ram_file_offset_to_gpa(
+				    instance_vdev, file_offset, mmap_size,
+				    &guest_ram_gpa_start))
+			{
+				ERROR(
+					"MicroVM memory mmap offset 0x%llx size 0x%lx cannot map to guest RAM GPA for instance %s\n",
+					(unsigned long long)file_offset, mmap_size,
+					instance_vdev->name);
+				return -EINVAL;
+			}
+			microvm_guest_ram_mmap = true;
 			INFO(
 				"[%s] Instance [%d] MicroVM memory region in instance %s, "
 				"va[0x%lx-0x%lx] size 0x%lx\n",
@@ -1002,6 +2623,24 @@ static int instance_mmap(struct file *file, struct vm_area_struct *vma)
 		return -EINVAL;
 	}
 
+	if (microvm_guest_ram_mmap)
+	{
+		guest_ram_ctx = kzalloc(sizeof(*guest_ram_ctx), GFP_KERNEL);
+		if (!guest_ram_ctx)
+			return -ENOMEM;
+		guest_ram_ctx->instance_vdev = instance_vdev;
+		guest_ram_ctx->mm = vma->vm_mm;
+		mmgrab(guest_ram_ctx->mm);
+		INIT_LIST_HEAD(&guest_ram_ctx->list);
+		guest_ram_ctx->generation = instance_generation_from_file(file);
+		guest_ram_ctx->gpa_start = guest_ram_gpa_start;
+		guest_ram_ctx->size = mmap_size;
+		guest_ram_ctx->vm_start = vma->vm_start;
+		guest_ram_ctx->vm_end = vma->vm_end;
+		guest_ram_ctx->listed = false;
+		atomic_set(&guest_ram_ctx->refs, 1);
+	}
+
 	INFO(
 		"[%s] Instance [%d] remap_pfn_range: va[0x%lx-0x%lx], pgoff 0x%lx\n",
 		__func__, instance_id, vma->vm_start, vma->vm_end, vma->vm_pgoff);
@@ -1009,13 +2648,52 @@ static int instance_mmap(struct file *file, struct vm_area_struct *vma)
 		"[%s] Instance [%d] remap_pfn_range: pfn_start 0x%lx,mmap_size 0x%lx\n",
 		__func__, instance_id, pfn_start, mmap_size);
 
+	if (microvm_guest_ram_mmap)
+	{
+		vm_flags_set(
+			vma,
+			VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP |
+				VM_DONTCOPY);
+		vma->vm_ops = &microvm_guest_ram_vm_ops;
+		vma->vm_private_data = guest_ram_ctx;
+		mutex_lock(&instance_vdev->microvm_guest_ram_mmap_lock);
+		list_add_tail(
+			&guest_ram_ctx->list,
+			&instance_vdev->microvm_guest_ram_vma_list);
+		guest_ram_ctx->listed = true;
+		mutex_unlock(&instance_vdev->microvm_guest_ram_mmap_lock);
+		microvm_guest_ram_mmap_account(
+			guest_ram_ctx, "mmap",
+			EQ_MICROVM_GUEST_RAM_MMAP_STATE_REASON_MMAP, vma->vm_start,
+			vma->vm_end);
+		INFO(
+			"[%s] Instance [%d] MicroVM guest RAM lazy fault mmap gpa[0x%llx-0x%llx] va[0x%lx-0x%lx]\n",
+			__func__, instance_id,
+			(unsigned long long)guest_ram_ctx->gpa_start,
+			(unsigned long long)(guest_ram_ctx->gpa_start + guest_ram_ctx->size),
+			vma->vm_start, vma->vm_end);
+		return 0;
+	}
+
 	ret = remap_pfn_range(
 		vma, vma->vm_start, pfn_start, mmap_size, vma->vm_page_prot);
 
 	if (ret)
+	{
 		ERROR(
 			"%s: remap_pfn_range failed at [0x%lx  0x%lx]\n", __func__,
 			vma->vm_start, vma->vm_end);
+		kfree(guest_ram_ctx);
+	}
+	else if (microvm_guest_ram_mmap)
+	{
+		vma->vm_ops = &microvm_guest_ram_vm_ops;
+		vma->vm_private_data = guest_ram_ctx;
+		microvm_guest_ram_mmap_account(
+			guest_ram_ctx, "mmap",
+			EQ_MICROVM_GUEST_RAM_MMAP_STATE_REASON_MMAP, vma->vm_start,
+			vma->vm_end);
+	}
 
 	return ret;
 }
@@ -1203,7 +2881,6 @@ int create_instance(eq_create_instance_arg_t *arg)
 
 	instance_vdev->id = instance_id;
 	instance_vdev->instance_type = arg->instance_type;
-	instance_vdev->active = true;
 	instance_vdev->status = STATUS_CREATED;
 	instance_vdev->microvm_console_ring_virt = microvm_console_ring_virt;
 	microvm_console_ring_virt = NULL;
@@ -1212,6 +2889,10 @@ int create_instance(eq_create_instance_arg_t *arg)
 	microvm_block_notify_ring_virt = NULL;
 	INIT_LIST_HEAD(&instance_vdev->irq_routes);
 	mutex_init(&instance_vdev->irq_routes_lock);
+	snprintf(
+		instance_vdev->name, sizeof(instance_vdev->name), "%s%d",
+		EQINSTANCE_DEV_PREFIX, instance_vdev->id);
+	microvm_guest_ram_prepare_generation(instance_vdev);
 
 	memcpy(
 		&instance_vdev->metadata, instance_metadata,
@@ -1220,10 +2901,9 @@ int create_instance(eq_create_instance_arg_t *arg)
 		instance_vdev->metadata.microvm_console_ring_gpa;
 	arg->microvm_block_notify_ring_gpa =
 		instance_vdev->metadata.microvm_block_notify_ring_gpa;
-
-	snprintf(
-		instance_vdev->name, sizeof(instance_vdev->name), "%s%d",
-		EQINSTANCE_DEV_PREFIX, instance_vdev->id);
+	instance_vdev->active = true;
+	microvm_guest_ram_report_state(
+		instance_vdev, EQ_MICROVM_GUEST_RAM_MMAP_STATE_REASON_CREATE);
 
 	instance_vdev->misc.name = instance_vdev->name;
 	instance_vdev->misc.minor = MISC_DYNAMIC_MINOR;
@@ -1319,7 +2999,26 @@ int unregister_instance_dev(eq_instance_vdev_t *vdev)
 	}
 
 	misc_deregister(&vdev->misc);
+	vdev->active = false;
+	microvm_guest_ram_zap_unregister_vmas(vdev);
 	eq_irq_routes_clear(vdev);
+	if (atomic_read(&vdev->microvm_guest_ram_mmap_count) != 0)
+	{
+		uint64_t generation;
+		int active_mmaps;
+		int current_mmaps;
+		int stale_mmaps;
+
+		mutex_lock(&vdev->microvm_guest_ram_mmap_lock);
+		microvm_guest_ram_mmap_snapshot_locked(
+			vdev, &generation, &active_mmaps, &current_mmaps,
+			&stale_mmaps);
+		mutex_unlock(&vdev->microvm_guest_ram_mmap_lock);
+		WARNING(
+			"Unregistering instance %s with active MicroVM guest RAM mmaps generation=%llu active_mmaps=%d current_mmaps=%d stale_mmaps=%d\n",
+			vdev->name, (unsigned long long)generation, active_mmaps,
+			current_mmaps, stale_mmaps);
+	}
 	if (vdev->microvm_console_ring_virt)
 	{
 		free_page((unsigned long)vdev->microvm_console_ring_virt);
@@ -1330,7 +3029,6 @@ int unregister_instance_dev(eq_instance_vdev_t *vdev)
 		free_page((unsigned long)vdev->microvm_block_notify_ring_virt);
 		vdev->microvm_block_notify_ring_virt = NULL;
 	}
-	vdev->active = false;
 	INFO(
 		"Successfully unregistered instance %s with ID %d\n", vdev->name,
 		vdev->id);
@@ -1339,12 +3037,21 @@ int unregister_instance_dev(eq_instance_vdev_t *vdev)
 
 void instances_init(void)
 {
+	int i;
+
 	// Just clear the instances array to ensure no garbage data.
+	instances_exiting = false;
 	memset(instances_array, 0, sizeof(instances_array));
+	for (i = 0; i < MAX_EQ_INSTANCES_NUM; i++)
+	{
+		mutex_init(&instances_array[i].microvm_guest_ram_mmap_lock);
+		INIT_LIST_HEAD(&instances_array[i].microvm_guest_ram_vma_list);
+	}
 }
 
 void instances_exit(void)
 {
+	instances_exiting = true;
 	for (int i = 0; i < MAX_EQ_INSTANCES_NUM; i++)
 	{
 		if (instances_array[i].active)

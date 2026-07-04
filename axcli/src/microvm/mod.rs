@@ -25,8 +25,9 @@ use std::fs;
 use std::thread;
 use std::time::Duration;
 
-use crate::hvc::hvc_init_shim;
-use cli::MicroVMCreateArgs;
+use crate::hvc::{hvc_init_shim, hvc_microvm_remove, hvc_microvm_stop};
+use crate::ioctl;
+use cli::{MicroVMCreateArgs, MicroVMRemoveArgs, MicroVMStopArgs};
 
 use arch::configure_system_for_boot;
 use arch::load_kernel;
@@ -42,19 +43,65 @@ pub fn init_gate() {
     hvc_init_shim(0);
 }
 
+pub fn remove_microvm(args: MicroVMRemoveArgs) -> AxResult {
+    let result = hvc_microvm_remove(args.instance_id);
+    if result < 0 {
+        return Err(ax_err_type!(
+            BadState,
+            format_args!(
+                "Failed to remove microVM instance {}: hvc returned {}",
+                args.instance_id, result
+            )
+        ));
+    }
+
+    info!(
+        "Removed microVM instance {} remaining_external_refs={}",
+        args.instance_id, result
+    );
+    Ok(())
+}
+
+pub fn stop_microvm(args: MicroVMStopArgs) -> AxResult {
+    let result = hvc_microvm_stop(args.instance_id);
+    if result < 0 {
+        return Err(ax_err_type!(
+            BadState,
+            format_args!(
+                "Failed to stop microVM instance {}: hvc returned {}",
+                args.instance_id, result
+            )
+        ));
+    }
+
+    info!(
+        "Stopped microVM instance {} active_pcpus_signalled={}",
+        args.instance_id, result
+    );
+    Ok(())
+}
+
 pub fn create_microvm(args: MicroVMCreateArgs) -> AxResult {
     info!(
         "Create Linux instance with config file path: {:?}",
         args.config_file
     );
 
-    let config_json = fs::read_to_string(args.config_file)
-        .expect("Unable to open or read from the configuration file");
+    let config_json = fs::read_to_string(&args.config_file).map_err(|e| {
+        ax_err_type!(
+            InvalidInput,
+            format_args!(
+                "Unable to open or read microVM config {}: {}",
+                args.config_file,
+                e
+            )
+        )
+    })?;
 
     // Build microVM resources from the configuration file.
     // It will create the microVM instance in the kernel via ioctl and get an instance ID, which is used as the VM ID for later interactions with this microVM.
     // This includes preparing the VM configuration, allocating guest memory, and setting up VFIO DMA mappings if needed.
-    let vm_resources = VmResources::from_json(&config_json).expect("Failed to build VM resources");
+    let vm_resources = VmResources::from_json(&config_json)?;
 
     if !vm_resources.passthrough_devices.is_empty() {
         for bdf in &vm_resources.passthrough_devices {
@@ -84,9 +131,12 @@ If devices are still not visible in guest, complete BAR/interrupt mapping is lik
         )
     })?;
 
-    let guest_memory = vm_resources
-        .allocate_guest_memory()
-        .expect("Failed to allocate guest memory");
+    let guest_memory = vm_resources.allocate_guest_memory().map_err(|e| {
+        ax_err_type!(
+            BadState,
+            format_args!("Failed to allocate guest memory: {}", e)
+        )
+    })?;
 
     let keep_foreground = vm_resources.vfio.is_some()
         || vm_resources.microvm_console_ring_gpa != 0
@@ -117,7 +167,8 @@ If devices are still not visible in guest, complete BAR/interrupt mapping is lik
         );
     }
 
-    let mut vm = Vm::new(vm_resources.fd).expect("Failed to create VM instance");
+    let mut vm = Vm::new(vm_resources.fd)
+        .map_err(|e| ax_err_type!(BadState, format_args!("Failed to create VM instance: {}", e)))?;
     console::attach_console(
         vm_resources.fd,
         vm_resources.vm_id,
@@ -129,6 +180,8 @@ If devices are still not visible in guest, complete BAR/interrupt mapping is lik
         vm_resources.vm_id,
         default_vcpus,
         max_vcpus,
+        !vm_resources.block_devices.is_empty(),
+        vm_resources.vfio.is_some(),
     )
     .map_err(|e| ax_err_type!(BadState, format_args!("control socket error {}", e)))?;
 
@@ -137,7 +190,6 @@ If devices are still not visible in guest, complete BAR/interrupt mapping is lik
         Some(block::start_block_backend(
             vm_resources.vm_id,
             vm_resources.fd,
-            vm.guest_memory().clone(),
             vm_resources.microvm_block_notify_ring_gpa,
             vm_resources.block_devices.clone(),
         )?)
@@ -163,11 +215,17 @@ If devices are still not visible in guest, complete BAR/interrupt mapping is lik
     )
     .map_err(|e| ax_err_type!(BadState, format_args!("configuration error {}", e)))?;
 
-    crate::hvc::hvc_microvm_boot(
+    ioctl::ioctl_microvm_boot(
+        vm_resources.fd,
         vm_resources.vm_id as u64,
         entry_point.entry_addr.0,
-        entry_point.protocol as u8,
-    );
+        entry_point.protocol as u32,
+    )
+    .map_err(|e| ax_err_type!(BadState, format_args!("microVM boot ioctl error {}", e)))?;
+
+    if vm_resources.vfio.is_none() {
+        drop(vm);
+    }
 
     if keep_foreground {
         if vm_resources.vfio.is_some() {
@@ -184,6 +242,10 @@ fn run_console_control_loop() -> ! {
     loop {
         console::poll_console_once();
         control::poll_control_once();
+        control::poll_policy_once();
+        control::poll_metrics_once();
+        control::poll_policy_eval_once();
+        control::poll_scheduler_once();
         thread::sleep(Duration::from_millis(10));
     }
 }

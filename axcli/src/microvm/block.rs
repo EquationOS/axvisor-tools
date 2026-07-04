@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use axerrno::{AxResult, ax_err, ax_err_type};
 use eqvm_defs::{
+    EQ_MICROVM_GUEST_MEM_COPY_MAX_LEN,
     MICROVM_BLOCK_NOTIFY_MAGIC, MICROVM_BLOCK_NOTIFY_PAGE_SIZE, MICROVM_BLOCK_NOTIFY_RING_SIZE,
     MICROVM_IRQ_INDEX_SOURCE_BLOCK, MMAP_MICROVM_BLOCK_NOTIFY_MAGIC_NUMBER,
     MicroVmBlockNotifyEntry, MicroVmBlockNotifyPage,
@@ -179,10 +180,106 @@ impl QueueRuntime {
     }
 }
 
+enum GuestMemoryAccess {
+    #[allow(dead_code)]
+    Mmap(GuestMemoryMmap),
+    Mediated { instance_id: usize, instance_fd: i32 },
+}
+
+impl GuestMemoryAccess {
+    fn mediated(instance_id: usize, instance_fd: i32) -> Self {
+        Self::Mediated {
+            instance_id,
+            instance_fd,
+        }
+    }
+
+    fn read_slice(&self, buf: &mut [u8], addr: u64) -> AxResult {
+        match self {
+            Self::Mmap(mem) => mem.read_slice(buf, GuestAddress(addr)).map_err(|e| {
+                ax_err_type!(
+                    BadState,
+                    format_args!("guest read_slice {:#x}+{}: {}", addr, buf.len(), e)
+                )
+            }),
+            Self::Mediated {
+                instance_id,
+                instance_fd,
+            } => {
+                let chunk_limit = EQ_MICROVM_GUEST_MEM_COPY_MAX_LEN as usize;
+                let mut done = 0usize;
+                while done < buf.len() {
+                    let n = chunk_limit.min(buf.len() - done);
+                    ioctl::ioctl_microvm_guest_mem_read(
+                        *instance_fd,
+                        *instance_id as u64,
+                        addr + done as u64,
+                        &mut buf[done..done + n],
+                    )
+                    .map_err(|e| ax_err_type!(BadState, format_args!("{}", e)))?;
+                    done += n;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn write_slice(&self, buf: &[u8], addr: u64) -> AxResult {
+        match self {
+            Self::Mmap(mem) => mem.write_slice(buf, GuestAddress(addr)).map_err(|e| {
+                ax_err_type!(
+                    BadState,
+                    format_args!("guest write_slice {:#x}+{}: {}", addr, buf.len(), e)
+                )
+            }),
+            Self::Mediated {
+                instance_id,
+                instance_fd,
+            } => {
+                let chunk_limit = EQ_MICROVM_GUEST_MEM_COPY_MAX_LEN as usize;
+                let mut done = 0usize;
+                while done < buf.len() {
+                    let n = chunk_limit.min(buf.len() - done);
+                    ioctl::ioctl_microvm_guest_mem_write(
+                        *instance_fd,
+                        *instance_id as u64,
+                        addr + done as u64,
+                        &buf[done..done + n],
+                    )
+                    .map_err(|e| ax_err_type!(BadState, format_args!("{}", e)))?;
+                    done += n;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn read_obj<T: ByteValued>(&self, addr: u64) -> AxResult<T> {
+        let mut value = core::mem::MaybeUninit::<T>::uninit();
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(
+                value.as_mut_ptr().cast::<u8>(),
+                core::mem::size_of::<T>(),
+            )
+        };
+        self.read_slice(bytes, addr)?;
+        Ok(unsafe { value.assume_init() })
+    }
+
+    fn write_obj<T: ByteValued>(&self, value: T, addr: u64) -> AxResult {
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&value as *const T).cast::<u8>(),
+                core::mem::size_of::<T>(),
+            )
+        };
+        self.write_slice(bytes, addr)
+    }
+}
+
 pub fn start_block_backend(
     instance_id: usize,
     instance_fd: i32,
-    guest_memory: GuestMemoryMmap,
     notify_ring_gpa: usize,
     drives: Vec<BlockDeviceConfig>,
 ) -> AxResult<BlockBackend> {
@@ -237,6 +334,7 @@ pub fn start_block_backend(
     let worker = thread::Builder::new()
         .name(worker_name)
         .spawn(move || {
+            let guest_memory = GuestMemoryAccess::mediated(instance_id, instance_fd);
             block_backend_loop(
                 instance_id,
                 instance_fd,
@@ -285,7 +383,7 @@ fn lock_drive_file(
 fn block_backend_loop(
     instance_id: usize,
     instance_fd: i32,
-    guest_memory: GuestMemoryMmap,
+    guest_memory: GuestMemoryAccess,
     drives: Vec<BlockDrive>,
     mut notify: BlockNotifySession,
 ) {
@@ -355,27 +453,27 @@ fn block_backend_loop(
     }
 }
 
-fn read_u16(mem: &GuestMemoryMmap, addr: u64) -> AxResult<u16> {
+fn read_u16(mem: &GuestMemoryAccess, addr: u64) -> AxResult<u16> {
     let mut buf = [0u8; 2];
-    mem.read_slice(&mut buf, GuestAddress(addr))
+    mem.read_slice(&mut buf, addr)
         .map_err(|e| ax_err_type!(BadState, format_args!("guest read_u16 {:#x}: {}", addr, e)))?;
     Ok(u16::from_le_bytes(buf))
 }
 
-fn write_u16(mem: &GuestMemoryMmap, addr: u64, val: u16) -> AxResult {
-    mem.write_slice(&val.to_le_bytes(), GuestAddress(addr))
+fn write_u16(mem: &GuestMemoryAccess, addr: u64, val: u16) -> AxResult {
+    mem.write_slice(&val.to_le_bytes(), addr)
         .map_err(|e| ax_err_type!(BadState, format_args!("guest write_u16 {:#x}: {}", addr, e)))
 }
 
-fn write_status(mem: &GuestMemoryMmap, desc: VringDesc, status: u8) -> AxResult {
+fn write_status(mem: &GuestMemoryAccess, desc: VringDesc, status: u8) -> AxResult {
     if desc.len == 0 || (desc.flags & VRING_DESC_F_WRITE) == 0 {
         return ax_err!(InvalidInput, "invalid virtio-blk status descriptor");
     }
-    mem.write_slice(&[status], GuestAddress(desc.addr))
+    mem.write_slice(&[status], desc.addr)
         .map_err(|e| ax_err_type!(BadState, format_args!("guest status write: {}", e)))
 }
 
-fn read_desc(mem: &GuestMemoryMmap, queue: &QueueRuntime, index: u16) -> AxResult<VringDesc> {
+fn read_desc(mem: &GuestMemoryAccess, queue: &QueueRuntime, index: u16) -> AxResult<VringDesc> {
     if index >= queue.queue_size {
         return ax_err!(
             InvalidInput,
@@ -386,12 +484,12 @@ fn read_desc(mem: &GuestMemoryMmap, queue: &QueueRuntime, index: u16) -> AxResul
         );
     }
     let addr = queue.desc_addr + (index as u64) * core::mem::size_of::<VringDesc>() as u64;
-    mem.read_obj::<VringDesc>(GuestAddress(addr))
+    mem.read_obj::<VringDesc>(addr)
         .map_err(|e| ax_err_type!(BadState, format_args!("guest desc read {:#x}: {}", addr, e)))
 }
 
 fn descriptor_chain(
-    mem: &GuestMemoryMmap,
+    mem: &GuestMemoryAccess,
     queue: &QueueRuntime,
     head: u16,
 ) -> AxResult<Vec<VringDesc>> {
@@ -414,7 +512,7 @@ fn descriptor_chain(
     ax_err!(InvalidInput, "virtio-blk descriptor chain loop")
 }
 
-fn read_request_header(mem: &GuestMemoryMmap, desc: VringDesc) -> AxResult<VirtioBlkOutHdr> {
+fn read_request_header(mem: &GuestMemoryAccess, desc: VringDesc) -> AxResult<VirtioBlkOutHdr> {
     if desc.len < core::mem::size_of::<VirtioBlkOutHdr>() as u32 {
         return ax_err!(InvalidInput, "virtio-blk header descriptor is too small");
     }
@@ -424,7 +522,7 @@ fn read_request_header(mem: &GuestMemoryMmap, desc: VringDesc) -> AxResult<Virti
             "virtio-blk header descriptor is device-writable"
         );
     }
-    mem.read_obj::<VirtioBlkOutHdr>(GuestAddress(desc.addr))
+    mem.read_obj::<VirtioBlkOutHdr>(desc.addr)
         .map_err(|e| {
             ax_err_type!(
                 BadState,
@@ -464,7 +562,7 @@ fn check_image_range(drive: &BlockDrive, file_off: u64, len: u64) -> AxResult {
 
 fn copy_file_to_guest(
     file: &File,
-    mem: &GuestMemoryMmap,
+    mem: &GuestMemoryAccess,
     mut file_off: u64,
     desc: VringDesc,
 ) -> AxResult<usize> {
@@ -490,7 +588,7 @@ fn copy_file_to_guest(
                 Err(e) => return ax_err!(Io, format_args!("block image read: {}", e)),
             }
         }
-        mem.write_slice(&buf[..n], GuestAddress(guest_off))
+        mem.write_slice(&buf[..n], guest_off)
             .map_err(|e| {
                 ax_err_type!(
                     BadState,
@@ -506,7 +604,7 @@ fn copy_file_to_guest(
 }
 
 fn copy_guest_to_file(
-    mem: &GuestMemoryMmap,
+    mem: &GuestMemoryAccess,
     file: &File,
     mut file_off: u64,
     desc: VringDesc,
@@ -523,7 +621,7 @@ fn copy_guest_to_file(
     let mut buf = vec![0u8; COPY_CHUNK_SIZE.min(remaining.max(1))];
     while remaining != 0 {
         let n = COPY_CHUNK_SIZE.min(remaining);
-        mem.read_slice(&mut buf[..n], GuestAddress(guest_off))
+        mem.read_slice(&mut buf[..n], guest_off)
             .map_err(|e| {
                 ax_err_type!(
                     BadState,
@@ -547,7 +645,7 @@ fn copy_guest_to_file(
     Ok(copied)
 }
 
-fn copy_id_to_guest(mem: &GuestMemoryMmap, desc: VringDesc) -> AxResult<usize> {
+fn copy_id_to_guest(mem: &GuestMemoryAccess, desc: VringDesc) -> AxResult<usize> {
     if (desc.flags & VRING_DESC_F_WRITE) == 0 {
         return ax_err!(InvalidInput, "get-id descriptor is not device-writable");
     }
@@ -555,13 +653,13 @@ fn copy_id_to_guest(mem: &GuestMemoryMmap, desc: VringDesc) -> AxResult<usize> {
     let mut buf = vec![0u8; desc.len as usize];
     let copy_len = id.len().min(buf.len());
     buf[..copy_len].copy_from_slice(&id[..copy_len]);
-    mem.write_slice(&buf, GuestAddress(desc.addr))
+    mem.write_slice(&buf, desc.addr)
         .map_err(|e| ax_err_type!(BadState, format_args!("guest get-id write: {}", e)))?;
     Ok(buf.len())
 }
 
 fn process_request(
-    mem: &GuestMemoryMmap,
+    mem: &GuestMemoryAccess,
     drive: &BlockDrive,
     queue: &QueueRuntime,
     head: u16,
@@ -648,14 +746,14 @@ fn process_request(
     Ok(written_len as u32)
 }
 
-fn add_used(mem: &GuestMemoryMmap, queue: &QueueRuntime, head: u16, len: u32) -> AxResult {
+fn add_used(mem: &GuestMemoryAccess, queue: &QueueRuntime, head: u16, len: u32) -> AxResult {
     let used_idx = read_u16(mem, queue.used_addr + 2)?;
     let elem = VringUsedElem {
         id: head as u32,
         len,
     };
     let elem_addr = queue.used_addr + 4 + ((used_idx % queue.queue_size) as u64) * 8;
-    mem.write_obj(elem, GuestAddress(elem_addr)).map_err(|e| {
+    mem.write_obj(elem, elem_addr).map_err(|e| {
         ax_err_type!(
             BadState,
             format_args!("guest used elem write {:#x}: {}", elem_addr, e)
@@ -667,7 +765,7 @@ fn add_used(mem: &GuestMemoryMmap, queue: &QueueRuntime, head: u16, len: u32) ->
 fn drain_queue_available(
     instance_id: usize,
     instance_fd: i32,
-    mem: &GuestMemoryMmap,
+    mem: &GuestMemoryAccess,
     drive: &BlockDrive,
     queue: &mut QueueRuntime,
     reason: &'static str,
@@ -746,7 +844,7 @@ fn drain_queue_available(
 fn handle_queue_notify(
     instance_id: usize,
     instance_fd: i32,
-    mem: &GuestMemoryMmap,
+    mem: &GuestMemoryAccess,
     drive: &BlockDrive,
     queue: &mut QueueRuntime,
     entry: MicroVmBlockNotifyEntry,

@@ -161,7 +161,22 @@ fn main() {
         CLISubCmd::Microvm { subcmd } => match subcmd {
             microvm::MicroVMSubCmd::Init => microvm::init_gate(),
             microvm::MicroVMSubCmd::Create(args) => {
-                microvm::create_microvm(args).expect("Failed to create microvm")
+                if let Err(err) = microvm::create_microvm(args) {
+                    warn!("Failed to create microvm: {:?}", err);
+                    std::process::exit(1);
+                }
+            }
+            microvm::MicroVMSubCmd::Stop(args) => {
+                if let Err(err) = microvm::stop_microvm(args) {
+                    warn!("Failed to stop microvm: {:?}", err);
+                    std::process::exit(1);
+                }
+            }
+            microvm::MicroVMSubCmd::Remove(args) => {
+                if let Err(err) = microvm::remove_microvm(args) {
+                    warn!("Failed to remove microvm: {:?}", err);
+                    std::process::exit(1);
+                }
             }
         },
         #[cfg(not(feature = "microvm"))]

@@ -213,7 +213,18 @@ pub fn create(
     eqdev_fd: Option<i32>,
 ) -> AxResult<Vec<GuestRegionMmap>> {
     let mut offset = 0;
-    let file = eqdev_fd.map(|fd| Arc::new(unsafe { File::from_raw_fd(fd) }));
+    let file = if let Some(fd) = eqdev_fd {
+        let dup_fd = unsafe { libc::dup(fd) };
+        if dup_fd < 0 {
+            return ax_err!(
+                Io,
+                format_args!("Failed to duplicate eqvisor instance fd: {}", std::io::Error::last_os_error())
+            );
+        }
+        Some(Arc::new(unsafe { File::from_raw_fd(dup_fd) }))
+    } else {
+        None
+    };
     regions
         .map(|(start, size)| {
             let mut builder = MmapRegionBuilder::new_with_bitmap(size, None)
