@@ -962,7 +962,13 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 	int ret;
 	bool owner_lock_held = false;
 	uint32_t old_target_vcpu = 0;
+	uint32_t old_guest_vector = 0;
+	uint32_t old_posted_vector = 0;
+	uint64_t old_pi_desc_hpa = 0;
 	bool old_owner_linked = false;
+	bool old_posted_active = false;
+	bool old_posted_shared_pid = false;
+	bool old_posted_vector_hardware = false;
 	bool query_shared_pid = false;
 	bool query_requires_posted_vector = false;
 	uint32_t query_posted_vector = 0;
@@ -1024,7 +1030,13 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 	mutex_lock(&eq_vfio_posted_owners_lock);
 	owner_lock_held = true;
 	old_target_vcpu = route->target_vcpu;
+	old_guest_vector = route->guest_vector;
+	old_posted_vector = route->posted_vector;
+	old_pi_desc_hpa = route->pi_desc_hpa;
 	old_owner_linked = route->posted_owner_linked;
+	old_posted_active = route->posted_active;
+	old_posted_shared_pid = route->posted_shared_pid;
+	old_posted_vector_hardware = route->posted_vector_hardware;
 	query_shared_pid = (query->flags & EQ_IRQ_ROUTE_FLAG_SHARED_VMCS_PID) != 0;
 	query_requires_posted_vector =
 		(query->flags & EQ_IRQ_ROUTE_FLAG_REQUIRES_POSTED_VECTOR) != 0;
@@ -1154,11 +1166,14 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 	if (owner_lock_held)
 		mutex_unlock(&eq_vfio_posted_owners_lock);
 	INFO(
-		"Eq IRQ bypass route active idx=%u host_irq=%d target_vcpu=%u pir_vector=%u posted_vector=%u guest_vector=%u use_posted_vector=%d pi_desc=%#llx\n",
+		"Eq IRQ bypass route active idx=%u host_irq=%d target_vcpu=%u pir_vector=%u posted_vector=%u guest_vector=%u use_posted_vector=%d shared_pid=%d pi_desc=%#llx old_active=%d old_target_vcpu=%u old_posted_vector=%u old_guest_vector=%u old_use_posted_vector=%d old_shared_pid=%d old_pi_desc=%#llx\n",
 		route->msix_index, route->host_irq, route->target_vcpu,
 		pir_vector, route->posted_vector, route->guest_vector,
-		route->posted_vector_hardware,
-		(unsigned long long)route->pi_desc_hpa);
+		route->posted_vector_hardware, route->posted_shared_pid,
+		(unsigned long long)route->pi_desc_hpa, old_posted_active,
+		old_target_vcpu, old_posted_vector, old_guest_vector,
+		old_posted_vector_hardware, old_posted_shared_pid,
+		(unsigned long long)old_pi_desc_hpa);
 	kfree(query);
 	return 0;
 }

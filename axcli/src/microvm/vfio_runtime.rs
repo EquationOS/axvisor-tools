@@ -4,16 +4,16 @@ use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWrit
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axerrno::{ax_err_type, AxResult};
+use axerrno::{AxResult, ax_err_type};
 use eqvm_defs::{
-    EqHyperAllocVfioDmaOp, EQ_HYPERALLOC_HUGE_PAGE_SIZE, EQ_HYPERALLOC_VERSION,
-    EQ_HYPERALLOC_VFIO_DMA_OP_MAP, EQ_HYPERALLOC_VFIO_DMA_OP_NONE, EQ_HYPERALLOC_VFIO_DMA_OP_UNMAP,
+    EQ_HYPERALLOC_HUGE_PAGE_SIZE, EQ_HYPERALLOC_VERSION, EQ_HYPERALLOC_VFIO_DMA_OP_MAP,
+    EQ_HYPERALLOC_VFIO_DMA_OP_NONE, EQ_HYPERALLOC_VFIO_DMA_OP_UNMAP,
     EQ_HYPERALLOC_VFIO_DMA_STATUS_FAILED, EQ_HYPERALLOC_VFIO_DMA_STATUS_NONE,
     EQ_HYPERALLOC_VFIO_DMA_STATUS_PENDING, EQ_HYPERALLOC_VFIO_DMA_STATUS_SUCCESS,
     EQ_HYPERALLOC_VFIO_DMA_STATUS_UNSUPPORTED, EQ_MICROVM_GUEST_RAM_MMAP_ZAP_OP_VERSION,
     EQ_MICROVM_GUEST_RAM_MMAP_ZAP_STATUS_FAILED, EQ_MICROVM_GUEST_RAM_MMAP_ZAP_STATUS_NONE,
     EQ_MICROVM_GUEST_RAM_MMAP_ZAP_STATUS_PENDING, EQ_MICROVM_GUEST_RAM_MMAP_ZAP_STATUS_SUCCESS,
-    EQ_MICROVM_GUEST_RAM_MMAP_ZAP_STATUS_UNSUPPORTED,
+    EQ_MICROVM_GUEST_RAM_MMAP_ZAP_STATUS_UNSUPPORTED, EqHyperAllocVfioDmaOp,
 };
 
 use crate::ioctl;
@@ -780,6 +780,26 @@ fn active_route_fallback_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn env_duration_ms(name: &str) -> Option<Duration> {
+    let raw = std::env::var(name).ok()?;
+    let ms = raw.parse::<u64>().ok()?;
+    Some(Duration::from_millis(ms.max(1)))
+}
+
+fn runtime_snapshot_interval() -> Option<Duration> {
+    let Ok(raw) = std::env::var("AXCLI_VFIO_RUNTIME_SNAPSHOT_MS") else {
+        return Some(Duration::from_secs(1));
+    };
+    let raw = raw.trim();
+    if matches!(raw, "0" | "off" | "OFF" | "false" | "FALSE" | "no" | "NO") {
+        return None;
+    }
+    let Ok(ms) = raw.parse::<u64>() else {
+        return Some(Duration::from_secs(1));
+    };
+    Some(Duration::from_millis(ms.max(1)))
+}
+
 fn log_posted_route_drain_mode_once() {
     static LOGGED_DRAIN_MODE: std::sync::Once = std::sync::Once::new();
     LOGGED_DRAIN_MODE.call_once(|| {
@@ -916,7 +936,11 @@ fn sample_msix_table_vectors(state: &VfioRuntimeState, _force: bool) -> AxResult
 }
 
 fn log_vfio_runtime_snapshot(state: &VfioRuntimeState, reason: &str) -> AxResult<()> {
-    let command = read_cfg_u16(state.device_fd, state.cfg_region_offset, PCI_COMMAND_REG_OFFSET)?;
+    let command = read_cfg_u16(
+        state.device_fd,
+        state.cfg_region_offset,
+        PCI_COMMAND_REG_OFFSET,
+    )?;
     let msix_ctrl = match state.msix_ctrl_off {
         Some(off) => Some(read_cfg_u16(state.device_fd, state.cfg_region_offset, off)?),
         None => None,
@@ -1172,12 +1196,7 @@ fn poll_hyperalloc_vma_zap(state: &VfioRuntimeState) {
             op.result_errno = 0;
             info!(
                 "HyperAlloc guest RAM mmap zap op completed: instance={} seq={} gpa={:#x} len={:#x} zapped_vmas={} zapped_bytes={:#x}",
-                state.instance_id,
-                op.sequence,
-                op.gpa,
-                op.len,
-                op.zapped_vmas,
-                op.zapped_bytes
+                state.instance_id, op.sequence, op.gpa, op.len, op.zapped_vmas, op.zapped_bytes
             );
         }
         Err(e) => {
@@ -1193,6 +1212,15 @@ fn poll_hyperalloc_vma_zap(state: &VfioRuntimeState) {
     complete_hyperalloc_vma_zap(state, &mut op);
 }
 
+pub(crate) fn poll_hyperalloc_runtime_once_for_control() -> bool {
+    let Some(state) = VFIO_RUNTIME_STATE.get() else {
+        return false;
+    };
+    poll_hyperalloc_vfio_dma(state);
+    poll_hyperalloc_vma_zap(state);
+    true
+}
+
 fn start_hyperalloc_dma_poll_worker() {
     if VFIO_HYPERALLOC_DMA_POLL_WORKER_STARTED.swap(true, Ordering::SeqCst) {
         return;
@@ -1200,12 +1228,14 @@ fn start_hyperalloc_dma_poll_worker() {
 
     match thread::Builder::new()
         .name("vfio-hyperalloc-dma-poll".to_string())
-        .spawn(|| loop {
-            if let Some(state) = VFIO_RUNTIME_STATE.get() {
-                poll_hyperalloc_vfio_dma(state);
-                poll_hyperalloc_vma_zap(state);
+        .spawn(|| {
+            loop {
+                if let Some(state) = VFIO_RUNTIME_STATE.get() {
+                    poll_hyperalloc_vfio_dma(state);
+                    poll_hyperalloc_vma_zap(state);
+                }
+                thread::sleep(Duration::from_millis(20));
             }
-            thread::sleep(Duration::from_millis(20));
         }) {
         Ok(_) => info!("VFIO HyperAlloc DMA poll worker started"),
         Err(e) => warn!("Failed to start VFIO HyperAlloc DMA poll worker: {}", e),
@@ -1706,8 +1736,27 @@ pub fn run_foreground_daemon_loop() -> ! {
     let mut last_route_refresh = Instant::now() - Duration::from_secs(1);
     let mut last_full_route_refresh = Instant::now() - Duration::from_secs(1);
     let mut last_hyperalloc_dma_poll = Instant::now() - Duration::from_millis(100);
-    let mut last_runtime_snapshot = Instant::now() - Duration::from_secs(1);
     let route_refresh_start = Instant::now();
+    let forced_route_refresh_interval = env_duration_ms("AXCLI_VFIO_ROUTE_REFRESH_MS");
+    let full_route_refresh_interval =
+        env_duration_ms("AXCLI_VFIO_FULL_ROUTE_REFRESH_MS").unwrap_or(Duration::from_secs(1));
+    let runtime_snapshot_interval = runtime_snapshot_interval();
+    let mut last_runtime_snapshot = runtime_snapshot_interval
+        .map(|interval| Instant::now() - interval)
+        .unwrap_or_else(Instant::now);
+    if forced_route_refresh_interval.is_some() || full_route_refresh_interval != Duration::from_secs(1)
+    {
+        info!(
+            "VFIO route refresh intervals route={:?} full_active={:?}",
+            forced_route_refresh_interval, full_route_refresh_interval
+        );
+    }
+    if std::env::var_os("AXCLI_VFIO_RUNTIME_SNAPSHOT_MS").is_some() {
+        info!(
+            "VFIO runtime snapshot interval {:?}",
+            runtime_snapshot_interval
+        );
+    }
     loop {
         crate::microvm::console::poll_console_once();
         crate::microvm::control::poll_control_once();
@@ -1725,14 +1774,15 @@ pub fn run_foreground_daemon_loop() -> ! {
                 }
                 last_bar0_trace = Instant::now();
             }
-            let route_refresh_interval = if route_refresh_start.elapsed() < Duration::from_secs(30)
-            {
+            let route_refresh_interval = if let Some(interval) = forced_route_refresh_interval {
+                interval
+            } else if route_refresh_start.elapsed() < Duration::from_secs(30) {
                 Duration::from_millis(20)
             } else {
                 Duration::from_millis(100)
             };
             if last_route_refresh.elapsed() >= route_refresh_interval {
-                let include_active = last_full_route_refresh.elapsed() >= Duration::from_secs(1);
+                let include_active = last_full_route_refresh.elapsed() >= full_route_refresh_interval;
                 refresh_posted_irq_routes(state, include_active);
                 if include_active {
                     last_full_route_refresh = Instant::now();
@@ -1741,13 +1791,16 @@ pub fn run_foreground_daemon_loop() -> ! {
             }
             if last_hyperalloc_dma_poll.elapsed() >= Duration::from_millis(100) {
                 poll_hyperalloc_vfio_dma(state);
+                poll_hyperalloc_vma_zap(state);
                 last_hyperalloc_dma_poll = Instant::now();
             }
-            if last_runtime_snapshot.elapsed() >= Duration::from_secs(1) {
-                if let Err(e) = log_vfio_runtime_snapshot(state, "poll") {
-                    warn!("VFIO runtime snapshot failed: {:?}", e);
+            if let Some(interval) = runtime_snapshot_interval {
+                if last_runtime_snapshot.elapsed() >= interval {
+                    if let Err(e) = log_vfio_runtime_snapshot(state, "poll") {
+                        warn!("VFIO runtime snapshot failed: {:?}", e);
+                    }
+                    last_runtime_snapshot = Instant::now();
                 }
-                last_runtime_snapshot = Instant::now();
             }
             drain_msix_event_and_forward(state);
             if cmdq_ram_trace_enabled() && last_cmdq_trace.elapsed() >= Duration::from_millis(100) {

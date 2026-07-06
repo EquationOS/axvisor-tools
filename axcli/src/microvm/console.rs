@@ -151,9 +151,9 @@ pub fn poll_console_forever() -> ! {
 }
 
 pub fn poll_console_once() {
-    if let Some(session) = CONSOLE_SESSION.get()
-        && let Ok(mut session) = session.lock()
-    {
-        session.poll();
+    if let Some(session) = CONSOLE_SESSION.get() {
+        if let Ok(mut session) = session.lock() {
+            session.poll();
+        }
     }
 }

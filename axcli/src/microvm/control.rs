@@ -4,7 +4,8 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{mpsc, Mutex, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::ioctl;
@@ -15,6 +16,7 @@ const HYPERALLOC_POLICY_TARGET_ENV: &str = "AXCLI_HYPERALLOC_POLICY_TARGET_HUGE_
 const HYPERALLOC_POLICY_INTERVAL_ENV: &str = "AXCLI_HYPERALLOC_POLICY_INTERVAL_MS";
 const HYPERALLOC_POLICY_DEFAULT_INTERVAL_MS: u64 = 2000;
 const HYPERALLOC_POLICY_MIN_INTERVAL_MS: u64 = 100;
+const HYPERALLOC_DEBUG_RECLAIM_CONTROL_POLL_MS: u64 = 5;
 const HYPERALLOC_METRICS_INTERVAL_ENV: &str = "AXCLI_HYPERALLOC_METRICS_INTERVAL_MS";
 const HYPERALLOC_METRICS_MIN_INTERVAL_MS: u64 = 100;
 const HYPERALLOC_EVAL_INTERVAL_ENV: &str = "AXCLI_HYPERALLOC_EVAL_INTERVAL_MS";
@@ -28,11 +30,17 @@ const HYPERALLOC_SCHEDULER_VFIO_QUEUE_GOAL_ENV: &str = "AXCLI_HYPERALLOC_SCHEDUL
 const HYPERALLOC_SCHEDULER_BLOCK_IO_WEIGHT_ENV: &str = "AXCLI_HYPERALLOC_SCHEDULER_BLOCK_IO_WEIGHT";
 const HYPERALLOC_SCHEDULER_EQGATE_DRAIN_BUDGET_ENV: &str =
     "AXCLI_HYPERALLOC_SCHEDULER_EQGATE_DRAIN_BUDGET";
+const HYPERALLOC_SCHEDULER_ADAPTIVE_ENV: &str = "AXCLI_HYPERALLOC_SCHEDULER_ADAPTIVE";
+const HYPERALLOC_SCHEDULER_ADAPTIVE_VFIO_QUEUE_CAP_ENV: &str =
+    "AXCLI_HYPERALLOC_SCHEDULER_ADAPTIVE_VFIO_QUEUE_CAP";
 const HYPERALLOC_SCHEDULER_MIN_INTERVAL_MS: u64 = 100;
 const HYPERALLOC_SCHEDULER_DEFAULT_TARGET_HUGE_FRAMES: u64 = 1;
 const HYPERALLOC_SCHEDULER_MAX_VFIO_QUEUE_GOAL: u16 = 1024;
 const HYPERALLOC_SCHEDULER_MAX_BLOCK_IO_WEIGHT: u16 = 10000;
 const HYPERALLOC_SCHEDULER_MAX_EQGATE_DRAIN_BUDGET: u32 = 1024;
+const HYPERALLOC_SCHEDULER_ADAPTIVE_DEFAULT_VFIO_QUEUE_CAP: u16 = 1;
+const HYPERALLOC_SCHEDULER_ADAPTIVE_BLOCK_IO_WEIGHT: u16 = 750;
+const HYPERALLOC_SCHEDULER_ADAPTIVE_EQGATE_DRAIN_BUDGET: u32 = 16;
 const HYPERALLOC_EQGATE_DRAIN_DEFAULT_MAX_REQUESTS: u32 = 16;
 
 struct ControlServer {
@@ -81,6 +89,8 @@ struct HyperAllocSchedulerDryRun {
     auto_apply: bool,
     cpu_auto_apply: bool,
     eqgate_auto_drain: bool,
+    adaptive: bool,
+    adaptive_vfio_queue_cap: u16,
 }
 
 struct HyperAllocRuntimeSnapshot {
@@ -113,6 +123,8 @@ struct HyperAllocRuntimeSnapshot {
     scheduler_memory_auto_apply: u8,
     scheduler_cpu_auto_apply: u8,
     scheduler_eqgate_auto_drain: u8,
+    scheduler_adaptive: u8,
+    scheduler_adaptive_vfio_queue_cap: u16,
     has_block_backend: bool,
     has_vfio_backend: bool,
 }
@@ -140,6 +152,25 @@ struct HyperAllocSchedulerCpuAutoApplyResult {
     max_vcpus: u8,
 }
 
+struct HyperAllocSchedulerIoApplyResult {
+    block_policy_result: &'static str,
+    vfio_channel_result: &'static str,
+}
+
+struct HyperAllocSchedulerAdaptResult {
+    result: &'static str,
+    target_before: u64,
+    target_after: u64,
+    desired_before: u8,
+    desired_after: u8,
+    vfio_queue_before: u16,
+    vfio_queue_after: u16,
+    block_weight_before: u16,
+    block_weight_after: u16,
+    eqgate_budget_before: u32,
+    eqgate_budget_after: u32,
+}
+
 struct HyperAllocSchedulerEqGateAutoDrainResult {
     result: &'static str,
     flags: u32,
@@ -154,6 +185,21 @@ struct HyperAllocSchedulerEqGateAutoDrainResult {
     last_sequence: u64,
     skipped: u64,
     blocked_by_other_instance: u64,
+}
+
+struct HyperAllocSchedulerMemoryApplyResult {
+    result: &'static str,
+    sequence: u64,
+    status: u32,
+    target_pages: u64,
+    timeout_ms: u64,
+}
+
+struct HyperAllocSchedulerCpuApplyResult {
+    result: &'static str,
+    desired_before: u8,
+    desired_after: u8,
+    max_vcpus: u8,
 }
 
 unsafe impl Sync for ControlServer {}
@@ -184,6 +230,13 @@ pub fn start_control_socket(
     let hyperalloc_metrics = parse_hyperalloc_metrics_sampler()?;
     let hyperalloc_evaluator = parse_hyperalloc_policy_evaluator()?;
     let hyperalloc_scheduler = parse_hyperalloc_scheduler(default_vcpus, max_vcpus)?;
+    if has_block_backend {
+        let block_io_weight = hyperalloc_scheduler
+            .as_ref()
+            .map(|scheduler| scheduler.block_io_weight)
+            .unwrap_or(0);
+        super::block::set_scheduler_block_io_weight(block_io_weight);
+    }
 
     let listener = UnixListener::bind(&socket_path)
         .map_err(|err| format!("Failed to bind control socket {}: {}", socket_path, err))?;
@@ -244,7 +297,7 @@ fn parse_hyperalloc_policy() -> Result<Option<HyperAllocPolicy>, String> {
             return Err(format!(
                 "invalid {}: {}",
                 HYPERALLOC_POLICY_INTERVAL_ENV, err
-            ))
+            ));
         }
     };
     interval_ms = clamp_hyperalloc_policy_interval_ms(interval_ms);
@@ -283,7 +336,7 @@ fn parse_hyperalloc_metrics_sampler() -> Result<Option<HyperAllocMetricsSampler>
             return Err(format!(
                 "invalid {}: {}",
                 HYPERALLOC_METRICS_INTERVAL_ENV, err
-            ))
+            ));
         }
     };
     if interval_ms == 0 {
@@ -367,7 +420,7 @@ fn parse_hyperalloc_scheduler(
             return Err(format!(
                 "invalid {}: {}",
                 HYPERALLOC_SCHEDULER_INTERVAL_ENV, err
-            ))
+            ));
         }
     };
     if interval_ms == 0 {
@@ -383,7 +436,7 @@ fn parse_hyperalloc_scheduler(
             return Err(format!(
                 "invalid {}: {}",
                 HYPERALLOC_SCHEDULER_TARGET_ENV, err
-            ))
+            ));
         }
     };
     if target_huge_frames == 0 {
@@ -414,15 +467,19 @@ fn parse_hyperalloc_scheduler(
     let eqgate_drain_budget =
         parse_scheduler_u32_env(HYPERALLOC_SCHEDULER_EQGATE_DRAIN_BUDGET_ENV, 0)?;
     validate_scheduler_eqgate_drain_budget(eqgate_drain_budget)?;
+    let adaptive = parse_scheduler_bool_env(HYPERALLOC_SCHEDULER_ADAPTIVE_ENV, false)?;
+    let adaptive_vfio_queue_cap = parse_scheduler_adaptive_vfio_queue_cap_env()?;
 
     info!(
-        "HyperAlloc scheduler dry-run enabled interval_ms={} target_huge_frames={} desired_vcpus={} vfio_queue_goal={} block_io_weight={} eqgate_drain_budget={} auto_apply=0 cpu_auto_apply=0 eqgate_auto_drain=0",
+        "HyperAlloc scheduler dry-run enabled interval_ms={} target_huge_frames={} desired_vcpus={} vfio_queue_goal={} block_io_weight={} eqgate_drain_budget={} adaptive={} adaptive_vfio_queue_cap={} auto_apply=0 cpu_auto_apply=0 eqgate_auto_drain=0",
         interval_ms,
         target_huge_frames,
         desired_vcpus,
         vfio_queue_goal,
         block_io_weight,
-        eqgate_drain_budget
+        eqgate_drain_budget,
+        bool_to_u8(adaptive),
+        adaptive_vfio_queue_cap
     );
     Ok(Some(HyperAllocSchedulerDryRun {
         interval: Duration::from_millis(interval_ms),
@@ -435,6 +492,8 @@ fn parse_hyperalloc_scheduler(
         auto_apply: false,
         cpu_auto_apply: false,
         eqgate_auto_drain: false,
+        adaptive,
+        adaptive_vfio_queue_cap,
     }))
 }
 
@@ -456,6 +515,27 @@ fn parse_scheduler_u32_env(name: &str, default_value: u32) -> Result<u32, String
         Err(std::env::VarError::NotPresent) => Ok(default_value),
         Err(err) => Err(format!("invalid {}: {}", name, err)),
     }
+}
+
+fn parse_scheduler_bool_env(name: &str, default_value: bool) -> Result<bool, String> {
+    match std::env::var(name) {
+        Ok(value) => match value.as_str() {
+            "0" => Ok(false),
+            "1" => Ok(true),
+            _ => Err(format!("invalid {}: must be 0 or 1", name)),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(default_value),
+        Err(err) => Err(format!("invalid {}: {}", name, err)),
+    }
+}
+
+fn parse_scheduler_adaptive_vfio_queue_cap_env() -> Result<u16, String> {
+    let cap = parse_scheduler_u16_env(
+        HYPERALLOC_SCHEDULER_ADAPTIVE_VFIO_QUEUE_CAP_ENV,
+        HYPERALLOC_SCHEDULER_ADAPTIVE_DEFAULT_VFIO_QUEUE_CAP,
+    )?;
+    validate_scheduler_adaptive_vfio_queue_cap(cap)?;
+    Ok(cap)
 }
 
 fn clamp_hyperalloc_scheduler_interval_ms(mut interval_ms: u64) -> u64 {
@@ -490,6 +570,16 @@ fn validate_scheduler_io_goals(vfio_queue_goal: u16, block_io_weight: u16) -> Re
         return Err(format!(
             "scheduler block I/O weight {} outside allowed range 0..={}",
             block_io_weight, HYPERALLOC_SCHEDULER_MAX_BLOCK_IO_WEIGHT
+        ));
+    }
+    Ok(())
+}
+
+fn validate_scheduler_adaptive_vfio_queue_cap(cap: u16) -> Result<(), String> {
+    if cap > HYPERALLOC_SCHEDULER_MAX_VFIO_QUEUE_GOAL {
+        return Err(format!(
+            "scheduler adaptive VFIO queue cap {} outside allowed range 0..={}",
+            cap, HYPERALLOC_SCHEDULER_MAX_VFIO_QUEUE_GOAL
         ));
     }
     Ok(())
@@ -703,7 +793,7 @@ pub fn poll_scheduler_once() {
         scheduler.last_tick = Instant::now();
     };
 
-    let snapshot = match hyperalloc_runtime_snapshot(server) {
+    let mut snapshot = match hyperalloc_runtime_snapshot(server) {
         Ok(snapshot) => snapshot,
         Err(err) => {
             warn!("HyperAlloc scheduler runtime snapshot failed: {}", err);
@@ -712,6 +802,16 @@ pub fn poll_scheduler_once() {
     };
     match ioctl::ioctl_hyperalloc_query(server.instance_fd, server.instance_id as u64) {
         Ok(query) => {
+            let adapt = maybe_adapt_hyperalloc_scheduler_goals(server, &snapshot, &query);
+            if adapt.result == "updated" {
+                match hyperalloc_runtime_snapshot(server) {
+                    Ok(updated) => snapshot = updated,
+                    Err(err) => warn!(
+                        "HyperAlloc scheduler runtime snapshot refresh after adapt failed: {}",
+                        err
+                    ),
+                }
+            }
             let (decision, reason) =
                 hyperalloc_policy_eval(&query, snapshot.scheduler_target_huge_frames);
             let (memory_action, cpu_action, io_action) =
@@ -725,6 +825,7 @@ pub fn poll_scheduler_once() {
             );
             let cpu_auto_apply =
                 maybe_auto_apply_hyperalloc_scheduler_cpu(server, &snapshot, cpu_action);
+            let io_apply = maybe_apply_hyperalloc_scheduler_io(&snapshot, io_action);
             let eqgate_auto_drain =
                 maybe_auto_drain_hyperalloc_scheduler_eqgate(server, &snapshot, &query);
             info!(
@@ -738,8 +839,10 @@ pub fn poll_scheduler_once() {
                     memory_action,
                     cpu_action,
                     io_action,
+                    &adapt,
                     &auto_apply,
                     &cpu_auto_apply,
+                    &io_apply,
                     &eqgate_auto_drain,
                 )
             );
@@ -887,6 +990,21 @@ fn execute_command(server: &ControlServer, request: &str) -> Result<String, Stri
 
             set_hyperalloc_scheduler_eqgate_auto_drain(server, enabled)
         }
+        "hyperalloc-scheduler-adaptive-set" | "ha-scheduler-adaptive-set" => {
+            let enabled = parts
+                .next()
+                .ok_or_else(|| "missing scheduler adaptive flag".to_string())?;
+            let enabled = match enabled {
+                "0" => false,
+                "1" => true,
+                _ => return Err("scheduler adaptive flag must be 0 or 1".to_string()),
+            };
+            if parts.next().is_some() {
+                return Err("unexpected extra argument for scheduler adaptive-set".to_string());
+            }
+
+            set_hyperalloc_scheduler_adaptive(server, enabled)
+        }
         "hyperalloc-scheduler-set" | "ha-scheduler-set" => {
             let interval_ms = parts
                 .next()
@@ -935,6 +1053,12 @@ fn execute_command(server: &ControlServer, request: &str) -> Result<String, Stri
                 return Err("unexpected argument for scheduler apply-once".to_string());
             }
             apply_hyperalloc_scheduler_once(server)
+        }
+        "hyperalloc-scheduler-apply-all-once" | "ha-scheduler-apply-all-once" => {
+            if parts.next().is_some() {
+                return Err("unexpected argument for scheduler apply-all-once".to_string());
+            }
+            apply_hyperalloc_scheduler_all_once(server)
         }
         "hyperalloc-scheduler-cpu-apply-once" | "ha-scheduler-cpu-apply-once" => {
             if parts.next().is_some() {
@@ -1054,6 +1178,64 @@ fn stop_microvm_via_control(server: &ControlServer) -> Result<String, String> {
     ))
 }
 
+fn ioctl_hyperalloc_debug_reclaim_with_runtime_poll(
+    instance_fd: i32,
+    instance_id: u64,
+    zone_id: u32,
+    frame_gpa: u64,
+    frame_len: u64,
+    flags: u32,
+) -> Result<eqvm_defs::EqHyperAllocDebugReclaimReq, String> {
+    let (tx, rx) = mpsc::sync_channel(1);
+    let worker = thread::Builder::new()
+        .name("ha-debug-reclaim-ioctl".to_string())
+        .spawn(move || {
+            let result = ioctl::ioctl_hyperalloc_debug_reclaim(
+                instance_fd,
+                instance_id,
+                zone_id,
+                frame_gpa,
+                frame_len,
+                flags,
+            );
+            let _ = tx.send(result);
+        })
+        .map_err(|err| format!("Failed to spawn HyperAlloc debug reclaim helper: {}", err))?;
+
+    let start = Instant::now();
+    let mut runtime_polls = 0u64;
+    loop {
+        match rx.try_recv() {
+            Ok(result) => {
+                if worker.join().is_err() {
+                    return Err("HyperAlloc debug reclaim helper panicked".to_string());
+                }
+                if runtime_polls != 0 {
+                    info!(
+                        "microVM control HyperAlloc debug reclaim runtime-poll helper instance={} polls={} elapsed_ms={}",
+                        instance_id,
+                        runtime_polls,
+                        start.elapsed().as_millis()
+                    );
+                }
+                return result;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                let _ = worker.join();
+                return Err("HyperAlloc debug reclaim helper disconnected".to_string());
+            }
+        }
+
+        if super::vfio_runtime::poll_hyperalloc_runtime_once_for_control() {
+            runtime_polls = runtime_polls.saturating_add(1);
+        }
+        thread::sleep(Duration::from_millis(
+            HYPERALLOC_DEBUG_RECLAIM_CONTROL_POLL_MS,
+        ));
+    }
+}
+
 fn issue_hyperalloc_debug_reclaim<'a, I>(
     server: &ControlServer,
     parts: &mut I,
@@ -1083,7 +1265,7 @@ where
         }
     }
 
-    let req = ioctl::ioctl_hyperalloc_debug_reclaim(
+    let req = ioctl_hyperalloc_debug_reclaim_with_runtime_poll(
         server.instance_fd,
         server.instance_id as u64,
         zone_id,
@@ -1153,12 +1335,7 @@ where
     )?;
     info!(
         "microVM control guest RAM mmap zap instance={} gpa={:#x} len={:#x} zapped_vmas={} zapped_bytes={:#x} errno={}",
-        server.instance_id,
-        req.gpa,
-        req.len,
-        req.zapped_vmas,
-        req.zapped_bytes,
-        req.result_errno
+        server.instance_id, req.gpa, req.len, req.zapped_vmas, req.zapped_bytes, req.result_errno
     );
     Ok(format!(
         "vma_zap instance={} gpa={:#x} len={:#x} zapped_vmas={} zapped_bytes={:#x} errno={}",
@@ -1937,7 +2114,10 @@ fn format_hyperalloc_eval_set_response(evaluator: Option<&HyperAllocPolicyEvalua
             evaluator.last_eval.elapsed().as_millis(),
             evaluator.target_huge_frames
         ),
-        None => "eval_set eval_enabled=0 eval_interval_ms=0 eval_elapsed_ms=0 eval_target_huge_frames=0".to_string(),
+        None => {
+            "eval_set eval_enabled=0 eval_interval_ms=0 eval_elapsed_ms=0 eval_target_huge_frames=0"
+                .to_string()
+        }
     }
 }
 
@@ -1958,6 +2138,9 @@ fn set_hyperalloc_scheduler(
             "HyperAlloc scheduler dry-run disabled by control command instance={}",
             server.instance_id
         );
+        if server.has_block_backend {
+            super::block::set_scheduler_block_io_weight(0);
+        }
         return Ok(format_hyperalloc_scheduler_set_response(None));
     }
 
@@ -2002,6 +2185,7 @@ fn set_hyperalloc_scheduler(
             }
             let desired_vcpus = desired_vcpus.unwrap_or(current_desired_vcpus);
             validate_scheduler_desired_vcpus(desired_vcpus, server.max_vcpus)?;
+            let adaptive_vfio_queue_cap = parse_scheduler_adaptive_vfio_queue_cap_env()?;
             *scheduler_guard = Some(HyperAllocSchedulerDryRun {
                 interval,
                 last_tick: Instant::now(),
@@ -2013,13 +2197,19 @@ fn set_hyperalloc_scheduler(
                 auto_apply: false,
                 cpu_auto_apply: false,
                 eqgate_auto_drain: false,
+                adaptive: false,
+                adaptive_vfio_queue_cap,
             });
             let scheduler = scheduler_guard
                 .as_ref()
                 .ok_or_else(|| "failed to enable HyperAlloc scheduler dry-run".to_string())?;
             info!(
-                "HyperAlloc scheduler dry-run enabled by control command instance={} interval_ms={} target_huge_frames={} desired_vcpus={} auto_apply=0 cpu_auto_apply=0 eqgate_auto_drain=0",
-                server.instance_id, interval_ms, target_huge_frames, desired_vcpus
+                "HyperAlloc scheduler dry-run enabled by control command instance={} interval_ms={} target_huge_frames={} desired_vcpus={} adaptive_vfio_queue_cap={} auto_apply=0 cpu_auto_apply=0 eqgate_auto_drain=0 adaptive=0",
+                server.instance_id,
+                interval_ms,
+                target_huge_frames,
+                desired_vcpus,
+                adaptive_vfio_queue_cap
             );
             Ok(format_hyperalloc_scheduler_set_response(Some(scheduler)))
         }
@@ -2043,6 +2233,9 @@ fn set_hyperalloc_scheduler_io(
     let block_changed = scheduler.block_io_weight != block_io_weight;
     scheduler.vfio_queue_goal = vfio_queue_goal;
     scheduler.block_io_weight = block_io_weight;
+    if server.has_block_backend {
+        super::block::set_scheduler_block_io_weight(block_io_weight);
+    }
     if vfio_changed || block_changed {
         scheduler.last_tick = Instant::now();
     }
@@ -2051,12 +2244,13 @@ fn set_hyperalloc_scheduler_io(
     let io_backend =
         hyperalloc_scheduler_io_backend(server.has_block_backend, server.has_vfio_backend);
     let io_effect = hyperalloc_scheduler_io_effect(
-        io_action,
+        scheduler.vfio_queue_goal,
+        scheduler.block_io_weight,
         server.has_block_backend,
         server.has_vfio_backend,
     );
     info!(
-        "HyperAlloc scheduler I/O dry-run updated by control command instance={} vfio_queue_goal={} block_io_weight={} vfio_changed={} block_changed={} io_action={} scheduler_io_backend={} io_effect={}",
+        "HyperAlloc scheduler I/O policy updated by control command instance={} vfio_queue_goal={} block_io_weight={} vfio_changed={} block_changed={} io_action={} scheduler_io_backend={} io_effect={}",
         server.instance_id,
         scheduler.vfio_queue_goal,
         scheduler.block_io_weight,
@@ -2199,12 +2393,46 @@ fn set_hyperalloc_scheduler_eqgate_auto_drain(
     ))
 }
 
+fn set_hyperalloc_scheduler_adaptive(
+    server: &ControlServer,
+    enabled: bool,
+) -> Result<String, String> {
+    let mut scheduler_guard = server
+        .hyperalloc_scheduler
+        .lock()
+        .map_err(|err| format!("HyperAlloc scheduler lock poisoned: {}", err))?;
+    let scheduler = scheduler_guard
+        .as_mut()
+        .ok_or_else(|| "HyperAlloc scheduler dry-run is disabled".to_string())?;
+    let changed = scheduler.adaptive != enabled;
+    scheduler.adaptive = enabled;
+    info!(
+        "HyperAlloc scheduler adaptive mode updated by control command instance={} scheduler_adaptive={} scheduler_adaptive_vfio_queue_cap={} changed={}",
+        server.instance_id,
+        bool_to_u8(enabled),
+        scheduler.adaptive_vfio_queue_cap,
+        changed
+    );
+    Ok(format!(
+        "scheduler_adaptive_set scheduler_enabled=1 scheduler_adaptive={} scheduler_interval_ms={} scheduler_elapsed_ms={} scheduler_target_huge_frames={} scheduler_desired_vcpus={} scheduler_vfio_queue_goal={} scheduler_block_io_weight={} scheduler_eqgate_drain_budget={} scheduler_adaptive_vfio_queue_cap={}",
+        bool_to_u8(scheduler.adaptive),
+        scheduler.interval.as_millis(),
+        scheduler.last_tick.elapsed().as_millis(),
+        scheduler.target_huge_frames,
+        scheduler.desired_vcpus,
+        scheduler.vfio_queue_goal,
+        scheduler.block_io_weight,
+        scheduler.eqgate_drain_budget,
+        scheduler.adaptive_vfio_queue_cap
+    ))
+}
+
 fn format_hyperalloc_scheduler_set_response(
     scheduler: Option<&HyperAllocSchedulerDryRun>,
 ) -> String {
     match scheduler {
         Some(scheduler) => format!(
-            "scheduler_set scheduler_enabled=1 scheduler_interval_ms={} scheduler_elapsed_ms={} scheduler_target_huge_frames={} scheduler_desired_vcpus={} scheduler_vfio_queue_goal={} scheduler_block_io_weight={} scheduler_eqgate_drain_budget={} scheduler_auto_apply={} scheduler_memory_auto_apply={} scheduler_cpu_auto_apply={} scheduler_eqgate_auto_drain={}",
+            "scheduler_set scheduler_enabled=1 scheduler_interval_ms={} scheduler_elapsed_ms={} scheduler_target_huge_frames={} scheduler_desired_vcpus={} scheduler_vfio_queue_goal={} scheduler_block_io_weight={} scheduler_eqgate_drain_budget={} scheduler_auto_apply={} scheduler_memory_auto_apply={} scheduler_cpu_auto_apply={} scheduler_eqgate_auto_drain={} scheduler_adaptive={} scheduler_adaptive_vfio_queue_cap={}",
             scheduler.interval.as_millis(),
             scheduler.last_tick.elapsed().as_millis(),
             scheduler.target_huge_frames,
@@ -2215,9 +2443,11 @@ fn format_hyperalloc_scheduler_set_response(
             bool_to_u8(scheduler.auto_apply),
             bool_to_u8(scheduler.auto_apply),
             bool_to_u8(scheduler.cpu_auto_apply),
-            bool_to_u8(scheduler.eqgate_auto_drain)
+            bool_to_u8(scheduler.eqgate_auto_drain),
+            bool_to_u8(scheduler.adaptive),
+            scheduler.adaptive_vfio_queue_cap
         ),
-        None => "scheduler_set scheduler_enabled=0 scheduler_interval_ms=0 scheduler_elapsed_ms=0 scheduler_target_huge_frames=0 scheduler_desired_vcpus=0 scheduler_vfio_queue_goal=0 scheduler_block_io_weight=0 scheduler_eqgate_drain_budget=0 scheduler_auto_apply=0 scheduler_memory_auto_apply=0 scheduler_cpu_auto_apply=0 scheduler_eqgate_auto_drain=0".to_string(),
+        None => "scheduler_set scheduler_enabled=0 scheduler_interval_ms=0 scheduler_elapsed_ms=0 scheduler_target_huge_frames=0 scheduler_desired_vcpus=0 scheduler_vfio_queue_goal=0 scheduler_block_io_weight=0 scheduler_eqgate_drain_budget=0 scheduler_auto_apply=0 scheduler_memory_auto_apply=0 scheduler_cpu_auto_apply=0 scheduler_eqgate_auto_drain=0 scheduler_adaptive=0 scheduler_adaptive_vfio_queue_cap=0".to_string(),
     }
 }
 
@@ -2235,7 +2465,7 @@ fn format_hyperalloc_scheduler_status(server: &ControlServer) -> Result<String, 
                 scheduler.block_io_weight,
             );
             format!(
-                "scheduler_status scheduler_enabled=1 scheduler_interval_ms={} scheduler_elapsed_ms={} scheduler_target_huge_frames={} scheduler_desired_vcpus={} scheduler_vfio_queue_goal={} scheduler_block_io_weight={} scheduler_eqgate_drain_budget={} scheduler_auto_apply={} scheduler_memory_auto_apply={} scheduler_cpu_auto_apply={} scheduler_eqgate_auto_drain={} io_action={} scheduler_io_backend={} io_effect={}",
+                "scheduler_status scheduler_enabled=1 scheduler_interval_ms={} scheduler_elapsed_ms={} scheduler_target_huge_frames={} scheduler_desired_vcpus={} scheduler_vfio_queue_goal={} scheduler_block_io_weight={} scheduler_eqgate_drain_budget={} scheduler_auto_apply={} scheduler_memory_auto_apply={} scheduler_cpu_auto_apply={} scheduler_eqgate_auto_drain={} scheduler_adaptive={} scheduler_adaptive_vfio_queue_cap={} io_action={} scheduler_io_backend={} io_effect={}",
                 scheduler.interval.as_millis(),
                 scheduler.last_tick.elapsed().as_millis(),
                 scheduler.target_huge_frames,
@@ -2247,10 +2477,13 @@ fn format_hyperalloc_scheduler_status(server: &ControlServer) -> Result<String, 
                 bool_to_u8(scheduler.auto_apply),
                 bool_to_u8(scheduler.cpu_auto_apply),
                 bool_to_u8(scheduler.eqgate_auto_drain),
+                bool_to_u8(scheduler.adaptive),
+                scheduler.adaptive_vfio_queue_cap,
                 io_action,
                 io_backend,
                 hyperalloc_scheduler_io_effect(
-                    io_action,
+                    scheduler.vfio_queue_goal,
+                    scheduler.block_io_weight,
                     server.has_block_backend,
                     server.has_vfio_backend
                 )
@@ -2258,7 +2491,7 @@ fn format_hyperalloc_scheduler_status(server: &ControlServer) -> Result<String, 
         }
         None => {
             format!(
-                "scheduler_status scheduler_enabled=0 scheduler_interval_ms=0 scheduler_elapsed_ms=0 scheduler_target_huge_frames=0 scheduler_desired_vcpus=0 scheduler_vfio_queue_goal=0 scheduler_block_io_weight=0 scheduler_eqgate_drain_budget=0 scheduler_auto_apply=0 scheduler_memory_auto_apply=0 scheduler_cpu_auto_apply=0 scheduler_eqgate_auto_drain=0 io_action=disabled scheduler_io_backend={} io_effect=disabled",
+                "scheduler_status scheduler_enabled=0 scheduler_interval_ms=0 scheduler_elapsed_ms=0 scheduler_target_huge_frames=0 scheduler_desired_vcpus=0 scheduler_vfio_queue_goal=0 scheduler_block_io_weight=0 scheduler_eqgate_drain_budget=0 scheduler_auto_apply=0 scheduler_memory_auto_apply=0 scheduler_cpu_auto_apply=0 scheduler_eqgate_auto_drain=0 scheduler_adaptive=0 scheduler_adaptive_vfio_queue_cap=0 io_action=disabled scheduler_io_backend={} io_effect=disabled",
                 io_backend
             )
         }
@@ -2284,7 +2517,8 @@ fn apply_hyperalloc_scheduler_once(server: &ControlServer) -> Result<String, Str
     let io_backend =
         hyperalloc_scheduler_io_backend(snapshot.has_block_backend, snapshot.has_vfio_backend);
     let io_effect = hyperalloc_scheduler_io_effect(
-        io_action,
+        snapshot.scheduler_vfio_queue_goal,
+        snapshot.scheduler_block_io_weight,
         snapshot.has_block_backend,
         snapshot.has_vfio_backend,
     );
@@ -2326,6 +2560,226 @@ fn apply_hyperalloc_scheduler_once(server: &ControlServer) -> Result<String, Str
     ))
 }
 
+fn apply_hyperalloc_scheduler_all_once(server: &ControlServer) -> Result<String, String> {
+    let snapshot = hyperalloc_runtime_snapshot(server)?;
+    if snapshot.scheduler_enabled == 0 {
+        return Err("HyperAlloc scheduler dry-run is disabled".to_string());
+    }
+    if snapshot.policy_enabled != 0 {
+        return Err("disable HyperAlloc host policy before scheduler apply-all-once".to_string());
+    }
+    if snapshot.scheduler_target_huge_frames == 0 {
+        return Err("scheduler target huge-frame count must be nonzero".to_string());
+    }
+    if snapshot.scheduler_desired_vcpus == 0 {
+        return Err("scheduler desired vCPU count must be nonzero".to_string());
+    }
+    validate_scheduler_desired_vcpus(snapshot.scheduler_desired_vcpus, snapshot.max_vcpus)?;
+
+    let query = ioctl::ioctl_hyperalloc_query(server.instance_fd, server.instance_id as u64)?;
+    let (decision, reason) = hyperalloc_policy_eval(&query, snapshot.scheduler_target_huge_frames);
+    let (memory_action, cpu_action, io_action) = hyperalloc_scheduler_actions(&snapshot, decision);
+    let memory_apply =
+        apply_hyperalloc_scheduler_memory_target(server, &snapshot, memory_action, reason)?;
+    let cpu_apply = apply_hyperalloc_scheduler_cpu_target(server, &snapshot, cpu_action)?;
+    let block_policy_result = apply_hyperalloc_scheduler_block_io_policy(&snapshot);
+    let vfio_channel_result = hyperalloc_scheduler_vfio_channel_result(&snapshot);
+    let eqgate_apply = apply_hyperalloc_scheduler_eqgate_drain(server, &snapshot, &query);
+    let io_backend =
+        hyperalloc_scheduler_io_backend(snapshot.has_block_backend, snapshot.has_vfio_backend);
+    let io_effect = hyperalloc_scheduler_io_effect(
+        snapshot.scheduler_vfio_queue_goal,
+        snapshot.scheduler_block_io_weight,
+        snapshot.has_block_backend,
+        snapshot.has_vfio_backend,
+    );
+
+    info!(
+        "HyperAlloc scheduler apply-all once instance={} memory_apply_result={} cpu_apply_result={} block_policy_result={} vfio_channel_result={} eqgate_apply_result={} scheduler_target_huge_frames={} scheduler_desired_vcpus={} scheduler_vfio_queue_goal={} scheduler_block_io_weight={}",
+        server.instance_id,
+        memory_apply.result,
+        cpu_apply.result,
+        block_policy_result,
+        vfio_channel_result,
+        eqgate_apply.result,
+        snapshot.scheduler_target_huge_frames,
+        snapshot.scheduler_desired_vcpus,
+        snapshot.scheduler_vfio_queue_goal,
+        snapshot.scheduler_block_io_weight
+    );
+
+    Ok(format!(
+        "scheduler_apply_all memory_action={} memory_apply_result={} memory_effect={} memory_seq={} memory_status={} memory_target_pages={} memory_timeout_ms={} cpu_action={} cpu_apply_result={} desired_vcpus_before={} desired_vcpus_after={} scheduler_desired_vcpus={} max_vcpus={} io_action={} scheduler_io_backend={} io_effect={} block_policy_result={} vfio_channel_result={} eqgate_action={} eqgate_apply_result={} eqgate_apply_flags={:#x} eqgate_apply_max_requests={} eqgate_apply_visited_pcpus={} eqgate_apply_pending_before={} eqgate_apply_drained={} eqgate_apply_installed={} eqgate_apply_unsupported={} eqgate_apply_failed={} eqgate_apply_pending_after={} eqgate_apply_last_seq={} eqgate_apply_skipped={} eqgate_apply_blocked_by_other_instance={} decision={} reason={} scheduler_target_huge_frames={} scheduler_vfio_queue_goal={} scheduler_block_io_weight={} scheduler_eqgate_drain_budget={} current_memory_target_huge_frames={}",
+        memory_action,
+        memory_apply.result,
+        hyperalloc_memory_effect(&query),
+        memory_apply.sequence,
+        memory_apply.status,
+        memory_apply.target_pages,
+        memory_apply.timeout_ms,
+        cpu_action,
+        cpu_apply.result,
+        cpu_apply.desired_before,
+        cpu_apply.desired_after,
+        snapshot.scheduler_desired_vcpus,
+        cpu_apply.max_vcpus,
+        io_action,
+        io_backend,
+        io_effect,
+        block_policy_result,
+        vfio_channel_result,
+        hyperalloc_scheduler_eqgate_action(&snapshot, &query),
+        eqgate_apply.result,
+        eqgate_apply.flags,
+        eqgate_apply.max_requests,
+        eqgate_apply.visited_pcpus,
+        eqgate_apply.pending_before,
+        eqgate_apply.drained,
+        eqgate_apply.installed,
+        eqgate_apply.unsupported,
+        eqgate_apply.failed,
+        eqgate_apply.pending_after,
+        eqgate_apply.last_sequence,
+        eqgate_apply.skipped,
+        eqgate_apply.blocked_by_other_instance,
+        decision,
+        reason,
+        snapshot.scheduler_target_huge_frames,
+        snapshot.scheduler_vfio_queue_goal,
+        snapshot.scheduler_block_io_weight,
+        snapshot.scheduler_eqgate_drain_budget,
+        snapshot.memory_target_huge_frames
+    ))
+}
+
+fn apply_hyperalloc_scheduler_memory_target(
+    server: &ControlServer,
+    snapshot: &HyperAllocRuntimeSnapshot,
+    memory_action: &str,
+    reason: &str,
+) -> Result<HyperAllocSchedulerMemoryApplyResult, String> {
+    if reason == "vfio_blocked" || reason == "mmap_stale" {
+        return Ok(HyperAllocSchedulerMemoryApplyResult::zero("blocked"));
+    }
+    if memory_action == "wait" {
+        return Ok(HyperAllocSchedulerMemoryApplyResult::zero("wait"));
+    }
+    if memory_action != "would_target" {
+        return Ok(HyperAllocSchedulerMemoryApplyResult::zero("hold"));
+    }
+
+    let result = issue_memory_target(
+        server,
+        snapshot.scheduler_target_huge_frames,
+        "scheduler-apply-all",
+    )?;
+    Ok(HyperAllocSchedulerMemoryApplyResult {
+        result: "issued",
+        sequence: result.sequence,
+        status: result.status,
+        target_pages: result.target_pages,
+        timeout_ms: result.timeout_ms,
+    })
+}
+
+fn apply_hyperalloc_scheduler_cpu_target(
+    server: &ControlServer,
+    snapshot: &HyperAllocRuntimeSnapshot,
+    cpu_action: &str,
+) -> Result<HyperAllocSchedulerCpuApplyResult, String> {
+    if cpu_action != "would_resize" {
+        return Ok(HyperAllocSchedulerCpuApplyResult::new(
+            "hold",
+            snapshot.desired_vcpus,
+            snapshot.desired_vcpus,
+            snapshot.max_vcpus,
+        ));
+    }
+
+    resize_microvm_vcpu(server, snapshot.scheduler_desired_vcpus)?;
+    let desired_after = server.desired_vcpus.load(Ordering::Acquire);
+    Ok(HyperAllocSchedulerCpuApplyResult::new(
+        "issued",
+        snapshot.desired_vcpus,
+        desired_after,
+        snapshot.max_vcpus,
+    ))
+}
+
+fn apply_hyperalloc_scheduler_block_io_policy(
+    snapshot: &HyperAllocRuntimeSnapshot,
+) -> &'static str {
+    if !snapshot.has_block_backend {
+        if snapshot.scheduler_block_io_weight == 0 {
+            return "disabled";
+        }
+        return "no_backend";
+    }
+    super::block::set_scheduler_block_io_weight(snapshot.scheduler_block_io_weight);
+    if snapshot.scheduler_block_io_weight == 0 {
+        "disabled"
+    } else {
+        "applied"
+    }
+}
+
+fn hyperalloc_scheduler_vfio_channel_result(snapshot: &HyperAllocRuntimeSnapshot) -> &'static str {
+    if snapshot.scheduler_vfio_queue_goal == 0 {
+        "disabled"
+    } else if snapshot.has_vfio_backend {
+        "guest_mediated_required"
+    } else {
+        "no_backend"
+    }
+}
+
+fn apply_hyperalloc_scheduler_eqgate_drain(
+    server: &ControlServer,
+    snapshot: &HyperAllocRuntimeSnapshot,
+    query: &eqvm_defs::EqHyperAllocQuery,
+) -> HyperAllocSchedulerEqGateAutoDrainResult {
+    if snapshot.scheduler_eqgate_drain_budget == 0 {
+        return HyperAllocSchedulerEqGateAutoDrainResult::zero("disabled");
+    }
+    if query.eqgate_hyperalloc_pending == 0 {
+        return HyperAllocSchedulerEqGateAutoDrainResult::zero("hold");
+    }
+
+    let flags = eqvm_defs::EQ_HYPERALLOC_EQGATE_DRAIN_FLAG_EXECUTE;
+    match ioctl::ioctl_hyperalloc_eqgate_drain(
+        server.instance_fd,
+        server.instance_id as u64,
+        snapshot.scheduler_eqgate_drain_budget,
+        flags,
+    ) {
+        Ok(req) => HyperAllocSchedulerEqGateAutoDrainResult {
+            result: "issued",
+            flags: req.flags,
+            max_requests: req.max_requests,
+            visited_pcpus: req.visited_pcpus,
+            pending_before: req.pending_before,
+            drained: req.drained,
+            installed: req.installed,
+            unsupported: req.unsupported,
+            failed: req.failed,
+            pending_after: req.pending_after,
+            last_sequence: req.last_sequence,
+            skipped: req.skipped,
+            blocked_by_other_instance: req.blocked_by_other_instance,
+        },
+        Err(err) => {
+            warn!(
+                "HyperAlloc scheduler apply-all EqGate drain failed instance={} budget={} pending={} err={}",
+                server.instance_id,
+                snapshot.scheduler_eqgate_drain_budget,
+                query.eqgate_hyperalloc_pending,
+                err
+            );
+            HyperAllocSchedulerEqGateAutoDrainResult::zero("failed")
+        }
+    }
+}
+
 fn apply_hyperalloc_scheduler_cpu_once(server: &ControlServer) -> Result<String, String> {
     let snapshot = hyperalloc_runtime_snapshot(server)?;
     if snapshot.scheduler_enabled == 0 {
@@ -2355,6 +2809,166 @@ fn apply_hyperalloc_scheduler_cpu_once(server: &ControlServer) -> Result<String,
         desired_vcpus_after,
         snapshot.max_vcpus
     ))
+}
+
+fn maybe_adapt_hyperalloc_scheduler_goals(
+    server: &ControlServer,
+    snapshot: &HyperAllocRuntimeSnapshot,
+    query: &eqvm_defs::EqHyperAllocQuery,
+) -> HyperAllocSchedulerAdaptResult {
+    let base = HyperAllocSchedulerAdaptResult::from_snapshot("disabled", snapshot);
+    if snapshot.scheduler_enabled == 0 || snapshot.scheduler_adaptive == 0 {
+        return base;
+    }
+
+    let target_after = adaptive_memory_target_huge_frames(snapshot, query);
+    let desired_after = adaptive_desired_vcpus(snapshot, query);
+    let block_weight_after = adaptive_block_io_weight(snapshot);
+    let eqgate_budget_after = adaptive_eqgate_drain_budget(snapshot, query);
+
+    let mut scheduler_guard = match server.hyperalloc_scheduler.lock() {
+        Ok(guard) => guard,
+        Err(err) => {
+            warn!(
+                "HyperAlloc scheduler lock poisoned during adaptive update: {}",
+                err
+            );
+            return HyperAllocSchedulerAdaptResult::from_snapshot("failed", snapshot);
+        }
+    };
+    let Some(scheduler) = scheduler_guard.as_mut() else {
+        return HyperAllocSchedulerAdaptResult::from_snapshot("disabled", snapshot);
+    };
+    if !scheduler.adaptive {
+        return HyperAllocSchedulerAdaptResult::from_snapshot("disabled", snapshot);
+    }
+
+    let target_before = scheduler.target_huge_frames;
+    let desired_before = scheduler.desired_vcpus;
+    let vfio_queue_before = scheduler.vfio_queue_goal;
+    let vfio_queue_after = adaptive_vfio_queue_goal(
+        snapshot,
+        desired_after,
+        scheduler.vfio_queue_goal,
+        scheduler.adaptive_vfio_queue_cap,
+    );
+    let block_weight_before = scheduler.block_io_weight;
+    let eqgate_budget_before = scheduler.eqgate_drain_budget;
+    let changed = target_before != target_after
+        || desired_before != desired_after
+        || vfio_queue_before != vfio_queue_after
+        || block_weight_before != block_weight_after
+        || eqgate_budget_before != eqgate_budget_after;
+
+    if changed {
+        scheduler.target_huge_frames = target_after;
+        scheduler.desired_vcpus = desired_after;
+        scheduler.vfio_queue_goal = vfio_queue_after;
+        scheduler.block_io_weight = block_weight_after;
+        scheduler.eqgate_drain_budget = eqgate_budget_after;
+        info!(
+            "HyperAlloc scheduler adaptive goals updated instance={} target_huge_frames {}->{} desired_vcpus {}->{} vfio_queue_goal {}->{} adaptive_vfio_queue_cap={} block_io_weight {}->{} eqgate_drain_budget {}->{}",
+            server.instance_id,
+            target_before,
+            target_after,
+            desired_before,
+            desired_after,
+            vfio_queue_before,
+            vfio_queue_after,
+            scheduler.adaptive_vfio_queue_cap,
+            block_weight_before,
+            block_weight_after,
+            eqgate_budget_before,
+            eqgate_budget_after
+        );
+    }
+
+    HyperAllocSchedulerAdaptResult {
+        result: if changed { "updated" } else { "hold" },
+        target_before,
+        target_after,
+        desired_before,
+        desired_after,
+        vfio_queue_before,
+        vfio_queue_after,
+        block_weight_before,
+        block_weight_after,
+        eqgate_budget_before,
+        eqgate_budget_after,
+    }
+}
+
+fn adaptive_memory_target_huge_frames(
+    snapshot: &HyperAllocRuntimeSnapshot,
+    query: &eqvm_defs::EqHyperAllocQuery,
+) -> u64 {
+    if query.registered_frames == 0 {
+        return snapshot.scheduler_target_huge_frames;
+    }
+    snapshot
+        .scheduler_target_huge_frames
+        .clamp(1, query.registered_frames)
+}
+
+fn adaptive_desired_vcpus(
+    snapshot: &HyperAllocRuntimeSnapshot,
+    query: &eqvm_defs::EqHyperAllocQuery,
+) -> u8 {
+    let max_vcpus = snapshot.max_vcpus.max(1);
+    let desired = snapshot.scheduler_desired_vcpus.clamp(1, max_vcpus);
+    if hyperalloc_scheduler_resource_backlog(query) {
+        max_vcpus
+    } else {
+        desired
+    }
+}
+
+fn hyperalloc_scheduler_resource_backlog(query: &eqvm_defs::EqHyperAllocQuery) -> bool {
+    hyperalloc_pagecache_request_outstanding(query)
+        || query.reclaiming_frames != 0
+        || query.vfio_dma_outstanding != 0
+        || query.guest_ram_mmap_zap_outstanding != 0
+        || query.eqgate_hyperalloc_pending != 0
+}
+
+fn adaptive_vfio_queue_goal(
+    snapshot: &HyperAllocRuntimeSnapshot,
+    desired_vcpus: u8,
+    current_goal: u16,
+    adaptive_cap: u16,
+) -> u16 {
+    if !snapshot.has_vfio_backend {
+        0
+    } else if current_goal != 0 {
+        current_goal
+    } else {
+        u16::from(desired_vcpus).min(adaptive_cap)
+    }
+}
+
+fn adaptive_block_io_weight(snapshot: &HyperAllocRuntimeSnapshot) -> u16 {
+    if !snapshot.has_block_backend {
+        0
+    } else if snapshot.scheduler_block_io_weight != 0 {
+        snapshot.scheduler_block_io_weight
+    } else {
+        HYPERALLOC_SCHEDULER_ADAPTIVE_BLOCK_IO_WEIGHT
+    }
+}
+
+fn adaptive_eqgate_drain_budget(
+    snapshot: &HyperAllocRuntimeSnapshot,
+    query: &eqvm_defs::EqHyperAllocQuery,
+) -> u32 {
+    if query.eqgate_hyperalloc_pending == 0 {
+        return snapshot.scheduler_eqgate_drain_budget;
+    }
+    let pending_budget = query
+        .eqgate_hyperalloc_pending
+        .min(u64::from(HYPERALLOC_SCHEDULER_ADAPTIVE_EQGATE_DRAIN_BUDGET));
+    u32::try_from(pending_budget)
+        .unwrap_or(HYPERALLOC_SCHEDULER_ADAPTIVE_EQGATE_DRAIN_BUDGET)
+        .clamp(1, HYPERALLOC_SCHEDULER_MAX_EQGATE_DRAIN_BUDGET)
 }
 
 fn maybe_auto_apply_hyperalloc_scheduler(
@@ -2461,6 +3075,23 @@ fn maybe_auto_apply_hyperalloc_scheduler_cpu(
     }
 }
 
+fn maybe_apply_hyperalloc_scheduler_io(
+    snapshot: &HyperAllocRuntimeSnapshot,
+    io_action: &str,
+) -> HyperAllocSchedulerIoApplyResult {
+    if snapshot.scheduler_enabled == 0 || io_action == "disabled" {
+        return HyperAllocSchedulerIoApplyResult {
+            block_policy_result: "disabled",
+            vfio_channel_result: "disabled",
+        };
+    }
+
+    HyperAllocSchedulerIoApplyResult {
+        block_policy_result: apply_hyperalloc_scheduler_block_io_policy(snapshot),
+        vfio_channel_result: hyperalloc_scheduler_vfio_channel_result(snapshot),
+    }
+}
+
 fn maybe_auto_drain_hyperalloc_scheduler_eqgate(
     server: &ControlServer,
     snapshot: &HyperAllocRuntimeSnapshot,
@@ -2534,6 +3165,24 @@ impl HyperAllocSchedulerCpuAutoApplyResult {
     }
 }
 
+impl HyperAllocSchedulerAdaptResult {
+    fn from_snapshot(result: &'static str, snapshot: &HyperAllocRuntimeSnapshot) -> Self {
+        Self {
+            result,
+            target_before: snapshot.scheduler_target_huge_frames,
+            target_after: snapshot.scheduler_target_huge_frames,
+            desired_before: snapshot.scheduler_desired_vcpus,
+            desired_after: snapshot.scheduler_desired_vcpus,
+            vfio_queue_before: snapshot.scheduler_vfio_queue_goal,
+            vfio_queue_after: snapshot.scheduler_vfio_queue_goal,
+            block_weight_before: snapshot.scheduler_block_io_weight,
+            block_weight_after: snapshot.scheduler_block_io_weight,
+            eqgate_budget_before: snapshot.scheduler_eqgate_drain_budget,
+            eqgate_budget_after: snapshot.scheduler_eqgate_drain_budget,
+        }
+    }
+}
+
 impl HyperAllocSchedulerEqGateAutoDrainResult {
     fn zero(result: &'static str) -> Self {
         Self {
@@ -2550,6 +3199,29 @@ impl HyperAllocSchedulerEqGateAutoDrainResult {
             last_sequence: 0,
             skipped: 0,
             blocked_by_other_instance: 0,
+        }
+    }
+}
+
+impl HyperAllocSchedulerMemoryApplyResult {
+    fn zero(result: &'static str) -> Self {
+        Self {
+            result,
+            sequence: 0,
+            status: 0,
+            target_pages: 0,
+            timeout_ms: 0,
+        }
+    }
+}
+
+impl HyperAllocSchedulerCpuApplyResult {
+    fn new(result: &'static str, desired_before: u8, desired_after: u8, max_vcpus: u8) -> Self {
+        Self {
+            result,
+            desired_before,
+            desired_after,
+            max_vcpus,
         }
     }
 }
@@ -2664,6 +3336,8 @@ fn hyperalloc_runtime_snapshot(
         scheduler_memory_auto_apply,
         scheduler_cpu_auto_apply,
         scheduler_eqgate_auto_drain,
+        scheduler_adaptive,
+        scheduler_adaptive_vfio_queue_cap,
     ) = {
         let scheduler_guard = server
             .hyperalloc_scheduler
@@ -2683,8 +3357,10 @@ fn hyperalloc_runtime_snapshot(
                 bool_to_u8(scheduler.auto_apply),
                 bool_to_u8(scheduler.cpu_auto_apply),
                 bool_to_u8(scheduler.eqgate_auto_drain),
+                bool_to_u8(scheduler.adaptive),
+                scheduler.adaptive_vfio_queue_cap,
             ),
-            None => (0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+            None => (0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
         }
     };
 
@@ -2718,6 +3394,8 @@ fn hyperalloc_runtime_snapshot(
         scheduler_memory_auto_apply,
         scheduler_cpu_auto_apply,
         scheduler_eqgate_auto_drain,
+        scheduler_adaptive,
+        scheduler_adaptive_vfio_queue_cap,
         has_block_backend: server.has_block_backend,
         has_vfio_backend: server.has_vfio_backend,
     })
@@ -2737,7 +3415,7 @@ fn format_hyperalloc_scheduler_snapshot(server: &ControlServer) -> Result<String
     let eqgate_action = hyperalloc_scheduler_eqgate_action(&snapshot, &query);
 
     Ok(format!(
-        "scheduler_snapshot instance={} memory_target_huge_frames={} policy_enabled={} policy_target_huge_frames={} policy_interval_ms={} policy_elapsed_ms={} policy_last_issued_seq={} policy_last_completed_seq={} metrics_enabled={} metrics_interval_ms={} metrics_elapsed_ms={} evaluator_enabled={} evaluator_interval_ms={} evaluator_elapsed_ms={} evaluator_target_huge_frames={} eval_target_huge_frames={} scheduler_enabled={} scheduler_interval_ms={} scheduler_elapsed_ms={} scheduler_target_huge_frames={} scheduler_desired_vcpus={} scheduler_vfio_queue_goal={} scheduler_block_io_weight={} scheduler_auto_apply={} scheduler_memory_auto_apply={} scheduler_cpu_auto_apply={} scheduler_eqgate_auto_drain={} memory_action={} memory_effect={} cpu_action={} io_action={} decision={} reason={} last_seq={} pcache_req={} pcache_done={} pcache_failed={} registered_frames={} unregistered_frames={} installed={} soft={} hard={} reclaiming={} physical_releases={} physical_allocations={} physically_released_frames={} last_physical_release_hpa={} last_physical_allocation_hpa={} last_target_huge={} last_target_pages={} last_reclaimed_huge={} last_remaining_file_huge={} last_pcache_status={} last_pcache_errno={} vfio_dma_pending={} vfio_dma_done={} vfio_dma_failed={} vfio_dma_outstanding={} last_vfio_dma_seq={} last_vfio_dma_op={} last_vfio_dma_op_name={} last_vfio_dma_status={} last_vfio_dma_status_name={} last_vfio_dma_iova={} last_vfio_dma_hpa={} last_vfio_dma_size={} last_vfio_dma_errno={} reclaim_dma_rollback_attempts={} reclaim_dma_rollback_successes={} reclaim_dma_rollback_failures={} install_ept_rollback_attempts={} install_ept_rollback_successes={} install_ept_rollback_failures={} mmap_gen={} mmap_active={} mmap_current={} mmap_stale={} mmap_seq={} mmap_reason={} mmap_zap_pending={} mmap_zap_done={} mmap_zap_failed={} mmap_zap_outstanding={} last_mmap_zap_seq={} last_mmap_zap_status={} last_mmap_zap_status_name={} last_mmap_zap_gpa={} last_mmap_zap_len={} last_mmap_zap_zapped_vmas={} last_mmap_zap_zapped_bytes={} last_mmap_zap_errno={} vfio_block_reason={} vfio_block_state={} eqgate_ha_available={} eqgate_ha_pcpu_count={} eqgate_ha_capacity={} eqgate_ha_pending={} eqgate_ha_submitted={} eqgate_ha_drained={} eqgate_ha_dropped={} eqgate_ha_last_seq={} physical_release_allowed={} persistent_host_ram_consumers={} scheduler_io_backend={} io_effect={} scheduler_eqgate_drain_budget={} eqgate_action={}",
+        "scheduler_snapshot instance={} memory_target_huge_frames={} policy_enabled={} policy_target_huge_frames={} policy_interval_ms={} policy_elapsed_ms={} policy_last_issued_seq={} policy_last_completed_seq={} metrics_enabled={} metrics_interval_ms={} metrics_elapsed_ms={} evaluator_enabled={} evaluator_interval_ms={} evaluator_elapsed_ms={} evaluator_target_huge_frames={} eval_target_huge_frames={} scheduler_enabled={} scheduler_interval_ms={} scheduler_elapsed_ms={} scheduler_target_huge_frames={} scheduler_desired_vcpus={} scheduler_vfio_queue_goal={} scheduler_block_io_weight={} scheduler_auto_apply={} scheduler_memory_auto_apply={} scheduler_cpu_auto_apply={} scheduler_eqgate_auto_drain={} scheduler_adaptive={} scheduler_adaptive_vfio_queue_cap={} memory_action={} memory_effect={} cpu_action={} io_action={} decision={} reason={} last_seq={} pcache_req={} pcache_done={} pcache_failed={} registered_frames={} unregistered_frames={} installed={} soft={} hard={} reclaiming={} physical_releases={} physical_allocations={} physically_released_frames={} last_physical_release_hpa={} last_physical_allocation_hpa={} last_target_huge={} last_target_pages={} last_reclaimed_huge={} last_remaining_file_huge={} last_pcache_status={} last_pcache_errno={} vfio_dma_pending={} vfio_dma_done={} vfio_dma_failed={} vfio_dma_outstanding={} last_vfio_dma_seq={} last_vfio_dma_op={} last_vfio_dma_op_name={} last_vfio_dma_status={} last_vfio_dma_status_name={} last_vfio_dma_iova={} last_vfio_dma_hpa={} last_vfio_dma_size={} last_vfio_dma_errno={} reclaim_dma_rollback_attempts={} reclaim_dma_rollback_successes={} reclaim_dma_rollback_failures={} install_ept_rollback_attempts={} install_ept_rollback_successes={} install_ept_rollback_failures={} mmap_gen={} mmap_active={} mmap_current={} mmap_stale={} mmap_seq={} mmap_reason={} mmap_zap_pending={} mmap_zap_done={} mmap_zap_failed={} mmap_zap_outstanding={} last_mmap_zap_seq={} last_mmap_zap_status={} last_mmap_zap_status_name={} last_mmap_zap_gpa={} last_mmap_zap_len={} last_mmap_zap_zapped_vmas={} last_mmap_zap_zapped_bytes={} last_mmap_zap_errno={} vfio_block_reason={} vfio_block_state={} eqgate_ha_available={} eqgate_ha_pcpu_count={} eqgate_ha_capacity={} eqgate_ha_pending={} eqgate_ha_submitted={} eqgate_ha_drained={} eqgate_ha_dropped={} eqgate_ha_last_seq={} eqgate_root_drain_execute={} eqgate_guest_hcall_enqueue={} eqgate_direct_ept_iommu_update={} physical_release_allowed={} persistent_host_ram_consumers={} scheduler_io_backend={} io_effect={} scheduler_eqgate_drain_budget={} eqgate_action={}",
         server.instance_id,
         snapshot.memory_target_huge_frames,
         snapshot.policy_enabled,
@@ -2765,6 +3443,8 @@ fn format_hyperalloc_scheduler_snapshot(server: &ControlServer) -> Result<String
         snapshot.scheduler_memory_auto_apply,
         snapshot.scheduler_cpu_auto_apply,
         snapshot.scheduler_eqgate_auto_drain,
+        snapshot.scheduler_adaptive,
+        snapshot.scheduler_adaptive_vfio_queue_cap,
         memory_action,
         hyperalloc_memory_effect(&query),
         cpu_action,
@@ -2844,6 +3524,18 @@ fn format_hyperalloc_scheduler_snapshot(server: &ControlServer) -> Result<String
         query.eqgate_hyperalloc_last_sequence,
         hyperalloc_query_flag(
             &query,
+            eqvm_defs::EQ_HYPERALLOC_QUERY_FLAG_EQGATE_ROOT_DRAIN_EXECUTE
+        ),
+        hyperalloc_query_flag(
+            &query,
+            eqvm_defs::EQ_HYPERALLOC_QUERY_FLAG_EQGATE_GUEST_HCALL_ENQUEUE
+        ),
+        hyperalloc_query_flag(
+            &query,
+            eqvm_defs::EQ_HYPERALLOC_QUERY_FLAG_EQGATE_DIRECT_EPT_IOMMU_UPDATE
+        ),
+        hyperalloc_query_flag(
+            &query,
             eqvm_defs::EQ_HYPERALLOC_QUERY_FLAG_PHYSICAL_RELEASE_ALLOWED
         ),
         hyperalloc_query_flag(
@@ -2852,7 +3544,8 @@ fn format_hyperalloc_scheduler_snapshot(server: &ControlServer) -> Result<String
         ),
         hyperalloc_scheduler_io_backend(snapshot.has_block_backend, snapshot.has_vfio_backend),
         hyperalloc_scheduler_io_effect(
-            io_action,
+            snapshot.scheduler_vfio_queue_goal,
+            snapshot.scheduler_block_io_weight,
             snapshot.has_block_backend,
             snapshot.has_vfio_backend
         ),
@@ -2869,14 +3562,16 @@ fn format_hyperalloc_scheduler_tick(
     memory_action: &str,
     cpu_action: &str,
     io_action: &str,
+    adapt: &HyperAllocSchedulerAdaptResult,
     auto_apply: &HyperAllocSchedulerAutoApplyResult,
     cpu_auto_apply: &HyperAllocSchedulerCpuAutoApplyResult,
+    io_apply: &HyperAllocSchedulerIoApplyResult,
     eqgate_auto_drain: &HyperAllocSchedulerEqGateAutoDrainResult,
 ) -> String {
     let unregistered_frames = query.frame_count.saturating_sub(query.registered_frames);
     let eqgate_action = hyperalloc_scheduler_eqgate_action(snapshot, query);
     format!(
-        "scheduler_tick desired_vcpus={} max_vcpus={} memory_target_huge_frames={} scheduler_target_huge_frames={} scheduler_desired_vcpus={} scheduler_vfio_queue_goal={} scheduler_block_io_weight={} scheduler_auto_apply={} scheduler_memory_auto_apply={} scheduler_cpu_auto_apply={} scheduler_eqgate_auto_drain={} memory_action={} memory_effect={} cpu_action={} io_action={} policy_enabled={} policy_target_huge_frames={} metrics_enabled={} evaluator_enabled={} eval_target_huge_frames={} decision={} reason={} auto_apply_result={} auto_apply_seq={} auto_apply_status={} auto_apply_target_pages={} auto_apply_timeout_ms={} cpu_auto_apply_result={} cpu_auto_apply_desired_before={} cpu_auto_apply_desired_after={} cpu_auto_apply_max_vcpus={} last_seq={} pcache_req={} pcache_done={} pcache_failed={} registered_frames={} unregistered_frames={} installed={} soft={} hard={} reclaiming={} physical_releases={} physical_allocations={} physically_released_frames={} last_physical_release_hpa={} last_physical_allocation_hpa={} vfio_dma_pending={} vfio_dma_done={} vfio_dma_failed={} vfio_dma_outstanding={} last_vfio_dma_seq={} last_vfio_dma_op={} last_vfio_dma_op_name={} last_vfio_dma_status={} last_vfio_dma_status_name={} last_vfio_dma_iova={} last_vfio_dma_hpa={} last_vfio_dma_size={} last_vfio_dma_errno={} reclaim_dma_rollback_attempts={} reclaim_dma_rollback_successes={} reclaim_dma_rollback_failures={} install_ept_rollback_attempts={} install_ept_rollback_successes={} install_ept_rollback_failures={} mmap_active={} mmap_current={} mmap_stale={} mmap_zap_pending={} mmap_zap_done={} mmap_zap_failed={} mmap_zap_outstanding={} last_mmap_zap_seq={} last_mmap_zap_status={} last_mmap_zap_status_name={} last_mmap_zap_gpa={} last_mmap_zap_len={} last_mmap_zap_zapped_vmas={} last_mmap_zap_zapped_bytes={} last_mmap_zap_errno={} vfio_block_reason={} vfio_block_state={} eqgate_ha_available={} eqgate_ha_pcpu_count={} eqgate_ha_capacity={} eqgate_ha_pending={} eqgate_ha_submitted={} eqgate_ha_drained={} eqgate_ha_dropped={} eqgate_ha_last_seq={} physical_release_allowed={} persistent_host_ram_consumers={} scheduler_io_backend={} io_effect={} scheduler_eqgate_drain_budget={} eqgate_action={} eqgate_auto_drain_result={} eqgate_auto_drain_flags={:#x} eqgate_auto_drain_max_requests={} eqgate_auto_drain_visited_pcpus={} eqgate_auto_drain_pending_before={} eqgate_auto_drain_drained={} eqgate_auto_drain_installed={} eqgate_auto_drain_unsupported={} eqgate_auto_drain_failed={} eqgate_auto_drain_pending_after={} eqgate_auto_drain_last_seq={} eqgate_auto_drain_skipped={} eqgate_auto_drain_blocked_by_other_instance={}",
+        "scheduler_tick desired_vcpus={} max_vcpus={} memory_target_huge_frames={} scheduler_target_huge_frames={} scheduler_desired_vcpus={} scheduler_vfio_queue_goal={} scheduler_block_io_weight={} scheduler_auto_apply={} scheduler_memory_auto_apply={} scheduler_cpu_auto_apply={} scheduler_eqgate_auto_drain={} scheduler_adaptive={} scheduler_adaptive_vfio_queue_cap={} adaptive_result={} adaptive_target_before={} adaptive_target_after={} adaptive_desired_before={} adaptive_desired_after={} adaptive_vfio_queue_before={} adaptive_vfio_queue_after={} adaptive_block_weight_before={} adaptive_block_weight_after={} adaptive_eqgate_budget_before={} adaptive_eqgate_budget_after={} memory_action={} memory_effect={} cpu_action={} io_action={} policy_enabled={} policy_target_huge_frames={} metrics_enabled={} evaluator_enabled={} eval_target_huge_frames={} decision={} reason={} auto_apply_result={} auto_apply_seq={} auto_apply_status={} auto_apply_target_pages={} auto_apply_timeout_ms={} cpu_auto_apply_result={} cpu_auto_apply_desired_before={} cpu_auto_apply_desired_after={} cpu_auto_apply_max_vcpus={} block_policy_result={} vfio_channel_result={} last_seq={} pcache_req={} pcache_done={} pcache_failed={} registered_frames={} unregistered_frames={} installed={} soft={} hard={} reclaiming={} physical_releases={} physical_allocations={} physically_released_frames={} last_physical_release_hpa={} last_physical_allocation_hpa={} vfio_dma_pending={} vfio_dma_done={} vfio_dma_failed={} vfio_dma_outstanding={} last_vfio_dma_seq={} last_vfio_dma_op={} last_vfio_dma_op_name={} last_vfio_dma_status={} last_vfio_dma_status_name={} last_vfio_dma_iova={} last_vfio_dma_hpa={} last_vfio_dma_size={} last_vfio_dma_errno={} reclaim_dma_rollback_attempts={} reclaim_dma_rollback_successes={} reclaim_dma_rollback_failures={} install_ept_rollback_attempts={} install_ept_rollback_successes={} install_ept_rollback_failures={} mmap_active={} mmap_current={} mmap_stale={} mmap_zap_pending={} mmap_zap_done={} mmap_zap_failed={} mmap_zap_outstanding={} last_mmap_zap_seq={} last_mmap_zap_status={} last_mmap_zap_status_name={} last_mmap_zap_gpa={} last_mmap_zap_len={} last_mmap_zap_zapped_vmas={} last_mmap_zap_zapped_bytes={} last_mmap_zap_errno={} vfio_block_reason={} vfio_block_state={} eqgate_ha_available={} eqgate_ha_pcpu_count={} eqgate_ha_capacity={} eqgate_ha_pending={} eqgate_ha_submitted={} eqgate_ha_drained={} eqgate_ha_dropped={} eqgate_ha_last_seq={} eqgate_root_drain_execute={} eqgate_guest_hcall_enqueue={} eqgate_direct_ept_iommu_update={} physical_release_allowed={} persistent_host_ram_consumers={} scheduler_io_backend={} io_effect={} scheduler_eqgate_drain_budget={} eqgate_action={} eqgate_auto_drain_result={} eqgate_auto_drain_flags={:#x} eqgate_auto_drain_max_requests={} eqgate_auto_drain_visited_pcpus={} eqgate_auto_drain_pending_before={} eqgate_auto_drain_drained={} eqgate_auto_drain_installed={} eqgate_auto_drain_unsupported={} eqgate_auto_drain_failed={} eqgate_auto_drain_pending_after={} eqgate_auto_drain_last_seq={} eqgate_auto_drain_skipped={} eqgate_auto_drain_blocked_by_other_instance={}",
         snapshot.desired_vcpus,
         snapshot.max_vcpus,
         snapshot.memory_target_huge_frames,
@@ -2888,6 +3583,19 @@ fn format_hyperalloc_scheduler_tick(
         snapshot.scheduler_memory_auto_apply,
         snapshot.scheduler_cpu_auto_apply,
         snapshot.scheduler_eqgate_auto_drain,
+        snapshot.scheduler_adaptive,
+        snapshot.scheduler_adaptive_vfio_queue_cap,
+        adapt.result,
+        adapt.target_before,
+        adapt.target_after,
+        adapt.desired_before,
+        adapt.desired_after,
+        adapt.vfio_queue_before,
+        adapt.vfio_queue_after,
+        adapt.block_weight_before,
+        adapt.block_weight_after,
+        adapt.eqgate_budget_before,
+        adapt.eqgate_budget_after,
         memory_action,
         hyperalloc_memory_effect(query),
         cpu_action,
@@ -2908,6 +3616,8 @@ fn format_hyperalloc_scheduler_tick(
         cpu_auto_apply.desired_before,
         cpu_auto_apply.desired_after,
         cpu_auto_apply.max_vcpus,
+        io_apply.block_policy_result,
+        io_apply.vfio_channel_result,
         query.last_pagecache_shrink_seq,
         query.pagecache_shrink_pending_requests,
         query.pagecache_shrink_completed_requests,
@@ -2972,6 +3682,18 @@ fn format_hyperalloc_scheduler_tick(
         query.eqgate_hyperalloc_last_sequence,
         hyperalloc_query_flag(
             query,
+            eqvm_defs::EQ_HYPERALLOC_QUERY_FLAG_EQGATE_ROOT_DRAIN_EXECUTE
+        ),
+        hyperalloc_query_flag(
+            query,
+            eqvm_defs::EQ_HYPERALLOC_QUERY_FLAG_EQGATE_GUEST_HCALL_ENQUEUE
+        ),
+        hyperalloc_query_flag(
+            query,
+            eqvm_defs::EQ_HYPERALLOC_QUERY_FLAG_EQGATE_DIRECT_EPT_IOMMU_UPDATE
+        ),
+        hyperalloc_query_flag(
+            query,
             eqvm_defs::EQ_HYPERALLOC_QUERY_FLAG_PHYSICAL_RELEASE_ALLOWED
         ),
         hyperalloc_query_flag(
@@ -2980,7 +3702,8 @@ fn format_hyperalloc_scheduler_tick(
         ),
         hyperalloc_scheduler_io_backend(snapshot.has_block_backend, snapshot.has_vfio_backend),
         hyperalloc_scheduler_io_effect(
-            io_action,
+            snapshot.scheduler_vfio_queue_goal,
+            snapshot.scheduler_block_io_weight,
             snapshot.has_block_backend,
             snapshot.has_vfio_backend
         ),
@@ -3052,14 +3775,25 @@ fn hyperalloc_scheduler_io_backend(
 }
 
 fn hyperalloc_scheduler_io_effect(
-    io_action: &str,
+    vfio_queue_goal: u16,
+    block_io_weight: u16,
     has_block_backend: bool,
     has_vfio_backend: bool,
 ) -> &'static str {
-    if io_action == "disabled" {
+    let block_requested = block_io_weight != 0;
+    let vfio_requested = vfio_queue_goal != 0;
+    if !block_requested && !vfio_requested {
         "disabled"
-    } else if has_block_backend || has_vfio_backend {
-        "dry_run"
+    } else if block_requested && has_block_backend && vfio_requested && has_vfio_backend {
+        "block_policy_applied_vfio_channel_pending"
+    } else if block_requested && has_block_backend && vfio_requested {
+        "block_policy_applied_vfio_no_backend"
+    } else if block_requested && has_block_backend {
+        "block_policy_applied"
+    } else if block_requested && vfio_requested && has_vfio_backend {
+        "vfio_channel_pending_block_no_backend"
+    } else if vfio_requested && has_vfio_backend {
+        "vfio_channel_pending"
     } else {
         "no_backend"
     }
@@ -3161,7 +3895,7 @@ fn format_hyperalloc_policy_eval(
 fn format_hyperalloc_status(query: &eqvm_defs::EqHyperAllocQuery) -> String {
     let unregistered_frames = query.frame_count.saturating_sub(query.registered_frames);
     format!(
-        "hyperalloc version={} flags={:#x} frames={} registered_frames={} unregistered_frames={} installed={} soft={} hard={} installing={} reclaiming={} logical_reclaims={} logical_returns={} logical_installs={} logical_reclaim_attempts={} logical_reclaim_failures={} logical_install_attempts={} logical_install_failures={} last_reclaim_us={} max_reclaim_us={} last_install_us={} max_install_us={} physical_releases={} physical_allocations={} physically_released_frames={} last_physical_release_hpa={} last_physical_allocation_hpa={} physical_release_allowed={} persistent_host_ram_consumers={} pcache_req={} pcache_done={} pcache_failed={} last_seq={} last_target_huge={} last_target_pages={} last_reclaimed_huge={} last_remaining_file_huge={} last_pcache_status={} last_pcache_errno={} vfio_dma_pending={} vfio_dma_done={} vfio_dma_failed={} vfio_dma_outstanding={} last_vfio_dma_seq={} last_vfio_dma_op={} last_vfio_dma_op_name={} last_vfio_dma_status={} last_vfio_dma_status_name={} last_vfio_dma_iova={} last_vfio_dma_hpa={} last_vfio_dma_size={} last_vfio_dma_errno={} reclaim_dma_rollback_attempts={} reclaim_dma_rollback_successes={} reclaim_dma_rollback_failures={} install_ept_rollback_attempts={} install_ept_rollback_successes={} install_ept_rollback_failures={} mmap_gen={} mmap_active={} mmap_current={} mmap_stale={} mmap_seq={} mmap_reason={} mmap_zap_pending={} mmap_zap_done={} mmap_zap_failed={} mmap_zap_outstanding={} last_mmap_zap_seq={} last_mmap_zap_status={} last_mmap_zap_status_name={} last_mmap_zap_gpa={} last_mmap_zap_len={} last_mmap_zap_zapped_vmas={} last_mmap_zap_zapped_bytes={} last_mmap_zap_errno={} vfio_block_reason={} vfio_block_state={} eqgate_ha_available={} eqgate_ha_pcpu_count={} eqgate_ha_capacity={} eqgate_ha_pending={} eqgate_ha_submitted={} eqgate_ha_drained={} eqgate_ha_dropped={} eqgate_ha_last_seq={} vfio_present={} vfio_dynamic_supported={} vfio_dynamic_enabled={} vfio_dma_blocked_stale_vma={} vfio_physical_reclaim_blocked={}",
+        "hyperalloc version={} flags={:#x} frames={} registered_frames={} unregistered_frames={} installed={} soft={} hard={} installing={} reclaiming={} logical_reclaims={} logical_returns={} logical_installs={} logical_reclaim_attempts={} logical_reclaim_failures={} logical_install_attempts={} logical_install_failures={} last_reclaim_us={} max_reclaim_us={} last_install_us={} max_install_us={} physical_releases={} physical_allocations={} physically_released_frames={} last_physical_release_hpa={} last_physical_allocation_hpa={} physical_release_allowed={} persistent_host_ram_consumers={} pcache_req={} pcache_done={} pcache_failed={} last_seq={} last_target_huge={} last_target_pages={} last_reclaimed_huge={} last_remaining_file_huge={} last_pcache_status={} last_pcache_errno={} vfio_dma_pending={} vfio_dma_done={} vfio_dma_failed={} vfio_dma_outstanding={} last_vfio_dma_seq={} last_vfio_dma_op={} last_vfio_dma_op_name={} last_vfio_dma_status={} last_vfio_dma_status_name={} last_vfio_dma_iova={} last_vfio_dma_hpa={} last_vfio_dma_size={} last_vfio_dma_errno={} reclaim_dma_rollback_attempts={} reclaim_dma_rollback_successes={} reclaim_dma_rollback_failures={} install_ept_rollback_attempts={} install_ept_rollback_successes={} install_ept_rollback_failures={} mmap_gen={} mmap_active={} mmap_current={} mmap_stale={} mmap_seq={} mmap_reason={} mmap_zap_pending={} mmap_zap_done={} mmap_zap_failed={} mmap_zap_outstanding={} last_mmap_zap_seq={} last_mmap_zap_status={} last_mmap_zap_status_name={} last_mmap_zap_gpa={} last_mmap_zap_len={} last_mmap_zap_zapped_vmas={} last_mmap_zap_zapped_bytes={} last_mmap_zap_errno={} vfio_block_reason={} vfio_block_state={} eqgate_ha_available={} eqgate_ha_pcpu_count={} eqgate_ha_capacity={} eqgate_ha_pending={} eqgate_ha_submitted={} eqgate_ha_drained={} eqgate_ha_dropped={} eqgate_ha_last_seq={} eqgate_root_drain_execute={} eqgate_guest_hcall_enqueue={} eqgate_direct_ept_iommu_update={} vfio_present={} vfio_dynamic_supported={} vfio_dynamic_enabled={} vfio_dma_blocked_stale_vma={} vfio_physical_reclaim_blocked={}",
         query.version,
         query.flags,
         query.frame_count,
@@ -3256,6 +3990,18 @@ fn format_hyperalloc_status(query: &eqvm_defs::EqHyperAllocQuery) -> String {
         query.eqgate_hyperalloc_drained,
         query.eqgate_hyperalloc_dropped,
         query.eqgate_hyperalloc_last_sequence,
+        hyperalloc_query_flag(
+            query,
+            eqvm_defs::EQ_HYPERALLOC_QUERY_FLAG_EQGATE_ROOT_DRAIN_EXECUTE
+        ),
+        hyperalloc_query_flag(
+            query,
+            eqvm_defs::EQ_HYPERALLOC_QUERY_FLAG_EQGATE_GUEST_HCALL_ENQUEUE
+        ),
+        hyperalloc_query_flag(
+            query,
+            eqvm_defs::EQ_HYPERALLOC_QUERY_FLAG_EQGATE_DIRECT_EPT_IOMMU_UPDATE
+        ),
         hyperalloc_query_flag(query, eqvm_defs::EQ_HYPERALLOC_QUERY_FLAG_VFIO_PRESENT),
         hyperalloc_query_flag(
             query,

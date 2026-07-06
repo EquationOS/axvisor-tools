@@ -2,16 +2,15 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicUsize, Ordering, fence};
+use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering, fence};
 use std::thread;
 use std::time::Duration;
 
 use axerrno::{AxResult, ax_err, ax_err_type};
 use eqvm_defs::{
-    EQ_MICROVM_GUEST_MEM_COPY_MAX_LEN,
-    MICROVM_BLOCK_NOTIFY_MAGIC, MICROVM_BLOCK_NOTIFY_PAGE_SIZE, MICROVM_BLOCK_NOTIFY_RING_SIZE,
-    MICROVM_IRQ_INDEX_SOURCE_BLOCK, MMAP_MICROVM_BLOCK_NOTIFY_MAGIC_NUMBER,
-    MicroVmBlockNotifyEntry, MicroVmBlockNotifyPage,
+    EQ_MICROVM_GUEST_MEM_COPY_MAX_LEN, MICROVM_BLOCK_NOTIFY_MAGIC, MICROVM_BLOCK_NOTIFY_PAGE_SIZE,
+    MICROVM_BLOCK_NOTIFY_RING_SIZE, MICROVM_IRQ_INDEX_SOURCE_BLOCK,
+    MMAP_MICROVM_BLOCK_NOTIFY_MAGIC_NUMBER, MicroVmBlockNotifyEntry, MicroVmBlockNotifyPage,
 };
 use libc::{MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE, mmap};
 
@@ -34,13 +33,27 @@ const VIRTIO_BLK_S_OK: u8 = 0;
 const VIRTIO_BLK_S_IOERR: u8 = 1;
 const VIRTIO_BLK_S_UNSUPP: u8 = 2;
 const BLOCK_TRACE_LIMIT: usize = 32;
+const BLOCK_IO_WEIGHT_MAX: u16 = 10000;
+const BLOCK_IO_DEFAULT_PRIO_DATA: u16 = 4;
+const IOPRIO_CLASS_BE: u32 = 2;
+const IOPRIO_CLASS_SHIFT: u32 = 13;
+const IOPRIO_WHO_PROCESS: i32 = 1;
 
 static BLOCK_REQUEST_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static BLOCK_COMPLETE_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static BLOCK_DRAIN_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static SCHEDULER_BLOCK_IO_WEIGHT: AtomicU16 = AtomicU16::new(0);
 
 pub struct BlockBackend {
     _worker: thread::JoinHandle<()>,
+}
+
+pub(crate) fn set_scheduler_block_io_weight(weight: u16) {
+    SCHEDULER_BLOCK_IO_WEIGHT.store(weight.min(BLOCK_IO_WEIGHT_MAX), Ordering::Release);
+}
+
+pub(crate) fn scheduler_block_io_weight() -> u16 {
+    SCHEDULER_BLOCK_IO_WEIGHT.load(Ordering::Acquire)
 }
 
 struct BlockDrive {
@@ -183,7 +196,10 @@ impl QueueRuntime {
 enum GuestMemoryAccess {
     #[allow(dead_code)]
     Mmap(GuestMemoryMmap),
-    Mediated { instance_id: usize, instance_fd: i32 },
+    Mediated {
+        instance_id: usize,
+        instance_fd: i32,
+    },
 }
 
 impl GuestMemoryAccess {
@@ -405,7 +421,9 @@ fn block_backend_loop(
     }
 
     let mut queue = QueueRuntime::default();
+    let mut applied_block_io_weight = u16::MAX;
     loop {
+        maybe_apply_block_io_policy(instance_id, &mut applied_block_io_weight);
         let mut active = false;
         while let Some(entry) = notify.pop(instance_id) {
             active = true;
@@ -451,6 +469,62 @@ fn block_backend_loop(
             IDLE_POLL_INTERVAL
         });
     }
+}
+
+fn maybe_apply_block_io_policy(instance_id: usize, applied_weight: &mut u16) {
+    let weight = scheduler_block_io_weight();
+    if *applied_weight == weight {
+        return;
+    }
+    *applied_weight = weight;
+    let prio_data = block_io_weight_to_ioprio_data(weight);
+    match apply_thread_ioprio(weight) {
+        Ok(()) => info!(
+            "microVM block I/O policy applied: instance={} weight={} ioprio_class=best-effort ioprio_data={} drain_budget_policy={}",
+            instance_id,
+            weight,
+            prio_data,
+            if weight == 0 { "unlimited" } else { "weighted" }
+        ),
+        Err(err) => warn!(
+            "microVM block I/O priority apply failed: instance={} weight={} ioprio_data={} err={}; weighted drain budget remains active",
+            instance_id, weight, prio_data, err
+        ),
+    }
+}
+
+fn apply_thread_ioprio(weight: u16) -> io::Result<()> {
+    let ioprio = block_io_weight_to_ioprio_value(weight);
+    let ret = unsafe { libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, ioprio) };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn block_io_weight_to_ioprio_value(weight: u16) -> u32 {
+    (IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | block_io_weight_to_ioprio_data(weight) as u32
+}
+
+fn block_io_weight_to_ioprio_data(weight: u16) -> u16 {
+    let weight = weight.min(BLOCK_IO_WEIGHT_MAX);
+    if weight == 0 {
+        return BLOCK_IO_DEFAULT_PRIO_DATA;
+    }
+    let inverted = (BLOCK_IO_WEIGHT_MAX - weight) as u32;
+    ((inverted * 7) / (BLOCK_IO_WEIGHT_MAX - 1) as u32) as u16
+}
+
+fn block_io_drain_budget(weight: u16, queue_size: u16) -> usize {
+    let weight = weight.min(BLOCK_IO_WEIGHT_MAX);
+    if weight == 0 || weight == BLOCK_IO_WEIGHT_MAX {
+        return usize::MAX;
+    }
+    let queue_size = usize::from(queue_size.max(1));
+    let budget = ((usize::from(weight) * queue_size) + usize::from(BLOCK_IO_WEIGHT_MAX - 1))
+        / usize::from(BLOCK_IO_WEIGHT_MAX);
+    budget.max(1)
 }
 
 fn read_u16(mem: &GuestMemoryAccess, addr: u64) -> AxResult<u16> {
@@ -522,13 +596,12 @@ fn read_request_header(mem: &GuestMemoryAccess, desc: VringDesc) -> AxResult<Vir
             "virtio-blk header descriptor is device-writable"
         );
     }
-    mem.read_obj::<VirtioBlkOutHdr>(desc.addr)
-        .map_err(|e| {
-            ax_err_type!(
-                BadState,
-                format_args!("guest virtio-blk header read {:#x}: {}", desc.addr, e)
-            )
-        })
+    mem.read_obj::<VirtioBlkOutHdr>(desc.addr).map_err(|e| {
+        ax_err_type!(
+            BadState,
+            format_args!("guest virtio-blk header read {:#x}: {}", desc.addr, e)
+        )
+    })
 }
 
 fn request_data_len(descs: &[VringDesc]) -> AxResult<u64> {
@@ -588,13 +661,12 @@ fn copy_file_to_guest(
                 Err(e) => return ax_err!(Io, format_args!("block image read: {}", e)),
             }
         }
-        mem.write_slice(&buf[..n], guest_off)
-            .map_err(|e| {
-                ax_err_type!(
-                    BadState,
-                    format_args!("guest data write {:#x}+{}: {}", guest_off, n, e)
-                )
-            })?;
+        mem.write_slice(&buf[..n], guest_off).map_err(|e| {
+            ax_err_type!(
+                BadState,
+                format_args!("guest data write {:#x}+{}: {}", guest_off, n, e)
+            )
+        })?;
         remaining -= n;
         guest_off += n as u64;
         file_off += n as u64;
@@ -621,13 +693,12 @@ fn copy_guest_to_file(
     let mut buf = vec![0u8; COPY_CHUNK_SIZE.min(remaining.max(1))];
     while remaining != 0 {
         let n = COPY_CHUNK_SIZE.min(remaining);
-        mem.read_slice(&mut buf[..n], guest_off)
-            .map_err(|e| {
-                ax_err_type!(
-                    BadState,
-                    format_args!("guest data read {:#x}+{}: {}", guest_off, n, e)
-                )
-            })?;
+        mem.read_slice(&mut buf[..n], guest_off).map_err(|e| {
+            ax_err_type!(
+                BadState,
+                format_args!("guest data read {:#x}+{}: {}", guest_off, n, e)
+            )
+        })?;
         let mut written = 0usize;
         while written < n {
             match file.write_at(&buf[written..n], file_off + written as u64) {
@@ -793,8 +864,10 @@ fn drain_queue_available(
         }
     }
 
+    let weight = scheduler_block_io_weight();
+    let drain_budget = block_io_drain_budget(weight, queue.queue_size);
     let mut completed = 0usize;
-    while queue.last_avail_idx != avail_idx {
+    while queue.last_avail_idx != avail_idx && completed < drain_budget {
         let ring_addr =
             queue.avail_addr + 4 + ((queue.last_avail_idx % queue.queue_size) as u64) * 2;
         let head = read_u16(mem, ring_addr)?;
@@ -812,10 +885,16 @@ fn drain_queue_available(
     let trace_id = BLOCK_COMPLETE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
     if trace_id < BLOCK_TRACE_LIMIT {
         trace!(
-            "microVM block queue completed: instance={} reason={} completed={} used_idx={} msix={}",
+            "microVM block queue completed: instance={} reason={} completed={} weight={} budget={} used_idx={} msix={}",
             instance_id,
             reason,
             completed,
+            weight,
+            if drain_budget == usize::MAX {
+                0
+            } else {
+                drain_budget
+            },
             read_u16(mem, queue.used_addr + 2).unwrap_or(0),
             queue.msix_vector
         );
@@ -962,5 +1041,25 @@ mod tests {
         assert!(lock_drive_file(1, &drive, &first).is_ok());
         assert!(lock_drive_file(2, &drive, &second).is_err());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn block_io_weight_maps_to_best_effort_priority() {
+        assert_eq!(
+            block_io_weight_to_ioprio_data(0),
+            BLOCK_IO_DEFAULT_PRIO_DATA
+        );
+        assert_eq!(block_io_weight_to_ioprio_data(1), 7);
+        assert_eq!(block_io_weight_to_ioprio_data(BLOCK_IO_WEIGHT_MAX), 0);
+        assert!(block_io_weight_to_ioprio_data(2500) > block_io_weight_to_ioprio_data(7500));
+    }
+
+    #[test]
+    fn block_io_weight_limits_drain_budget() {
+        assert_eq!(block_io_drain_budget(0, 256), usize::MAX);
+        assert_eq!(block_io_drain_budget(BLOCK_IO_WEIGHT_MAX, 256), usize::MAX);
+        assert_eq!(block_io_drain_budget(1, 256), 1);
+        assert_eq!(block_io_drain_budget(750, 256), 20);
+        assert_eq!(block_io_drain_budget(5000, 256), 128);
     }
 }
