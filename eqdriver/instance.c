@@ -85,7 +85,7 @@ static bool eq_vfio_use_eqgate_posted_vector;
 module_param(eq_vfio_use_eqgate_posted_vector, bool, 0644);
 MODULE_PARM_DESC(
 	eq_vfio_use_eqgate_posted_vector,
-	"Use hypervisor-provided owner-coded posted vector for VFIO IRQ posting");
+	"Deprecated compatibility knob; VFIO IRQ posting uses hypervisor-provided owner-coded vectors when available");
 
 typedef struct microvm_block_notify_page_header
 {
@@ -1044,9 +1044,7 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 		(query->flags & EQ_IRQ_ROUTE_FLAG_HAS_POSTED_VECTOR) ?
 			(uint32_t)(query->reserved[0] & 0xff) :
 			0;
-	query_use_posted_vector =
-		(eq_vfio_use_eqgate_posted_vector || query_requires_posted_vector) &&
-		query_posted_vector != 0;
+	query_use_posted_vector = query_posted_vector != 0;
 	if (query_requires_posted_vector && !query_use_posted_vector)
 	{
 		if (route->posted_active)
@@ -1106,9 +1104,7 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 			0;
 	query_requires_posted_vector =
 		(query->flags & EQ_IRQ_ROUTE_FLAG_REQUIRES_POSTED_VECTOR) != 0;
-	query_use_posted_vector =
-		(eq_vfio_use_eqgate_posted_vector || query_requires_posted_vector) &&
-		query_posted_vector != 0;
+	query_use_posted_vector = query_posted_vector != 0;
 	if (query_requires_posted_vector && !query_use_posted_vector)
 	{
 		if (route->posted_active)
