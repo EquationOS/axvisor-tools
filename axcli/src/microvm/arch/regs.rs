@@ -10,6 +10,7 @@ use std::mem;
 
 use kvm_bindings::kvm_sregs;
 
+use eqgate_microvm::gate::GATE_PT_GPA_BASE;
 use eqgate_microvm::layout::{PDE_START, PDPTE_START, PML4_START};
 
 use crate::microvm::arch::BootProtocol;
@@ -179,6 +180,17 @@ fn setup_page_tables(mem: &GuestMemoryMmap, sregs: &mut kvm_sregs) -> Result<(),
 
     // Entry covering VA [0..512GB)
     mem.write_obj(boot_pdpte_addr.raw_value() | 0x03, boot_pml4_addr)
+        .map_err(|_| RegsError::WritePML4Address)?;
+
+    // No-HLAT plan B: inject the gate high-half PML4[256] entry (VA
+    // 0xffff_8000_0000_0000, Linux's hypervisor-reserved guard hole) so the
+    // eqgate cede trampoline is reachable from the guest's initial boot page
+    // table, before eqLinux switches to its own page tables and re-injects
+    // slot 256 itself. pdpt_high is the 3rd gate PT page (GATE_PT_GPA_BASE holds
+    // PML4, +4K pdpt_low, +8K pdpt_high). Harmless under HLAT: slot 256 is
+    // unused by Linux and HLAT manages the gate range regardless of guest PML4.
+    let gate_pdpt_high_gpa = GATE_PT_GPA_BASE as u64 + 2 * 0x1000;
+    mem.write_obj(gate_pdpt_high_gpa | 0x03, boot_pml4_addr.unchecked_add(256 * 8))
         .map_err(|_| RegsError::WritePML4Address)?;
 
     // Entry covering VA [0..1GB)
