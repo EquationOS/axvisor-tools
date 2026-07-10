@@ -18,6 +18,7 @@
 #include <linux/sched/mm.h>
 #include <linux/uaccess.h>
 #include <linux/hashtable.h>
+#include <linux/version.h>
 
 #ifdef CONFIG_X86
 #include <asm/irq_remapping.h>
@@ -1117,7 +1118,13 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 	}
 	pir_vector = query_use_posted_vector ? query_posted_vector : query->guest_vector;
 	{
+		/* Linux 6.17 split 'struct vcpu_data' into vendor-specific structs;
+		 * the Intel variant keeps the same field layout. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
+		struct intel_iommu_pi_data vcpu_info = {
+#else
 		struct vcpu_data vcpu_info = {
+#endif
 			.pi_desc_addr = query->pi_desc_hpa,
 			.vector = pir_vector,
 		};
@@ -1269,11 +1276,17 @@ static int eq_register_irq_route(
 	route->instance_id = instance_vdev->id;
 	route->msix_index = arg->msix_index;
 	route->host_irq = -1;
-	route->consumer.token = eventfd;
 	route->consumer.add_producer = eq_irq_route_add_producer;
 	route->consumer.del_producer = eq_irq_route_del_producer;
 
+	/* Linux 6.17 dropped the opaque consumer token; producers and consumers
+	 * are paired by the eventfd passed at registration instead. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
+	ret = irq_bypass_register_consumer(&route->consumer, eventfd);
+#else
+	route->consumer.token = eventfd;
 	ret = irq_bypass_register_consumer(&route->consumer);
+#endif
 	if (ret)
 	{
 		INFO(
@@ -1290,8 +1303,8 @@ static int eq_register_irq_route(
 	mutex_unlock(&instance_vdev->irq_routes_lock);
 
 	INFO(
-		"Eq IRQ bypass consumer registered instance=%d msix_index=%u token=%p\n",
-		instance_vdev->id, route->msix_index, route->consumer.token);
+		"Eq IRQ bypass consumer registered instance=%d msix_index=%u eventfd=%p\n",
+		instance_vdev->id, route->msix_index, eventfd);
 	return 0;
 }
 
