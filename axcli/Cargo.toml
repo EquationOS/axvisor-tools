@@ -7,9 +7,8 @@ edition = "2024"
 members = ["deps/acpi-tables"]
 
 [features]
-default = ["libos", "microvm"]
+default = ["microvm"]
 microvm = ["eqgate-microvm", "eqvm_defs"]
-libos = ["equation_defs"]
 
 [dependencies]
 clap = { version = "4.5.4", features = ["derive"] }
@@ -24,7 +23,6 @@ lazyinit = "0.2"
 axerrno = "0.1.0"
 sc = "0.2.7"
 
-equation_defs = { optional = true, git = "https://github.com/EquationOS/equation_defs.git" }
 eqvm_defs = { optional = true, path = "../../../crates/eqvm_defs" }
 eqgate-microvm = { optional = true, git = "https://github.com/EquationOS/microvm_gate.git" }
 linux-libc-auxv = { git = "https://github.com/EquationOS/linux-libc-auxv.git" }
@@ -54,9 +52,6 @@ axhvc = { path = "../../../crates/axhvc" }
 
 [patch."https://github.com/EquationOS/pi-memory-layout.git"]
 pi_memory_layout = { path = "../../../crates/pi_memory_layout" }
-
-[patch."https://github.com/EquationOS/equation_defs.git"]
-equation_defs = { path = "../../../crates/equation_defs" }
 
 [patch."https://github.com/EquationOS/microvm_gate.git"]
 eqgate-microvm = { path = "../../../deps/microvm_gate/gate" }

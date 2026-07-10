@@ -41,53 +41,6 @@ pub fn hvc_init_shim(ksched_shm_base: u64) {
     info!("hvc_init_shim result: {:#x}", result);
 }
 
-#[cfg(feature = "libos")]
-pub fn hvc_setup_instance(
-    instance_id: u64,
-    file_size: u64,
-    shared_pages_base: u64,
-    shared_pages_num: u64,
-) -> isize {
-    info!(
-        "[*] Setting up instance ID: {}, file size: {}, shared pages base: {:#x}, num: {}",
-        instance_id, file_size, shared_pages_base, shared_pages_num
-    );
-
-    trigger_hypercall(
-        HyperCallCode::HSetupInstance,
-        instance_id,
-        file_size,
-        shared_pages_base,
-        shared_pages_num,
-        0,
-        0,
-    )
-}
-
-#[cfg(feature = "libos")]
-pub fn hvc_daemon_shmat(
-    instance_id: u64,
-    process_id: u64,
-    shmkey: u64,
-    shmaddr: u64,
-    shmsize: u64,
-    shmflg: u64,
-) -> isize {
-    debug!(
-        "[*] Attaching shm instance ID:{}, process ID: {}, key: {:#x}, addr: {:#x}, size: {:#x}, flags: {:#x}",
-        instance_id, process_id, shmkey, shmaddr, shmsize, shmflg
-    );
-    trigger_hypercall(
-        HyperCallCode::HIVCSHMAt,
-        instance_id,
-        process_id,
-        shmkey,
-        shmaddr,
-        shmsize,
-        shmflg,
-    )
-}
-
 #[cfg(feature = "microvm")]
 #[allow(dead_code)]
 pub fn hvc_microvm_boot(instance_id: u64, entry_point: u64, boot_protocol: u8) -> isize {
