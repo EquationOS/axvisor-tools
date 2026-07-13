@@ -3810,8 +3810,10 @@ fn hyperalloc_query_flag(query: &eqvm_defs::EqHyperAllocQuery, flag: u32) -> u8 
 fn hyperalloc_memory_effect(query: &eqvm_defs::EqHyperAllocQuery) -> &'static str {
     let physical_release =
         query.flags & eqvm_defs::EQ_HYPERALLOC_QUERY_FLAG_PHYSICAL_RELEASE_ALLOWED != 0;
-    let logical_only =
-        query.flags & eqvm_defs::EQ_HYPERALLOC_QUERY_FLAG_PERSISTENT_HOST_RAM_CONSUMERS != 0;
+    let logical_only = query.flags
+        & (eqvm_defs::EQ_HYPERALLOC_QUERY_FLAG_PERSISTENT_HOST_RAM_CONSUMERS
+            | eqvm_defs::EQ_HYPERALLOC_QUERY_FLAG_RETAIN_HPA)
+        != 0;
     match (physical_release, logical_only) {
         (true, false) => "physical_release",
         (false, true) => "logical_only",
@@ -3895,7 +3897,7 @@ fn format_hyperalloc_policy_eval(
 fn format_hyperalloc_status(query: &eqvm_defs::EqHyperAllocQuery) -> String {
     let unregistered_frames = query.frame_count.saturating_sub(query.registered_frames);
     format!(
-        "hyperalloc version={} flags={:#x} frames={} registered_frames={} unregistered_frames={} installed={} soft={} hard={} installing={} reclaiming={} logical_reclaims={} logical_returns={} logical_installs={} logical_reclaim_attempts={} logical_reclaim_failures={} logical_install_attempts={} logical_install_failures={} last_reclaim_us={} max_reclaim_us={} last_install_us={} max_install_us={} physical_releases={} physical_allocations={} physically_released_frames={} last_physical_release_hpa={} last_physical_allocation_hpa={} physical_release_allowed={} persistent_host_ram_consumers={} pcache_req={} pcache_done={} pcache_failed={} last_seq={} last_target_huge={} last_target_pages={} last_reclaimed_huge={} last_remaining_file_huge={} last_pcache_status={} last_pcache_errno={} vfio_dma_pending={} vfio_dma_done={} vfio_dma_failed={} vfio_dma_outstanding={} last_vfio_dma_seq={} last_vfio_dma_op={} last_vfio_dma_op_name={} last_vfio_dma_status={} last_vfio_dma_status_name={} last_vfio_dma_iova={} last_vfio_dma_hpa={} last_vfio_dma_size={} last_vfio_dma_errno={} reclaim_dma_rollback_attempts={} reclaim_dma_rollback_successes={} reclaim_dma_rollback_failures={} install_ept_rollback_attempts={} install_ept_rollback_successes={} install_ept_rollback_failures={} mmap_gen={} mmap_active={} mmap_current={} mmap_stale={} mmap_seq={} mmap_reason={} mmap_zap_pending={} mmap_zap_done={} mmap_zap_failed={} mmap_zap_outstanding={} last_mmap_zap_seq={} last_mmap_zap_status={} last_mmap_zap_status_name={} last_mmap_zap_gpa={} last_mmap_zap_len={} last_mmap_zap_zapped_vmas={} last_mmap_zap_zapped_bytes={} last_mmap_zap_errno={} vfio_block_reason={} vfio_block_state={} eqgate_ha_available={} eqgate_ha_pcpu_count={} eqgate_ha_capacity={} eqgate_ha_pending={} eqgate_ha_submitted={} eqgate_ha_drained={} eqgate_ha_dropped={} eqgate_ha_last_seq={} eqgate_root_drain_execute={} eqgate_guest_hcall_enqueue={} eqgate_direct_ept_iommu_update={} vfio_present={} vfio_dynamic_supported={} vfio_dynamic_enabled={} vfio_dma_blocked_stale_vma={} vfio_physical_reclaim_blocked={}",
+        "hyperalloc version={} flags={:#x} frames={} registered_frames={} unregistered_frames={} installed={} soft={} hard={} installing={} reclaiming={} logical_reclaims={} logical_returns={} logical_installs={} logical_reclaim_attempts={} logical_reclaim_failures={} logical_install_attempts={} logical_install_failures={} last_reclaim_us={} max_reclaim_us={} last_install_us={} max_install_us={} physical_releases={} physical_allocations={} physically_released_frames={} last_physical_release_hpa={} last_physical_allocation_hpa={} physical_release_allowed={} persistent_host_ram_consumers={} retain_hpa={} pcache_req={} pcache_done={} pcache_failed={} last_seq={} last_target_huge={} last_target_pages={} last_reclaimed_huge={} last_remaining_file_huge={} last_pcache_status={} last_pcache_errno={} vfio_dma_pending={} vfio_dma_done={} vfio_dma_failed={} vfio_dma_outstanding={} last_vfio_dma_seq={} last_vfio_dma_op={} last_vfio_dma_op_name={} last_vfio_dma_status={} last_vfio_dma_status_name={} last_vfio_dma_iova={} last_vfio_dma_hpa={} last_vfio_dma_size={} last_vfio_dma_errno={} reclaim_dma_rollback_attempts={} reclaim_dma_rollback_successes={} reclaim_dma_rollback_failures={} install_ept_rollback_attempts={} install_ept_rollback_successes={} install_ept_rollback_failures={} mmap_gen={} mmap_active={} mmap_current={} mmap_stale={} mmap_seq={} mmap_reason={} mmap_zap_pending={} mmap_zap_done={} mmap_zap_failed={} mmap_zap_outstanding={} last_mmap_zap_seq={} last_mmap_zap_status={} last_mmap_zap_status_name={} last_mmap_zap_gpa={} last_mmap_zap_len={} last_mmap_zap_zapped_vmas={} last_mmap_zap_zapped_bytes={} last_mmap_zap_errno={} vfio_block_reason={} vfio_block_state={} eqgate_ha_available={} eqgate_ha_pcpu_count={} eqgate_ha_capacity={} eqgate_ha_pending={} eqgate_ha_submitted={} eqgate_ha_drained={} eqgate_ha_dropped={} eqgate_ha_last_seq={} eqgate_root_drain_execute={} eqgate_guest_hcall_enqueue={} eqgate_direct_ept_iommu_update={} vfio_present={} vfio_dynamic_supported={} vfio_dynamic_enabled={} vfio_dma_blocked_stale_vma={} vfio_physical_reclaim_blocked={}",
         query.version,
         query.flags,
         query.frame_count,
@@ -3930,6 +3932,7 @@ fn format_hyperalloc_status(query: &eqvm_defs::EqHyperAllocQuery) -> String {
             query,
             eqvm_defs::EQ_HYPERALLOC_QUERY_FLAG_PERSISTENT_HOST_RAM_CONSUMERS
         ),
+        hyperalloc_query_flag(query, eqvm_defs::EQ_HYPERALLOC_QUERY_FLAG_RETAIN_HPA),
         query.pagecache_shrink_pending_requests,
         query.pagecache_shrink_completed_requests,
         query.pagecache_shrink_failed_requests,

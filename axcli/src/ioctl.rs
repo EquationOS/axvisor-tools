@@ -120,6 +120,7 @@ pub fn ioctl_create_microvm(
     max_vcpu_num: u8,
     init_mem_size_mib: usize,
     max_mem_size_mib: usize,
+    hyperalloc_retain_hpa: bool,
     passthrough_devices: &[PciBdf],
     vfio: Option<VfioResourceConfig>,
     block_device_count: usize,
@@ -136,6 +137,7 @@ pub fn ioctl_create_microvm(
         max_vcpu_num: max_vcpu_num as u64,
         init_mem_size_mib: init_mem_size_mib as u64,
         max_mem_size_mib: max_mem_size_mib as u64,
+        microvm_hyperalloc_flags: 0,
         passthrough_device_count: 0,
         passthrough_bdf: [0; 8],
         vfio_flags: 0,
@@ -153,6 +155,11 @@ pub fn ioctl_create_microvm(
         microvm_block_notify_ring_gpa: 0,
         microvm_block_capacity_sectors: 0,
     };
+
+    if hyperalloc_retain_hpa {
+        const MICROVM_HYPERALLOC_FLAG_RETAIN_HPA: u64 = 1 << 0;
+        arg.microvm_hyperalloc_flags |= MICROVM_HYPERALLOC_FLAG_RETAIN_HPA;
+    }
 
     if passthrough_devices.len() > arg.passthrough_bdf.len() {
         return Err(format!(
@@ -227,6 +234,7 @@ pub fn ioctl_create_libos() -> Result<usize, String> {
         max_vcpu_num: 0,         // Dummy value, not used for libOS
         init_mem_size_mib: 0,    // Dummy value, not used for libOS
         max_mem_size_mib: 0,     // Dummy value, not used for libOS
+        microvm_hyperalloc_flags: 0,
         passthrough_device_count: 0,
         passthrough_bdf: [0; 8],
         vfio_flags: 0,

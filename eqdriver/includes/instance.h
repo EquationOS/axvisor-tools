@@ -32,6 +32,8 @@ typedef struct eq_instance_metadata
     uint64_t init_memory_region_size_mib;
     /// Maximum size of the microVM's memory region (set by eqdriver).
     uint64_t max_memory_region_size_mib;
+    /// HyperAlloc instance policy flags (bit0: retain HPA).
+    uint64_t microvm_hyperalloc_flags;
     /// Base GPA of the microVM's memory region.
     uint64_t memory_region_base_gpa;
 

@@ -53,6 +53,8 @@ impl MachineConfig {
 pub struct GuestConfig {
     pub boot_source: BootSourceConfig,
     pub machine_config: Option<MachineConfig>,
+    /// Optional HyperAlloc policy for this instance.
+    pub hyperalloc: Option<HyperAllocConfig>,
     /// Optional virtio-blk drives. Field names intentionally match
     /// Firecracker's JSON shape to keep existing disk-image configs portable.
     pub drives: Option<Vec<BlockDeviceConfig>>,
@@ -63,6 +65,15 @@ pub struct GuestConfig {
     pub passthrough_devices: Option<Vec<String>>,
     /// Optional VFIO-related passthrough settings.
     pub vfio: Option<VfioConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct HyperAllocConfig {
+    /// Keep the original HPA bound after logical reclaim. This is required for
+    /// an EPT-only EqGate install; it does not enable direct IOMMU updates.
+    #[serde(default)]
+    pub retain_hpa: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

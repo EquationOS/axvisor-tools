@@ -64,6 +64,7 @@
 #define EQ_HYPERALLOC_QUERY_FLAG_EQGATE_ROOT_DRAIN_EXECUTE (1U << 11)
 #define EQ_HYPERALLOC_QUERY_FLAG_EQGATE_GUEST_HCALL_ENQUEUE (1U << 12)
 #define EQ_HYPERALLOC_QUERY_FLAG_EQGATE_DIRECT_EPT_IOMMU_UPDATE (1U << 13)
+#define EQ_HYPERALLOC_QUERY_FLAG_RETAIN_HPA (1U << 14)
 #define EQ_HYPERALLOC_PAGECACHE_SHRINK_STATUS_NONE (0U)
 #define EQ_HYPERALLOC_PAGECACHE_SHRINK_STATUS_PENDING (1U)
 #define EQ_HYPERALLOC_PAGECACHE_SHRINK_STATUS_SUCCESS (2U)
@@ -80,6 +81,7 @@ typedef struct eq_create_instance_arg
 	uint64_t max_vcpu_num; // Number of vCPUs for the instance
 	uint64_t init_mem_size_mib; // Memory size for the instance
 	uint64_t max_mem_size_mib; // Max memory size for the instance
+	uint64_t microvm_hyperalloc_flags; // bit0: retain HPA after logical reclaim
 	uint64_t passthrough_device_count; // Number of passthrough BDF entries used
 	uint64_t passthrough_bdf[EQ_MAX_PASSTHROUGH_DEVICES]; // Encoded as 0xddddbbddf
 	uint64_t vfio_flags; // bit0: enabled, bit1: iova-gpa-identity, bit2: physical-release

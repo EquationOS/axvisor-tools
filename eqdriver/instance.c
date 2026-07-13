@@ -2770,6 +2770,7 @@ int create_instance(eq_create_instance_arg_t *arg)
 		// Fill in the instance metadata based on the arguments provided.
 		instance_metadata->init_memory_region_size_mib = arg->init_mem_size_mib;
 		instance_metadata->max_memory_region_size_mib = arg->max_mem_size_mib;
+		instance_metadata->microvm_hyperalloc_flags = arg->microvm_hyperalloc_flags;
 		instance_metadata->init_vcpu_num = arg->init_vcpu_num;
 		instance_metadata->max_vcpu_num = arg->max_vcpu_num;
 		instance_metadata->passthrough_device_count = arg->passthrough_device_count;

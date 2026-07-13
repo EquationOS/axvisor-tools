@@ -408,6 +408,8 @@ impl VmResources {
             )
         })?;
 
+        let hyperalloc = guest_config.hyperalloc.unwrap_or_default();
+
         let machine_config = guest_config.machine_config.unwrap_or(MachineConfig {
             vcpu_count: 1,
             default_vcpu_num: None,
@@ -559,6 +561,7 @@ impl VmResources {
             machine_config.max_vcpu_count(),
             machine_config.init_mem_size_mib,
             machine_config.max_mem_size_mib(),
+            hyperalloc.retain_hpa,
             &passthrough_devices,
             vfio,
             block_devices.len(),
@@ -644,6 +647,11 @@ impl VmResources {
             block_devices,
             ..Default::default()
         };
+
+        info!(
+            "HyperAlloc instance policy retain_hpa={}",
+            hyperalloc.retain_hpa
+        );
 
         let mut boot_source_cfg = guest_config.boot_source;
         if has_root_block_device {
