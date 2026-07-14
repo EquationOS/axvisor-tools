@@ -1828,6 +1828,15 @@ fn resize_microvm_vcpu(server: &ControlServer, count: u8) -> Result<(), String> 
         server.instance_id as u64,
         count as u32,
     )?;
+    /*
+     * Shrink routes are moved synchronously by eqdriver before the guest is
+     * notified.  On grow, however, the new Gate owner/PID becomes eligible
+     * only after the AP resumes.  Ask the foreground VFIO control loop for a
+     * short active-route refresh burst so eqdriver can reprogram the IRTE as
+     * soon as that owner is ready.  This never forwards a data-plane IRQ via
+     * axcli; it only issues the existing host-kernel route-refresh ioctl.
+     */
+    crate::microvm::vfio_runtime::request_resize_irq_route_refresh();
     server.desired_vcpus.store(count, Ordering::Release);
     info!(
         "microVM control resize-vcpu instance={} desired={} max={}",

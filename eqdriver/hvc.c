@@ -54,10 +54,11 @@ int hvc_query_microvm_irq_route(__u64 route_query_ptr)
 	return hvc_call(HMicroVMQueryIrqRoute, route_query_ptr, 0, 0, 0, 0, 0);
 }
 
-int hvc_set_microvm_vcpu_count(__u64 instance_id, __u64 vcpu_count)
+int hvc_set_microvm_vcpu_count(
+	__u64 instance_id, __u64 vcpu_count, __u64 flags)
 {
 	return hvc_call(
-		HMicroVMSetVcpuCount, instance_id, vcpu_count, 0, 0, 0, 0);
+		HMicroVMSetVcpuCount, instance_id, vcpu_count, flags, 0, 0, 0);
 }
 
 int hvc_hyperalloc_vfio_dma_poll(__u64 dma_op_ptr)

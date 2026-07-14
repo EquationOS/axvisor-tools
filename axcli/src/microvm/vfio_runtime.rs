@@ -173,8 +173,11 @@ static VFIO_MSIX_EVENTFD_EVENT_TOTAL: AtomicUsize = AtomicUsize::new(0);
 static VFIO_MSIX_EVENTFD_INJECT_TOTAL: AtomicUsize = AtomicUsize::new(0);
 static VFIO_MSIX_EVENTFD_INJECT_FAILURES: AtomicUsize = AtomicUsize::new(0);
 static VFIO_MSIX_EVENTFD_PROGRESS_LAST_MS: AtomicUsize = AtomicUsize::new(0);
+static VFIO_RESIZE_ROUTE_REFRESH_REMAINING: AtomicUsize = AtomicUsize::new(0);
 const VFIO_ACTIVE_ROUTE_FALLBACK_TRACE_LIMIT: usize = 64;
 const VFIO_MSIX_EVENTFD_PROGRESS_INTERVAL_MS: usize = 1_000;
+const VFIO_RESIZE_ROUTE_REFRESH_ATTEMPTS: usize = 16;
+const VFIO_RESIZE_ROUTE_REFRESH_INTERVAL: Duration = Duration::from_millis(2);
 
 fn lock_mlx5_bar0_last() -> Option<MutexGuard<'static, Option<(u32, u32, u32)>>> {
     VFIO_MLX5_BAR0_LAST
@@ -1034,6 +1037,35 @@ fn refresh_posted_irq_routes(state: &VfioRuntimeState, include_active: bool) {
     }
 }
 
+fn refresh_active_posted_irq_routes(state: &VfioRuntimeState) {
+    if state.msix_event_count == 0 {
+        return;
+    }
+    let Some(mut active) = write_posted_route_active() else {
+        return;
+    };
+    for msix_index in 0..state.msix_event_count {
+        if active[msix_index] {
+            refresh_posted_irq_route_locked(state, msix_index, &mut active);
+        }
+    }
+}
+
+pub(super) fn request_resize_irq_route_refresh() {
+    if VFIO_RUNTIME_STATE.get().is_none() {
+        return;
+    }
+    VFIO_RESIZE_ROUTE_REFRESH_REMAINING.store(
+        VFIO_RESIZE_ROUTE_REFRESH_ATTEMPTS,
+        Ordering::Release,
+    );
+    info!(
+        "VFIO resize route-refresh burst requested attempts={} interval_us={}",
+        VFIO_RESIZE_ROUTE_REFRESH_ATTEMPTS,
+        VFIO_RESIZE_ROUTE_REFRESH_INTERVAL.as_micros()
+    );
+}
+
 fn complete_hyperalloc_vfio_dma(state: &VfioRuntimeState, op: &mut EqHyperAllocVfioDmaOp) {
     if let Err(e) = ioctl::ioctl_hyperalloc_vfio_dma_complete(state.instance_fd, op) {
         warn!(
@@ -1774,7 +1806,11 @@ pub fn run_foreground_daemon_loop() -> ! {
                 }
                 last_bar0_trace = Instant::now();
             }
-            let route_refresh_interval = if let Some(interval) = forced_route_refresh_interval {
+            let resize_refresh_remaining =
+                VFIO_RESIZE_ROUTE_REFRESH_REMAINING.load(Ordering::Acquire);
+            let route_refresh_interval = if resize_refresh_remaining != 0 {
+                VFIO_RESIZE_ROUTE_REFRESH_INTERVAL
+            } else if let Some(interval) = forced_route_refresh_interval {
                 interval
             } else if route_refresh_start.elapsed() < Duration::from_secs(30) {
                 Duration::from_millis(20)
@@ -1782,10 +1818,20 @@ pub fn run_foreground_daemon_loop() -> ! {
                 Duration::from_millis(100)
             };
             if last_route_refresh.elapsed() >= route_refresh_interval {
-                let include_active = last_full_route_refresh.elapsed() >= full_route_refresh_interval;
-                refresh_posted_irq_routes(state, include_active);
-                if include_active {
-                    last_full_route_refresh = Instant::now();
+                if resize_refresh_remaining != 0 {
+                    refresh_active_posted_irq_routes(state);
+                    let previous = VFIO_RESIZE_ROUTE_REFRESH_REMAINING
+                        .fetch_sub(1, Ordering::AcqRel);
+                    if previous == 1 {
+                        info!("VFIO resize route-refresh burst completed");
+                    }
+                } else {
+                    let include_active =
+                        last_full_route_refresh.elapsed() >= full_route_refresh_interval;
+                    refresh_posted_irq_routes(state, include_active);
+                    if include_active {
+                        last_full_route_refresh = Instant::now();
+                    }
                 }
                 last_route_refresh = Instant::now();
             }

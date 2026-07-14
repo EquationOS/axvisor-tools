@@ -35,7 +35,10 @@ int hvc_microvm_boot(
 	__u64 instance_id, __u64 entry_point, __u64 boot_protocol);
 int hvc_inject_microvm_irq(__u64 instance_id, __u64 msix_index);
 int hvc_query_microvm_irq_route(__u64 route_query_ptr);
-int hvc_set_microvm_vcpu_count(__u64 instance_id, __u64 vcpu_count);
+#define EQ_MICROVM_VCPU_RESIZE_PREPARE_ONLY (1ULL << 0)
+#define EQ_MICROVM_VCPU_RESIZE_NOTIFY_ONLY (1ULL << 1)
+int hvc_set_microvm_vcpu_count(
+	__u64 instance_id, __u64 vcpu_count, __u64 flags);
 int hvc_hyperalloc_vfio_dma_poll(__u64 dma_op_ptr);
 int hvc_hyperalloc_vfio_dma_complete(__u64 dma_op_ptr);
 int hvc_microvm_guest_mem_copy(__u64 copy_arg_ptr);

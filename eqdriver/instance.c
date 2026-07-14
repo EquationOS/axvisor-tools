@@ -1147,7 +1147,6 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 		kfree(query);
 		return 0;
 	}
-
 	route->target_vcpu = query->target_vcpu;
 	route->guest_vector = query->guest_vector;
 	route->posted_vector = query_posted_vector;
@@ -1325,6 +1324,30 @@ static int eq_refresh_irq_route(
 			ret = eq_irq_route_try_activate(route, route->host_irq);
 		arg->flags = route->posted_active ? 0x1 : 0x0;
 		break;
+	}
+	mutex_unlock(&instance_vdev->irq_routes_lock);
+
+	return ret;
+}
+
+static int eq_refresh_irq_routes_for_resize(eq_instance_vdev_t *instance_vdev)
+{
+	eq_irq_route_t *route;
+	int ret = 0;
+
+	mutex_lock(&instance_vdev->irq_routes_lock);
+	list_for_each_entry(route, &instance_vdev->irq_routes, list)
+	{
+		bool was_posted_active = route->posted_active;
+		int route_ret;
+
+		if (route->host_irq < 0)
+			continue;
+		route_ret = eq_irq_route_try_activate(route, route->host_irq);
+		if (route_ret < 0 && ret == 0)
+			ret = route_ret;
+		else if (was_posted_active && !route->posted_active && ret == 0)
+			ret = -EIO;
 	}
 	mutex_unlock(&instance_vdev->irq_routes_lock);
 
@@ -2172,6 +2195,7 @@ static long instance_dev_ioctl(
 	case EQ_INSTANCE_SET_VCPU_COUNT:
 	{
 		eq_instance_vcpu_resize_arg_t resize_arg;
+		int old_vcpu_count;
 		int ret;
 		if (copy_from_user(
 				&resize_arg, (void __user *)arg,
@@ -2190,18 +2214,61 @@ static long instance_dev_ioctl(
 			return -EINVAL;
 		}
 
-		ret = hvc_set_microvm_vcpu_count(
-			instance_vdev->id, resize_arg.vcpu_count);
-		if (ret < 0)
+		old_vcpu_count = hvc_set_microvm_vcpu_count(
+			instance_vdev->id, resize_arg.vcpu_count,
+			EQ_MICROVM_VCPU_RESIZE_PREPARE_ONLY);
+		if (old_vcpu_count < 0)
 		{
 			ERROR(
-				"HMicroVMSetVcpuCount failed for instance %d vcpu_count=%u ret=%d\n",
-				instance_vdev->id, resize_arg.vcpu_count, ret);
+				"HMicroVMSetVcpuCount prepare failed for instance %d vcpu_count=%u ret=%d\n",
+				instance_vdev->id, resize_arg.vcpu_count,
+				old_vcpu_count);
+			return old_vcpu_count;
+		}
+
+		/*
+		 * Reprogram every live irq-bypass consumer after the desired owner
+		 * mask changes and before Linux is told to park a vCPU. The steady
+		 * interrupt path remains device -> IRTE/PID -> EqGate IDT; this is a
+		 * resize control-plane transaction only.
+		 */
+		ret = eq_refresh_irq_routes_for_resize(instance_vdev);
+		if (ret < 0)
+		{
+			int rollback_ret = hvc_set_microvm_vcpu_count(
+				instance_vdev->id, old_vcpu_count,
+				EQ_MICROVM_VCPU_RESIZE_PREPARE_ONLY);
+
+			if (rollback_ret >= 0)
+				eq_refresh_irq_routes_for_resize(instance_vdev);
+			ERROR(
+				"MicroVM instance %d IRQ route refresh failed before vCPU resize %u ret=%d rollback_ret=%d\n",
+				instance_vdev->id, resize_arg.vcpu_count, ret,
+				rollback_ret);
+			return ret;
+		}
+
+		ret = hvc_set_microvm_vcpu_count(
+			instance_vdev->id, resize_arg.vcpu_count,
+			EQ_MICROVM_VCPU_RESIZE_NOTIFY_ONLY);
+		if (ret < 0)
+		{
+			int rollback_ret = hvc_set_microvm_vcpu_count(
+				instance_vdev->id, old_vcpu_count,
+				EQ_MICROVM_VCPU_RESIZE_PREPARE_ONLY);
+
+			if (rollback_ret >= 0)
+				eq_refresh_irq_routes_for_resize(instance_vdev);
+			ERROR(
+				"HMicroVMSetVcpuCount notify failed for instance %d vcpu_count=%u ret=%d rollback_ret=%d\n",
+				instance_vdev->id, resize_arg.vcpu_count, ret,
+				rollback_ret);
 			return ret;
 		}
 		INFO(
-			"MicroVM instance %d desired vCPU count set to %u\n",
-			instance_vdev->id, resize_arg.vcpu_count);
+			"MicroVM instance %d desired vCPU count set to %u after IRQ route refresh (old=%d)\n",
+			instance_vdev->id, resize_arg.vcpu_count,
+			old_vcpu_count);
 		return 0;
 	}
 	case EQ_INSTANCE_MICROVM_STOP:
