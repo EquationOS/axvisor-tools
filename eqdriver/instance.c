@@ -44,6 +44,7 @@ typedef struct eq_irq_route
 	bool posted_active;
 	bool posted_shared_pid;
 	bool posted_vector_hardware;
+	bool posted_bootstrap;
 	bool logged_not_ready;
 	struct list_head posted_owner_list;
 	bool posted_owner_linked;
@@ -62,6 +63,7 @@ typedef struct eq_vfio_posted_owner
 #define EQ_IRQ_ROUTE_FLAG_SHARED_VMCS_PID (1U << 1)
 #define EQ_IRQ_ROUTE_FLAG_HAS_POSTED_VECTOR (1U << 2)
 #define EQ_IRQ_ROUTE_FLAG_REQUIRES_POSTED_VECTOR (1U << 3)
+#define EQ_IRQ_ROUTE_FLAG_BOOTSTRAP (1U << 4)
 #define EQ_MICROVM_BLOCK_FLAG_ENABLED (1ULL << 0)
 #define MICROVM_BLOCK_NOTIFY_VERSION (1U)
 #define EQ_HYPERALLOC_VFIO_DMA_STATUS_NONE (0U)
@@ -859,6 +861,7 @@ static void eq_irq_route_deactivate_locked(eq_irq_route_t *route, int producer_i
 	route->posted_active = false;
 	route->posted_shared_pid = false;
 	route->posted_vector_hardware = false;
+	route->posted_bootstrap = false;
 	route->target_vcpu = 0;
 	route->guest_vector = 0;
 	route->posted_vector = 0;
@@ -959,8 +962,10 @@ static bool eq_vfio_posted_owner_is_route_locked(eq_irq_route_t *route, uint32_t
 static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 {
 	eq_microvm_irq_route_query_t *query;
+	eq_microvm_irq_route_query_t active_query;
 	phys_addr_t query_hpa;
 	int ret;
+	int commit_ret;
 	bool owner_lock_held = false;
 	uint32_t old_target_vcpu = 0;
 	uint32_t old_guest_vector = 0;
@@ -972,6 +977,7 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 	bool old_posted_vector_hardware = false;
 	bool query_shared_pid = false;
 	bool query_requires_posted_vector = false;
+	bool query_bootstrap = false;
 	uint32_t query_posted_vector = 0;
 	bool query_use_posted_vector = false;
 	uint32_t pir_vector = 0;
@@ -1041,6 +1047,7 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 	query_shared_pid = (query->flags & EQ_IRQ_ROUTE_FLAG_SHARED_VMCS_PID) != 0;
 	query_requires_posted_vector =
 		(query->flags & EQ_IRQ_ROUTE_FLAG_REQUIRES_POSTED_VECTOR) != 0;
+	query_bootstrap = (query->flags & EQ_IRQ_ROUTE_FLAG_BOOTSTRAP) != 0;
 	query_posted_vector =
 		(query->flags & EQ_IRQ_ROUTE_FLAG_HAS_POSTED_VECTOR) ?
 			(uint32_t)(query->reserved[0] & 0xff) :
@@ -1062,7 +1069,8 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 		route->posted_vector == query_posted_vector &&
 		route->posted_vector_hardware == query_use_posted_vector &&
 		route->pi_desc_hpa == query->pi_desc_hpa &&
-		route->posted_shared_pid == query_shared_pid)
+		route->posted_shared_pid == query_shared_pid &&
+		route->posted_bootstrap == query_bootstrap)
 	{
 		if (!query_shared_pid ||
 			query_use_posted_vector ||
@@ -1105,6 +1113,7 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 			0;
 	query_requires_posted_vector =
 		(query->flags & EQ_IRQ_ROUTE_FLAG_REQUIRES_POSTED_VECTOR) != 0;
+	query_bootstrap = (query->flags & EQ_IRQ_ROUTE_FLAG_BOOTSTRAP) != 0;
 	query_use_posted_vector = query_posted_vector != 0;
 	if (query_requires_posted_vector && !query_use_posted_vector)
 	{
@@ -1147,6 +1156,45 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 		kfree(query);
 		return 0;
 	}
+	if (query_shared_pid && query_use_posted_vector)
+	{
+		/* The probe query keeps the old Gate route/PID alive while the
+		 * physical IRTE still targets it.  Now that irq_set_vcpu_affinity()
+		 * has switched the producer to the new Gate PID, commit the
+		 * replacement so EqVisor can drain the stable old PIR through its
+		 * old owner-coded route before releasing that route.  Keep the
+		 * successfully installed hardware route even if this best-effort
+		 * bookkeeping HVC fails; falling back here would reintroduce an
+		 * eventfd/ioctl path after the IRTE has already moved. */
+		active_query = *query;
+		query->flags |= EQ_IRQ_ROUTE_FLAG_COMMIT_OWNER;
+		commit_ret = hvc_query_microvm_irq_route(query_hpa);
+		if (commit_ret < 0)
+		{
+			INFO(
+				"Eq IRQ bypass route idx=%u producer_irq=%d owner route commit failed ret=%d after hardware switch; keep posted route\n",
+				route->msix_index, producer_irq, commit_ret);
+		}
+		else if (query->pi_desc_hpa != active_query.pi_desc_hpa ||
+			 query->target_vcpu != active_query.target_vcpu ||
+			 query->guest_vector != active_query.guest_vector ||
+			 !(query->flags & EQ_IRQ_ROUTE_FLAG_HAS_POSTED_VECTOR) ||
+			 (uint32_t)(query->reserved[0] & 0xff) != query_posted_vector)
+		{
+			INFO(
+				"Eq IRQ bypass route idx=%u producer_irq=%d owner route commit returned changed route after hardware switch; keep probed posted route\n",
+				route->msix_index, producer_irq);
+		}
+		else
+		{
+			INFO(
+				"Eq IRQ bypass route idx=%u producer_irq=%d owner route committed target_vcpu=%u posted_vector=%u pi_desc=%#llx\n",
+				route->msix_index, producer_irq,
+				active_query.target_vcpu, query_posted_vector,
+				(unsigned long long)active_query.pi_desc_hpa);
+		}
+		*query = active_query;
+	}
 	route->target_vcpu = query->target_vcpu;
 	route->guest_vector = query->guest_vector;
 	route->posted_vector = query_posted_vector;
@@ -1155,6 +1203,7 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 	route->posted_active = true;
 	route->posted_shared_pid = query_shared_pid;
 	route->posted_vector_hardware = query_use_posted_vector;
+	route->posted_bootstrap = query_bootstrap;
 	route->logged_not_ready = false;
 	if (query_shared_pid && !query_use_posted_vector)
 		eq_vfio_posted_owner_add_route_locked(route, route->target_vcpu);
@@ -1168,10 +1217,11 @@ static int eq_irq_route_try_activate(eq_irq_route_t *route, int producer_irq)
 	if (owner_lock_held)
 		mutex_unlock(&eq_vfio_posted_owners_lock);
 	INFO(
-		"Eq IRQ bypass route active idx=%u host_irq=%d target_vcpu=%u pir_vector=%u posted_vector=%u guest_vector=%u use_posted_vector=%d shared_pid=%d pi_desc=%#llx old_active=%d old_target_vcpu=%u old_posted_vector=%u old_guest_vector=%u old_use_posted_vector=%d old_shared_pid=%d old_pi_desc=%#llx\n",
+		"Eq IRQ bypass route active idx=%u host_irq=%d target_vcpu=%u pir_vector=%u posted_vector=%u guest_vector=%u use_posted_vector=%d shared_pid=%d bootstrap=%d pi_desc=%#llx old_active=%d old_target_vcpu=%u old_posted_vector=%u old_guest_vector=%u old_use_posted_vector=%d old_shared_pid=%d old_pi_desc=%#llx\n",
 		route->msix_index, route->host_irq, route->target_vcpu,
 		pir_vector, route->posted_vector, route->guest_vector,
 		route->posted_vector_hardware, route->posted_shared_pid,
+		route->posted_bootstrap,
 		(unsigned long long)route->pi_desc_hpa, old_posted_active,
 		old_target_vcpu, old_posted_vector, old_guest_vector,
 		old_posted_vector_hardware, old_posted_shared_pid,
