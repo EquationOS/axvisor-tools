@@ -151,6 +151,9 @@ typedef struct eq_instance_vdev
 	atomic_t microvm_guest_ram_current_mmap_count;
 	atomic_t microvm_guest_ram_stale_mmap_count;
 	atomic64_t microvm_guest_ram_mmap_update_seq;
+	atomic64_t microvm_guest_ram_huge_pte_batches;
+	atomic64_t microvm_guest_ram_single_pte_faults;
+	atomic64_t microvm_guest_ram_populate_batches;
 
 	eq_instance_metadata_t metadata;
 } eq_instance_vdev_t;
@@ -775,6 +778,14 @@ static vm_fault_t microvm_guest_ram_vma_fault(struct vm_fault *vmf)
 	uint64_t current_generation;
 	uint64_t fault_offset;
 	uint64_t fault_gpa;
+	uint64_t huge_gpa;
+	uint64_t huge_hpa;
+	uint64_t huge_offset;
+	unsigned long huge_vaddr;
+	unsigned long batch_addr;
+	unsigned long batch_pfn;
+	uint64_t fault_count;
+	vm_fault_t fault_result;
 	unsigned long pfn;
 	int ret;
 
@@ -821,7 +832,68 @@ static vm_fault_t microvm_guest_ram_vma_fault(struct vm_fault *vmf)
 		return VM_FAULT_SIGBUS;
 	}
 
+	/*
+	 * Guest RAM is backed by 2 MiB EPT leaves.  VFIO pins the lazy PFNMAP
+	 * VMA after every HyperAlloc replacement install; inserting only the
+	 * faulting 4 KiB page would repeat this trusted translation 512 times for
+	 * one huge frame.  Preserve the 4 KiB fallback, but use the page-size
+	 * capability returned by EqVisor to populate all 512 ordinary PTEs from one
+	 * trusted translation.  VFIO Type1 rejects a PFNMAP huge PMD on this host,
+	 * so the userspace representation deliberately remains 4 KiB PTEs.
+	 */
+	huge_gpa = fault_gpa & ~((uint64_t)PMD_SIZE - 1);
+	huge_offset = fault_gpa - huge_gpa;
+	if (translate->page_size >= PMD_SIZE &&
+	    translate->hpa >= huge_offset &&
+	    huge_gpa >= ctx->gpa_start &&
+	    huge_gpa + PMD_SIZE >= huge_gpa &&
+	    huge_gpa + PMD_SIZE <= ctx->gpa_start + ctx->size)
+	{
+		huge_hpa = translate->hpa - huge_offset;
+		huge_vaddr =
+			ctx->vm_start + (unsigned long)(huge_gpa - ctx->gpa_start);
+		if (!(huge_hpa & (PMD_SIZE - 1)) &&
+		    huge_vaddr >= vma->vm_start &&
+		    huge_vaddr + PMD_SIZE >= huge_vaddr &&
+		    huge_vaddr + PMD_SIZE <= vma->vm_end)
+		{
+			batch_addr = huge_vaddr;
+			batch_pfn = (unsigned long)(huge_hpa >> PAGE_SHIFT);
+			kfree(translate);
+			while (batch_addr < huge_vaddr + PMD_SIZE)
+			{
+				fault_result = vmf_insert_pfn(
+					vma, batch_addr, batch_pfn);
+				if (fault_result & VM_FAULT_ERROR)
+					return fault_result;
+				batch_addr += PAGE_SIZE;
+				batch_pfn++;
+			}
+			fault_count = atomic64_inc_return(&ctx->instance_vdev
+							  ->microvm_guest_ram_huge_pte_batches);
+			if (fault_count <= 4 || !(fault_count & 1023))
+				INFO(
+					"MicroVM instance %d guest RAM huge-PTE fault batch progress count=%llu gpa=%#llx hpa=%#llx va=%#lx ptes=%lu\n",
+					ctx->instance_vdev->id,
+					(unsigned long long)fault_count,
+					(unsigned long long)huge_gpa,
+					(unsigned long long)huge_hpa,
+					huge_vaddr, PMD_SIZE / PAGE_SIZE);
+			return VM_FAULT_NOPAGE;
+		}
+	}
+
 	pfn = (unsigned long)(translate->hpa >> PAGE_SHIFT);
+	fault_count = atomic64_inc_return(
+		&ctx->instance_vdev->microvm_guest_ram_single_pte_faults);
+	if (fault_count <= 4 || !(fault_count & 1023))
+		INFO(
+			"MicroVM instance %d guest RAM PTE fault fallback progress count=%llu gpa=%#llx page_size=%#llx addr=%#lx\n",
+			ctx->instance_vdev->id,
+			(unsigned long long)fault_count,
+			(unsigned long long)(fault_gpa & PAGE_MASK),
+			(unsigned long long)translate->page_size,
+			vmf->address);
 	kfree(translate);
 	return vmf_insert_pfn(vma, vmf->address & PAGE_MASK, pfn);
 }
@@ -1930,6 +2002,159 @@ static void microvm_guest_ram_put_zap_targets(
 	kfree(targets);
 }
 
+/*
+ * Populate the exact current-generation VMA range that axcli will pass to
+ * VFIO_IOMMU_MAP_DMA. Unlike the fault handler, this ioctl runs under the mm
+ * write lock, so remap_pfn_range can establish all 512 ordinary 4 KiB PTEs
+ * for one authoritative 2 MiB EPT leaf in one page-table walk.
+ *
+ * No HPA is accepted from userspace. EqVisor translates GPA -> HPA while the
+ * install transaction is in Installing with its EPT leaf already present;
+ * axcli also compares the returned HPA with the pending DMA transaction.
+ */
+static int eq_microvm_guest_ram_mmap_populate_ioctl(
+	eq_instance_vdev_t *instance_vdev, void __user *user_arg)
+{
+	eq_microvm_guest_ram_mmap_populate_t populate;
+	eq_microvm_guest_ram_translate_t *translate = NULL;
+	microvm_guest_ram_vma_context_t *ctx;
+	struct mm_struct *mm = current->mm;
+	struct vm_area_struct *vma;
+	uint64_t current_generation;
+	uint64_t gpa_end;
+	uint64_t ctx_end;
+	uint64_t gpa_offset;
+	uint64_t user_end;
+	unsigned long va_start;
+	unsigned long va_end;
+	unsigned long expected_vaddr;
+	uint64_t batch_count;
+	int ret = 0;
+
+	if (copy_from_user(&populate, user_arg, sizeof(populate)))
+	{
+		ERROR("Failed to copy MicroVM guest RAM mmap populate arg from user\n");
+		return -EFAULT;
+	}
+	populate.translated_hpa = 0;
+	populate.populated_bytes = 0;
+	populate.result_errno = 0;
+
+	if (populate.version != EQ_MICROVM_GUEST_RAM_MMAP_POPULATE_VERSION ||
+		populate.flags != 0 || populate.len != PMD_SIZE ||
+		(populate.gpa & (PMD_SIZE - 1)) ||
+		(populate.user_vaddr & ~PAGE_MASK) ||
+		!microvm_guest_ram_gpa_range_valid(
+			instance_vdev, populate.gpa, populate.len) ||
+		__builtin_add_overflow(populate.gpa, populate.len, &gpa_end) ||
+		__builtin_add_overflow(
+			populate.user_vaddr, populate.len, &user_end) ||
+		populate.user_vaddr > ULONG_MAX || user_end > ULONG_MAX)
+	{
+		ret = -EINVAL;
+		goto out_copy;
+	}
+	if (populate.instance_id != 0 &&
+		populate.instance_id != (uint64_t)instance_vdev->id)
+	{
+		ret = -EINVAL;
+		goto out_copy;
+	}
+	if (!mm)
+	{
+		ret = -EINVAL;
+		goto out_copy;
+	}
+
+	translate = kzalloc(sizeof(*translate), GFP_KERNEL);
+	if (!translate)
+	{
+		ret = -ENOMEM;
+		goto out_copy;
+	}
+	translate->version = EQ_MICROVM_GUEST_RAM_TRANSLATE_VERSION;
+	translate->instance_id = (uint64_t)instance_vdev->id;
+	translate->gpa = populate.gpa;
+	translate->len = populate.len;
+	ret = hvc_microvm_guest_ram_translate(virt_to_phys(translate));
+	if (ret < 0 || translate->result_errno != 0 || translate->hpa == 0 ||
+		translate->page_size < populate.len ||
+		(translate->hpa & (PMD_SIZE - 1)))
+	{
+		if (ret >= 0)
+			ret = translate->result_errno != 0 ?
+				translate->result_errno : -EINVAL;
+		goto out_copy;
+	}
+
+	va_start = (unsigned long)populate.user_vaddr;
+	va_end = (unsigned long)user_end;
+	mmap_write_lock(mm);
+	vma = find_vma(mm, va_start);
+	if (!vma || vma->vm_start > va_start || vma->vm_end < va_end ||
+		vma->vm_ops != &microvm_guest_ram_vm_ops)
+	{
+		ret = -ENOENT;
+		goto out_unlock;
+	}
+	ctx = vma->vm_private_data;
+	if (!ctx || ctx->instance_vdev != instance_vdev || ctx->mm != mm)
+	{
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+	mutex_lock(&instance_vdev->microvm_guest_ram_mmap_lock);
+	current_generation = instance_vdev->microvm_guest_ram_mmap_generation;
+	mutex_unlock(&instance_vdev->microvm_guest_ram_mmap_lock);
+	if (ctx->generation != current_generation ||
+		__builtin_add_overflow(ctx->gpa_start, ctx->size, &ctx_end) ||
+		populate.gpa < ctx->gpa_start || gpa_end > ctx_end)
+	{
+		ret = -ESTALE;
+		goto out_unlock;
+	}
+	gpa_offset = populate.gpa - ctx->gpa_start;
+	if (__builtin_add_overflow(ctx->vm_start, (unsigned long)gpa_offset,
+				   &expected_vaddr) ||
+		expected_vaddr != va_start)
+	{
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+
+	ret = remap_pfn_range(
+		vma, va_start, (unsigned long)(translate->hpa >> PAGE_SHIFT),
+		(unsigned long)populate.len, vma->vm_page_prot);
+	if (ret)
+	{
+		/* remap_pfn_range may have populated a prefix before failing. */
+		zap_vma_ptes(vma, va_start, (unsigned long)populate.len);
+		goto out_unlock;
+	}
+	populate.translated_hpa = translate->hpa;
+	populate.populated_bytes = populate.len;
+	batch_count = atomic64_inc_return(
+		&instance_vdev->microvm_guest_ram_populate_batches);
+	if (batch_count <= 4 || !(batch_count & 1023))
+		INFO(
+			"MicroVM instance %d guest RAM controlled populate progress count=%llu gpa=%#llx hpa=%#llx va=%#lx bytes=%#llx\n",
+			instance_vdev->id, (unsigned long long)batch_count,
+			(unsigned long long)populate.gpa,
+			(unsigned long long)populate.translated_hpa, va_start,
+			(unsigned long long)populate.populated_bytes);
+
+out_unlock:
+	mmap_write_unlock(mm);
+out_copy:
+	if (ret < 0)
+		populate.result_errno = ret;
+	populate.instance_id = (uint64_t)instance_vdev->id;
+	kfree(translate);
+	if (copy_to_user(user_arg, &populate, sizeof(populate)))
+		return -EFAULT;
+	return ret < 0 ? ret : 0;
+}
+
 static int eq_microvm_guest_ram_mmap_zap_ioctl(
 	eq_instance_vdev_t *instance_vdev, void __user *user_arg)
 {
@@ -2440,6 +2665,9 @@ static long instance_dev_ioctl(
 	case EQ_INSTANCE_MICROVM_GUEST_RAM_MMAP_ZAP_COMPLETE:
 		return eq_microvm_guest_ram_mmap_zap_op_ioctl(
 			instance_vdev, cmd, (void __user *)arg);
+	case EQ_INSTANCE_MICROVM_GUEST_RAM_MMAP_POPULATE:
+		return eq_microvm_guest_ram_mmap_populate_ioctl(
+			instance_vdev, (void __user *)arg);
 	case EQ_INSTANCE_MICROVM_GUEST_RAM_MMAP_QUERY_V1:
 	{
 		eq_microvm_guest_ram_mmap_query_v1_t query;
@@ -2531,6 +2759,12 @@ static long instance_dev_ioctl(
 		query.active_mmaps = (uint64_t)active_mmaps;
 		query.current_mmaps = (uint64_t)current_mmaps;
 		query.stale_mmaps = (uint64_t)stale_mmaps;
+		query.reserved[0] = (uint64_t)atomic64_read(
+			&instance_vdev->microvm_guest_ram_huge_pte_batches);
+		query.reserved[1] = (uint64_t)atomic64_read(
+			&instance_vdev->microvm_guest_ram_single_pte_faults);
+		query.reserved[2] = (uint64_t)atomic64_read(
+			&instance_vdev->microvm_guest_ram_populate_batches);
 		if (copy_to_user((void __user *)arg, &query, sizeof(query)))
 		{
 			ERROR(

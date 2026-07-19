@@ -34,6 +34,7 @@
 #define EQ_MICROVM_GUEST_RAM_TRANSLATE_VERSION (1U)
 #define EQ_MICROVM_GUEST_RAM_MMAP_ZAP_VERSION (1U)
 #define EQ_MICROVM_GUEST_RAM_MMAP_ZAP_OP_VERSION (1U)
+#define EQ_MICROVM_GUEST_RAM_MMAP_POPULATE_VERSION (1U)
 #define EQ_MICROVM_GUEST_RAM_MMAP_ZAP_STATUS_NONE \
 	EQ_HYPERALLOC_VFIO_DMA_STATUS_NONE
 #define EQ_MICROVM_GUEST_RAM_MMAP_ZAP_STATUS_PENDING \
@@ -45,6 +46,7 @@
 #define EQ_MICROVM_GUEST_RAM_MMAP_ZAP_STATUS_UNSUPPORTED \
 	EQ_HYPERALLOC_VFIO_DMA_STATUS_UNSUPPORTED
 #define EQ_HYPERALLOC_VERSION (1U)
+#define EQ_HYPERALLOC_VFIO_DMA_FLAG_MAP_POPULATE_VMA (1U << 1)
 #define EQ_HYPERALLOC_DEBUG_RECLAIM_VERSION (1U)
 #define EQ_HYPERALLOC_DEBUG_RECLAIM_FLAG_GUEST_RAM_PREZAPPED (1U << 0)
 #define EQ_HYPERALLOC_EQGATE_DRAIN_VERSION (1U)
@@ -187,7 +189,7 @@ typedef struct eq_hyperalloc_query
 	uint32_t page_shift;
 	uint32_t huge_order;
 	uint32_t zone_count;
-	uint32_t reserved0;
+	uint32_t last_reclaim_backed_frames;
 	uint64_t frame_count;
 	uint64_t installed_frames;
 	uint64_t soft_reclaimed_frames;
@@ -201,7 +203,7 @@ typedef struct eq_hyperalloc_query
 	uint64_t first_tracked_frame_gpa;
 	uint64_t first_tracked_frame_hpa;
 	uint32_t first_tracked_frame_state;
-	uint32_t reserved1;
+	uint32_t last_reclaim_unbacked_frames;
 	uint64_t last_reclaimed_frame_gpa;
 	uint64_t last_reclaimed_frame_hpa;
 	uint32_t last_reclaimed_zone_id;
@@ -255,7 +257,7 @@ typedef struct eq_hyperalloc_query
 	uint64_t vfio_guest_ram_mmap_stale;
 	uint64_t vfio_guest_ram_mmap_update_seq;
 	uint32_t vfio_guest_ram_mmap_last_reason;
-	uint32_t reserved3;
+	uint32_t last_reclaim_ept_present_frames;
 	uint64_t guest_ram_mmap_zap_pending_requests;
 	uint64_t guest_ram_mmap_zap_completed_requests;
 	uint64_t guest_ram_mmap_zap_failed_requests;
@@ -267,9 +269,9 @@ typedef struct eq_hyperalloc_query
 	uint32_t last_guest_ram_mmap_zap_status;
 	int32_t last_guest_ram_mmap_zap_errno;
 	uint32_t guest_ram_mmap_zap_outstanding;
-	uint32_t reserved4;
+	uint32_t last_reclaim_no_backing_discards;
 	uint32_t vfio_physical_reclaim_block_reason;
-	uint32_t reserved5;
+	uint32_t last_reclaim_retained_frames;
 	uint64_t eqgate_hyperalloc_pcpu_count;
 	uint64_t eqgate_hyperalloc_queue_capacity;
 	uint64_t eqgate_hyperalloc_pending;
@@ -386,6 +388,7 @@ typedef struct eq_microvm_guest_ram_mmap_query
 	uint64_t active_mmaps;
 	uint64_t current_mmaps;
 	uint64_t stale_mmaps;
+	/* v2 reserved fields, now defined as monotonic evidence counters. */
 	uint64_t reserved[3];
 } eq_microvm_guest_ram_mmap_query_t;
 
@@ -453,6 +456,24 @@ typedef struct eq_microvm_guest_ram_mmap_zap_op
 
 _Static_assert(sizeof(eq_microvm_guest_ram_mmap_zap_op_t) == 80,
 	       "eq_microvm_guest_ram_mmap_zap_op_t must match EqMicroVmGuestRamMmapZapOp");
+
+typedef struct eq_microvm_guest_ram_mmap_populate
+{
+	uint32_t version;
+	uint32_t flags;
+	uint64_t instance_id;
+	uint64_t gpa;
+	uint64_t len;
+	uint64_t user_vaddr;
+	uint64_t translated_hpa;
+	uint64_t populated_bytes;
+	int32_t result_errno;
+	uint32_t reserved0;
+	uint64_t reserved[2];
+} eq_microvm_guest_ram_mmap_populate_t;
+
+_Static_assert(sizeof(eq_microvm_guest_ram_mmap_populate_t) == 80,
+	       "eq_microvm_guest_ram_mmap_populate_t must match EqMicroVmGuestRamMmapPopulate");
 
 typedef struct eq_microvm_irq_route_query
 {
@@ -524,5 +545,7 @@ typedef struct eq_shmctl_arg
 	_IOW(0, 18, eq_microvm_guest_ram_mmap_zap_op_t)
 #define EQ_INSTANCE_MICROVM_STOP _IOW(0, 19, eq_microvm_stop_arg_t)
 #define EQ_INSTANCE_MICROVM_BOOT _IOW(0, 20, eq_microvm_boot_arg_t)
+#define EQ_INSTANCE_MICROVM_GUEST_RAM_MMAP_POPULATE \
+	_IOW(0, 21, eq_microvm_guest_ram_mmap_populate_t)
 #define EQ_SHMGET _IOW(1, 2, eq_shmget_arg_t)
 #define EQ_SHMCTL _IOW(1, 3, eq_shmctl_arg_t)

@@ -190,8 +190,11 @@ fn setup_page_tables(mem: &GuestMemoryMmap, sregs: &mut kvm_sregs) -> Result<(),
     // PML4, +4K pdpt_low, +8K pdpt_high). Harmless under HLAT: slot 256 is
     // unused by Linux and HLAT manages the gate range regardless of guest PML4.
     let gate_pdpt_high_gpa = GATE_PT_GPA_BASE as u64 + 2 * 0x1000;
-    mem.write_obj(gate_pdpt_high_gpa | 0x03, boot_pml4_addr.unchecked_add(256 * 8))
-        .map_err(|_| RegsError::WritePML4Address)?;
+    mem.write_obj(
+        gate_pdpt_high_gpa | 0x03,
+        boot_pml4_addr.unchecked_add(256 * 8),
+    )
+    .map_err(|_| RegsError::WritePML4Address)?;
 
     // Entry covering VA [0..1GB)
     mem.write_obj(boot_pde_addr.raw_value() | 0x03, boot_pdpte_addr)

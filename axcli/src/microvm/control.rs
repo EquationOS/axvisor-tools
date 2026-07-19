@@ -3,8 +3,8 @@ use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -921,7 +921,26 @@ fn execute_command(server: &ControlServer, request: &str) -> Result<String, Stri
         "hyperalloc-status" | "ha-status" => {
             let query =
                 ioctl::ioctl_hyperalloc_query(server.instance_fd, server.instance_id as u64)?;
-            Ok(format_hyperalloc_status(&query))
+            let mut status = format_hyperalloc_status(&query);
+            match ioctl::ioctl_microvm_guest_ram_mmap_state(
+                server.instance_fd,
+                server.instance_id as u64,
+            ) {
+                Ok(mmap) => status.push_str(&format!(
+                    " mmap_fault_huge_batches={} mmap_fault_single_ptes={} mmap_controlled_populates={}",
+                    mmap.fault_huge_batches,
+                    mmap.fault_single_ptes,
+                    mmap.controlled_populates
+                )),
+                Err(err) => {
+                    warn!(
+                        "MicroVM guest RAM mmap evidence query failed instance={}: {}",
+                        server.instance_id, err
+                    );
+                    status.push_str(" mmap_evidence_error=1");
+                }
+            }
+            Ok(status)
         }
         "hyperalloc-policy-status" | "ha-policy-status" => format_hyperalloc_policy_status(server),
         "hyperalloc-scheduler-snapshot" | "ha-snapshot" => {
@@ -1775,6 +1794,9 @@ fn parse_hyperalloc_vfio_dma_status(value: &str) -> Result<u32, String> {
         "success" => Ok(eqvm_defs::EQ_HYPERALLOC_VFIO_DMA_STATUS_SUCCESS),
         "failed" => Ok(eqvm_defs::EQ_HYPERALLOC_VFIO_DMA_STATUS_FAILED),
         "unsupported" => Ok(eqvm_defs::EQ_HYPERALLOC_VFIO_DMA_STATUS_UNSUPPORTED),
+        "external-state-uncertain" => Ok(
+            eqvm_defs::EQ_HYPERALLOC_VFIO_DMA_STATUS_EXTERNAL_STATE_UNCERTAIN,
+        ),
         _ => {
             let status = parse_u64_arg(value, "VFIO DMA status")?;
             u32::try_from(status)
@@ -1857,11 +1879,7 @@ fn format_memory_target_response(result: &HyperAllocMemoryTargetResult) -> Strin
 }
 
 fn bool_to_u8(value: bool) -> u8 {
-    if value {
-        1
-    } else {
-        0
-    }
+    if value { 1 } else { 0 }
 }
 
 fn hyperalloc_pagecache_request_outstanding(query: &eqvm_defs::EqHyperAllocQuery) -> bool {
@@ -3809,11 +3827,7 @@ fn hyperalloc_scheduler_io_effect(
 }
 
 fn hyperalloc_query_flag(query: &eqvm_defs::EqHyperAllocQuery, flag: u32) -> u8 {
-    if query.flags & flag != 0 {
-        1
-    } else {
-        0
-    }
+    if query.flags & flag != 0 { 1 } else { 0 }
 }
 
 fn hyperalloc_memory_effect(query: &eqvm_defs::EqHyperAllocQuery) -> &'static str {
@@ -3863,6 +3877,9 @@ fn hyperalloc_vfio_dma_status_name(status: u32) -> &'static str {
         eqvm_defs::EQ_HYPERALLOC_VFIO_DMA_STATUS_SUCCESS => "success",
         eqvm_defs::EQ_HYPERALLOC_VFIO_DMA_STATUS_FAILED => "failed",
         eqvm_defs::EQ_HYPERALLOC_VFIO_DMA_STATUS_UNSUPPORTED => "unsupported",
+        eqvm_defs::EQ_HYPERALLOC_VFIO_DMA_STATUS_EXTERNAL_STATE_UNCERTAIN => {
+            "external-state-uncertain"
+        }
         _ => "unknown",
     }
 }
@@ -3906,17 +3923,28 @@ fn format_hyperalloc_policy_eval(
 fn format_hyperalloc_status(query: &eqvm_defs::EqHyperAllocQuery) -> String {
     let unregistered_frames = query.frame_count.saturating_sub(query.registered_frames);
     format!(
-        "hyperalloc version={} flags={:#x} frames={} registered_frames={} unregistered_frames={} installed={} soft={} hard={} installing={} reclaiming={} logical_reclaims={} logical_returns={} logical_installs={} logical_reclaim_attempts={} logical_reclaim_failures={} logical_install_attempts={} logical_install_failures={} last_reclaim_us={} max_reclaim_us={} last_install_us={} max_install_us={} physical_releases={} physical_allocations={} physically_released_frames={} last_physical_release_hpa={} last_physical_allocation_hpa={} physical_release_allowed={} persistent_host_ram_consumers={} retain_hpa={} pcache_req={} pcache_done={} pcache_failed={} last_seq={} last_target_huge={} last_target_pages={} last_reclaimed_huge={} last_remaining_file_huge={} last_pcache_status={} last_pcache_errno={} vfio_dma_pending={} vfio_dma_done={} vfio_dma_failed={} vfio_dma_outstanding={} last_vfio_dma_seq={} last_vfio_dma_op={} last_vfio_dma_op_name={} last_vfio_dma_status={} last_vfio_dma_status_name={} last_vfio_dma_iova={} last_vfio_dma_hpa={} last_vfio_dma_size={} last_vfio_dma_errno={} reclaim_dma_rollback_attempts={} reclaim_dma_rollback_successes={} reclaim_dma_rollback_failures={} install_ept_rollback_attempts={} install_ept_rollback_successes={} install_ept_rollback_failures={} mmap_gen={} mmap_active={} mmap_current={} mmap_stale={} mmap_seq={} mmap_reason={} mmap_zap_pending={} mmap_zap_done={} mmap_zap_failed={} mmap_zap_outstanding={} last_mmap_zap_seq={} last_mmap_zap_status={} last_mmap_zap_status_name={} last_mmap_zap_gpa={} last_mmap_zap_len={} last_mmap_zap_zapped_vmas={} last_mmap_zap_zapped_bytes={} last_mmap_zap_errno={} vfio_block_reason={} vfio_block_state={} eqgate_ha_available={} eqgate_ha_pcpu_count={} eqgate_ha_capacity={} eqgate_ha_pending={} eqgate_ha_submitted={} eqgate_ha_drained={} eqgate_ha_dropped={} eqgate_ha_last_seq={} eqgate_root_drain_execute={} eqgate_guest_hcall_enqueue={} eqgate_direct_ept_iommu_update={} vfio_present={} vfio_dynamic_supported={} vfio_dynamic_enabled={} vfio_dma_blocked_stale_vma={} vfio_physical_reclaim_blocked={}",
+        "hyperalloc version={} flags={:#x} frames={} registered_frames={} unregistered_frames={} reclaim_start_backed_frames={} reclaim_start_unbacked_frames={} reclaim_start_ept_present_frames={} reclaim_no_backing_discards={} reclaim_retained_frames={} installed={} soft={} hard={} installing={} reclaiming={} last_reclaimed_gpa={} last_reclaimed_hpa={} last_reclaimed_result={} last_installed_gpa={} last_installed_hpa={} last_installed_result={} logical_reclaims={} logical_returns={} logical_installs={} logical_reclaim_attempts={} logical_reclaim_failures={} logical_install_attempts={} logical_install_failures={} last_reclaim_us={} max_reclaim_us={} last_install_us={} max_install_us={} physical_releases={} physical_allocations={} physically_released_frames={} last_physical_release_hpa={} last_physical_allocation_hpa={} physical_release_allowed={} persistent_host_ram_consumers={} retain_hpa={} pcache_req={} pcache_done={} pcache_failed={} last_seq={} last_target_huge={} last_target_pages={} last_reclaimed_huge={} last_remaining_file_huge={} last_pcache_status={} last_pcache_errno={} vfio_dma_pending={} vfio_dma_done={} vfio_dma_failed={} vfio_dma_outstanding={} last_vfio_dma_seq={} last_vfio_dma_op={} last_vfio_dma_op_name={} last_vfio_dma_status={} last_vfio_dma_status_name={} last_vfio_dma_iova={} last_vfio_dma_hpa={} last_vfio_dma_size={} last_vfio_dma_errno={} reclaim_dma_rollback_attempts={} reclaim_dma_rollback_successes={} reclaim_dma_rollback_failures={} install_ept_rollback_attempts={} install_ept_rollback_successes={} install_ept_rollback_failures={} mmap_gen={} mmap_active={} mmap_current={} mmap_stale={} mmap_seq={} mmap_reason={} mmap_zap_pending={} mmap_zap_done={} mmap_zap_failed={} mmap_zap_outstanding={} last_mmap_zap_seq={} last_mmap_zap_status={} last_mmap_zap_status_name={} last_mmap_zap_gpa={} last_mmap_zap_len={} last_mmap_zap_zapped_vmas={} last_mmap_zap_zapped_bytes={} last_mmap_zap_errno={} vfio_block_reason={} vfio_block_state={} eqgate_ha_available={} eqgate_ha_pcpu_count={} eqgate_ha_capacity={} eqgate_ha_pending={} eqgate_ha_submitted={} eqgate_ha_drained={} eqgate_ha_dropped={} eqgate_ha_last_seq={} eqgate_root_drain_execute={} eqgate_guest_hcall_enqueue={} eqgate_direct_ept_iommu_update={} vfio_present={} vfio_dynamic_supported={} vfio_dynamic_enabled={} vfio_dma_blocked_stale_vma={} vfio_physical_reclaim_blocked={}",
         query.version,
         query.flags,
         query.frame_count,
         query.registered_frames,
         unregistered_frames,
+        query.last_reclaim_backed_frames,
+        query.last_reclaim_unbacked_frames,
+        query.last_reclaim_ept_present_frames,
+        query.last_reclaim_no_backing_discards,
+        query.last_reclaim_retained_frames,
         query.installed_frames,
         query.soft_reclaimed_frames,
         query.hard_reclaimed_frames,
         query.installing_frames,
         query.reclaiming_frames,
+        query.last_reclaimed_frame_gpa,
+        query.last_reclaimed_frame_hpa,
+        query.last_reclaimed_result,
+        query.last_installed_frame_gpa,
+        query.last_installed_frame_hpa,
+        query.last_installed_result,
         query.logical_hard_reclaims,
         query.logical_returns,
         query.logical_installs,

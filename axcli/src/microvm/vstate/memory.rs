@@ -218,7 +218,10 @@ pub fn create(
         if dup_fd < 0 {
             return ax_err!(
                 Io,
-                format_args!("Failed to duplicate eqvisor instance fd: {}", std::io::Error::last_os_error())
+                format_args!(
+                    "Failed to duplicate eqvisor instance fd: {}",
+                    std::io::Error::last_os_error()
+                )
             );
         }
         Some(Arc::new(unsafe { File::from_raw_fd(dup_fd) }))

@@ -92,8 +92,7 @@ pub fn create_microvm(args: MicroVMCreateArgs) -> AxResult {
             InvalidInput,
             format_args!(
                 "Unable to open or read microVM config {}: {}",
-                args.config_file,
-                e
+                args.config_file, e
             )
         )
     })?;
@@ -167,8 +166,12 @@ If devices are still not visible in guest, complete BAR/interrupt mapping is lik
         );
     }
 
-    let mut vm = Vm::new(vm_resources.fd)
-        .map_err(|e| ax_err_type!(BadState, format_args!("Failed to create VM instance: {}", e)))?;
+    let mut vm = Vm::new(vm_resources.fd).map_err(|e| {
+        ax_err_type!(
+            BadState,
+            format_args!("Failed to create VM instance: {}", e)
+        )
+    })?;
     console::attach_console(
         vm_resources.fd,
         vm_resources.vm_id,

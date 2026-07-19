@@ -1,19 +1,22 @@
 use std::ffi::CString;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axerrno::{AxResult, ax_err_type};
+use axerrno::{ax_err_type, AxResult};
 use eqvm_defs::{
-    EQ_HYPERALLOC_HUGE_PAGE_SIZE, EQ_HYPERALLOC_VERSION, EQ_HYPERALLOC_VFIO_DMA_OP_MAP,
-    EQ_HYPERALLOC_VFIO_DMA_OP_NONE, EQ_HYPERALLOC_VFIO_DMA_OP_UNMAP,
+    EqHyperAllocVfioDmaOp, EQ_HYPERALLOC_HUGE_PAGE_SIZE, EQ_HYPERALLOC_VERSION,
+    EQ_HYPERALLOC_VFIO_DMA_FLAG_MAP_POPULATE_VMA,
+    EQ_HYPERALLOC_VFIO_DMA_OP_MAP, EQ_HYPERALLOC_VFIO_DMA_OP_NONE, EQ_HYPERALLOC_VFIO_DMA_OP_UNMAP,
     EQ_HYPERALLOC_VFIO_DMA_STATUS_FAILED, EQ_HYPERALLOC_VFIO_DMA_STATUS_NONE,
     EQ_HYPERALLOC_VFIO_DMA_STATUS_PENDING, EQ_HYPERALLOC_VFIO_DMA_STATUS_SUCCESS,
-    EQ_HYPERALLOC_VFIO_DMA_STATUS_UNSUPPORTED, EQ_MICROVM_GUEST_RAM_MMAP_ZAP_OP_VERSION,
+    EQ_HYPERALLOC_VFIO_DMA_STATUS_EXTERNAL_STATE_UNCERTAIN,
+    EQ_HYPERALLOC_VFIO_DMA_STATUS_UNSUPPORTED,
+    EQ_MICROVM_GUEST_RAM_MMAP_ZAP_OP_VERSION,
     EQ_MICROVM_GUEST_RAM_MMAP_ZAP_STATUS_FAILED, EQ_MICROVM_GUEST_RAM_MMAP_ZAP_STATUS_NONE,
     EQ_MICROVM_GUEST_RAM_MMAP_ZAP_STATUS_PENDING, EQ_MICROVM_GUEST_RAM_MMAP_ZAP_STATUS_SUCCESS,
-    EQ_MICROVM_GUEST_RAM_MMAP_ZAP_STATUS_UNSUPPORTED, EqHyperAllocVfioDmaOp,
+    EQ_MICROVM_GUEST_RAM_MMAP_ZAP_STATUS_UNSUPPORTED,
 };
 
 use crate::ioctl;
@@ -167,6 +170,18 @@ static VFIO_HYPERALLOC_VMA_ZAP_POLL_WARNED: AtomicBool = AtomicBool::new(false);
 static VFIO_HYPERALLOC_DMA_POLL_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
 static VFIO_HYPERALLOC_DMA_POLL_LOCK: Mutex<()> = Mutex::new(());
 static VFIO_HYPERALLOC_VMA_ZAP_POLL_LOCK: Mutex<()> = Mutex::new(());
+static VFIO_HYPERALLOC_DYNAMIC_MAP_COMPLETIONS: AtomicUsize = AtomicUsize::new(0);
+static VFIO_HYPERALLOC_DYNAMIC_UNMAP_COMPLETIONS: AtomicUsize = AtomicUsize::new(0);
+static VFIO_HYPERALLOC_SHORT_UNMAP_INJECTED: AtomicBool = AtomicBool::new(false);
+static VFIO_HYPERALLOC_MAP_VMA_ROLLBACK_UNCERTAIN_INJECTED: AtomicBool = AtomicBool::new(false);
+static VFIO_HYPERALLOC_VMA_ZAP_COMPLETIONS: AtomicUsize = AtomicUsize::new(0);
+static VFIO_HYPERALLOC_DMA_TRANSACTIONS: AtomicUsize = AtomicUsize::new(0);
+static VFIO_HYPERALLOC_DMA_POLL_NS: AtomicU64 = AtomicU64::new(0);
+static VFIO_HYPERALLOC_DMA_EXECUTE_NS: AtomicU64 = AtomicU64::new(0);
+static VFIO_HYPERALLOC_DMA_COMPLETE_NS: AtomicU64 = AtomicU64::new(0);
+static VFIO_HYPERALLOC_CONTROLLED_MAPS: AtomicUsize = AtomicUsize::new(0);
+static VFIO_HYPERALLOC_CONTROLLED_POPULATE_NS: AtomicU64 = AtomicU64::new(0);
+static VFIO_HYPERALLOC_CONTROLLED_MAP_IOCTL_NS: AtomicU64 = AtomicU64::new(0);
 static VFIO_ACTIVE_ROUTE_FALLBACK_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static VFIO_MSIX_EVENTFD_READ_BATCHES: AtomicUsize = AtomicUsize::new(0);
 static VFIO_MSIX_EVENTFD_EVENT_TOTAL: AtomicUsize = AtomicUsize::new(0);
@@ -178,6 +193,16 @@ const VFIO_ACTIVE_ROUTE_FALLBACK_TRACE_LIMIT: usize = 64;
 const VFIO_MSIX_EVENTFD_PROGRESS_INTERVAL_MS: usize = 1_000;
 const VFIO_RESIZE_ROUTE_REFRESH_ATTEMPTS: usize = 16;
 const VFIO_RESIZE_ROUTE_REFRESH_INTERVAL: Duration = Duration::from_millis(2);
+const VFIO_HYPERALLOC_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const VFIO_HYPERALLOC_HOT_POLL_WINDOW: Duration = Duration::from_millis(10);
+
+fn should_log_hyperalloc_completion(completion: usize) -> bool {
+    completion <= 4 || completion % 1024 == 0
+}
+
+fn elapsed_ns(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
 
 fn lock_mlx5_bar0_last() -> Option<MutexGuard<'static, Option<(u32, u32, u32)>>> {
     VFIO_MLX5_BAR0_LAST
@@ -504,30 +529,195 @@ fn vfio_dma_map_one(container_fd: i32, iova: u64, vaddr: u64, size: u64) -> AxRe
         (&mut map as *mut VfioIommuType1DmaMap) as usize,
         "VFIO_IOMMU_MAP_DMA(dynamic)",
     )?;
-    info!(
-        "VFIO dynamic DMA map iova=[{:#x}~{:#x}) vaddr={:#x} size={:#x}",
-        iova,
-        iova.saturating_add(size),
-        vaddr,
-        size
-    );
+    let completion = VFIO_HYPERALLOC_DYNAMIC_MAP_COMPLETIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    if should_log_hyperalloc_completion(completion) {
+        info!(
+            "VFIO dynamic DMA map progress completion={} iova=[{:#x}~{:#x}) vaddr={:#x} size={:#x}",
+            completion,
+            iova,
+            iova.saturating_add(size),
+            vaddr,
+            size
+        );
+    }
     Ok(())
 }
 
-fn vfio_dma_unmap_one(container_fd: i32, iova: u64, size: u64) -> AxResult<u64> {
+/// Populate the current guest-RAM VMA from EqVisor's authoritative EPT before
+/// asking VFIO Type1 to pin it. The old lazy fault path remains a compatibility
+/// fallback at mmap level, but production HyperAlloc installs use this
+/// mmap-write-locked range operation to avoid 512 vmf_insert_pfn calls.
+///
+/// The boolean error disposition means that the VMA could not be proven empty
+/// after a later failure. Root must quarantine the Installing frame in that
+/// case instead of unmapping EPT and releasing the new HPA.
+fn vfio_dma_map_one_with_populate(
+    state: &VfioRuntimeState,
+    op: &EqHyperAllocVfioDmaOp,
+    vaddr: u64,
+    size: u64,
+) -> Result<(), (axerrno::AxError, bool)> {
+    let populate_start = Instant::now();
+    let populate = ioctl::ioctl_microvm_guest_ram_mmap_populate(
+        state.instance_fd,
+        state.instance_id as u64,
+        op.frame_gpa,
+        size,
+        vaddr,
+    )
+    .map_err(|err| {
+        (
+            ax_err_type!(
+                Io,
+                format_args!("MicroVM guest RAM controlled populate failed: {}", err)
+            ),
+            false,
+        )
+    })?;
+    let populate_ns = elapsed_ns(populate_start);
+
+    let populate_matches = populate.translated_hpa == op.frame_hpa
+        && populate.populated_bytes == size
+        && populate.instance_id == state.instance_id as u64;
+    if !populate_matches {
+        let rollback = ioctl::ioctl_microvm_guest_ram_mmap_zap(
+            state.instance_fd,
+            state.instance_id as u64,
+            op.frame_gpa,
+            size,
+        );
+        let rollback_failed = !rollback.is_ok_and(|result| {
+            result.zapped_vmas != 0 && result.zapped_bytes >= size
+        });
+        return Err((
+            ax_err_type!(
+                InvalidInput,
+                format_args!(
+                    "MicroVM guest RAM populate mismatch: expected_hpa={:#x} translated_hpa={:#x} expected_bytes={:#x} populated_bytes={:#x}",
+                    op.frame_hpa,
+                    populate.translated_hpa,
+                    size,
+                    populate.populated_bytes
+                )
+            ),
+            rollback_failed,
+        ));
+    }
+
+    let map_start = Instant::now();
+    if let Err(map_err) = vfio_dma_map_one(state.container_fd, op.iova, vaddr, size) {
+        let rollback = ioctl::ioctl_microvm_guest_ram_mmap_zap(
+            state.instance_fd,
+            state.instance_id as u64,
+            op.frame_gpa,
+            size,
+        );
+        let rollback_failed = match rollback {
+            Ok(result) => result.zapped_vmas == 0 || result.zapped_bytes < size,
+            Err(err) => {
+                warn!(
+                    "HyperAlloc VFIO MAP failure VMA rollback failed: instance={} seq={} gpa={:#x} len={:#x} err={}",
+                    state.instance_id, op.sequence, op.frame_gpa, size, err
+                );
+                true
+            }
+        };
+        return Err((map_err, rollback_failed));
+    }
+    let inject_map_vma_rollback_uncertain =
+        std::env::var("AXCLI_HYPERALLOC_INJECT_MAP_VMA_ROLLBACK_UNCERTAIN_ONCE")
+            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+            && VFIO_HYPERALLOC_MAP_VMA_ROLLBACK_UNCERTAIN_INJECTED
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
+    if inject_map_vma_rollback_uncertain {
+        // Both external effects are real: Type1 accepted the MAP and the
+        // controlled VMA contains the authoritative replacement HPA. Simulate
+        // losing the ability to confirm a required VMA rollback after that
+        // point. Root must keep EPT + Installing + HPA intact; treating this as
+        // an ordinary MAP failure would free an HPA still reachable by DMA/VMA.
+        warn!(
+            "HYPERALLOC_VFIO_FAULT_INJECT_RESULT kind=map-vma-rollback-uncertain instance={} seq={} gpa={:#x} hpa={:#x} len={:#x} map_applied=1 vma_populated=1 rollback_confirmed=0",
+            state.instance_id, op.sequence, op.frame_gpa, op.frame_hpa, size
+        );
+        return Err((
+            ax_err_type!(
+                Io,
+                "injected failure after VFIO MAP with unconfirmed VMA rollback"
+            ),
+            true,
+        ));
+    }
+    let map_ioctl_ns = elapsed_ns(map_start);
+
+    let maps = VFIO_HYPERALLOC_CONTROLLED_MAPS.fetch_add(1, Ordering::Relaxed) + 1;
+    let populate_total = VFIO_HYPERALLOC_CONTROLLED_POPULATE_NS
+        .fetch_add(populate_ns, Ordering::Relaxed)
+        .saturating_add(populate_ns);
+    let map_total = VFIO_HYPERALLOC_CONTROLLED_MAP_IOCTL_NS
+        .fetch_add(map_ioctl_ns, Ordering::Relaxed)
+        .saturating_add(map_ioctl_ns);
+    if should_log_hyperalloc_completion(maps) {
+        info!(
+            "VFIO HyperAlloc controlled MAP timing progress count={} last_populate_ns={} last_map_ioctl_ns={} avg_populate_ns={} avg_map_ioctl_ns={}",
+            maps,
+            populate_ns,
+            map_ioctl_ns,
+            populate_total / maps as u64,
+            map_total / maps as u64
+        );
+    }
+
+    Ok(())
+}
+
+fn vfio_dma_unmap_one(
+    container_fd: i32,
+    iova: u64,
+    size: u64,
+) -> Result<u64, (axerrno::AxError, bool)> {
+    let inject_short_unmap = size > 4096
+        && std::env::var("AXCLI_HYPERALLOC_INJECT_SHORT_UNMAP_ONCE")
+            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+        && VFIO_HYPERALLOC_SHORT_UNMAP_INJECTED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+    let ioctl_size = if inject_short_unmap { 4096 } else { size };
+    if inject_short_unmap {
+        warn!(
+            "HYPERALLOC_VFIO_FAULT_INJECT kind=short-unmap iova={:#x} requested={:#x} ioctl_size={:#x}",
+            iova, size, ioctl_size
+        );
+    }
     let mut unmap = VfioIommuType1DmaUnmap {
         argsz: core::mem::size_of::<VfioIommuType1DmaUnmap>() as u32,
         flags: 0,
         iova,
-        size,
+        size: ioctl_size,
     };
 
-    let _ = ioctl_ret(
+    if let Err(err) = ioctl_ret(
         container_fd,
         io(VFIO_TYPE, VFIO_IOMMU_UNMAP_DMA_NR),
         (&mut unmap as *mut VfioIommuType1DmaUnmap) as usize,
         "VFIO_IOMMU_UNMAP_DMA(dynamic)",
-    )?;
+    ) {
+        // The host returned before EqVisor could observe an unmapped length.
+        // Conservatively treat IOMMU state as uncertain.
+        return Err((err, true));
+    }
+    let kernel_unmapped = unmap.size;
+    if inject_short_unmap {
+        // The 5418Y Type1 backend may expand a 4 KiB request to the complete
+        // 2 MiB mapping. Fault injection overrides only the completion that
+        // root observes: external IOMMU state has changed, while EqVisor must
+        // handle the deliberately incomplete result as untrustworthy.
+        unmap.size = ioctl_size;
+        warn!(
+            "HYPERALLOC_VFIO_FAULT_INJECT_RESULT kind=short-unmap kernel_unmapped={:#x} reported_unmapped={:#x} requested={:#x}",
+            kernel_unmapped, unmap.size, size
+        );
+    }
     if unmap.size != size {
         warn!(
             "VFIO dynamic DMA unmap incomplete iova=[{:#x}~{:#x}) requested={:#x} unmapped={:#x}",
@@ -536,21 +726,28 @@ fn vfio_dma_unmap_one(container_fd: i32, iova: u64, size: u64) -> AxResult<u64> 
             size,
             unmap.size
         );
-        return Err(ax_err_type!(
-            InvalidInput,
-            format_args!(
-                "VFIO dynamic DMA unmap incomplete: requested={:#x} unmapped={:#x}",
-                size, unmap.size
-            )
+        return Err((
+            ax_err_type!(
+                InvalidInput,
+                format_args!(
+                    "VFIO dynamic DMA unmap incomplete: requested={:#x} unmapped={:#x}",
+                    size, unmap.size
+                )
+            ),
+            true,
         ));
     }
-    info!(
-        "VFIO dynamic DMA unmap iova=[{:#x}~{:#x}) requested={:#x} unmapped={:#x}",
-        iova,
-        iova.saturating_add(size),
-        size,
-        unmap.size
-    );
+    let completion = VFIO_HYPERALLOC_DYNAMIC_UNMAP_COMPLETIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    if should_log_hyperalloc_completion(completion) {
+        info!(
+            "VFIO dynamic DMA unmap progress completion={} iova=[{:#x}~{:#x}) requested={:#x} unmapped={:#x}",
+            completion,
+            iova,
+            iova.saturating_add(size),
+            size,
+            unmap.size
+        );
+    }
     Ok(unmap.size)
 }
 
@@ -1055,10 +1252,8 @@ pub(super) fn request_resize_irq_route_refresh() {
     if VFIO_RUNTIME_STATE.get().is_none() {
         return;
     }
-    VFIO_RESIZE_ROUTE_REFRESH_REMAINING.store(
-        VFIO_RESIZE_ROUTE_REFRESH_ATTEMPTS,
-        Ordering::Release,
-    );
+    VFIO_RESIZE_ROUTE_REFRESH_REMAINING
+        .store(VFIO_RESIZE_ROUTE_REFRESH_ATTEMPTS, Ordering::Release);
     info!(
         "VFIO resize route-refresh burst requested attempts={} interval_us={}",
         VFIO_RESIZE_ROUTE_REFRESH_ATTEMPTS,
@@ -1087,26 +1282,31 @@ fn complete_hyperalloc_vma_zap(
     }
 }
 
-fn poll_hyperalloc_vfio_dma(state: &VfioRuntimeState) {
+fn poll_hyperalloc_vfio_dma(state: &VfioRuntimeState, wait_for_request: bool) -> bool {
     let Ok(_poll_guard) = VFIO_HYPERALLOC_DMA_POLL_LOCK.try_lock() else {
-        return;
+        return false;
     };
-    let mut op =
-        match ioctl::ioctl_hyperalloc_vfio_dma_poll(state.instance_fd, state.instance_id as u64) {
-            Ok(op) => op,
-            Err(e) => {
-                if !VFIO_HYPERALLOC_DMA_POLL_WARNED.swap(true, Ordering::Relaxed) {
-                    warn!(
-                        "HyperAlloc VFIO DMA poll failed: instance={} err={}",
-                        state.instance_id, e
-                    );
-                }
-                return;
+    let poll_start = Instant::now();
+    let mut op = match ioctl::ioctl_hyperalloc_vfio_dma_poll(
+        state.instance_fd,
+        state.instance_id as u64,
+        wait_for_request,
+    ) {
+        Ok(op) => op,
+        Err(e) => {
+            if !VFIO_HYPERALLOC_DMA_POLL_WARNED.swap(true, Ordering::Relaxed) {
+                warn!(
+                    "HyperAlloc VFIO DMA poll failed: instance={} err={}",
+                    state.instance_id, e
+                );
             }
-        };
+            return false;
+        }
+    };
+    let poll_ns = elapsed_ns(poll_start);
 
     if op.status == EQ_HYPERALLOC_VFIO_DMA_STATUS_NONE || op.op == EQ_HYPERALLOC_VFIO_DMA_OP_NONE {
-        return;
+        return false;
     }
     if op.version != EQ_HYPERALLOC_VERSION {
         warn!(
@@ -1116,14 +1316,14 @@ fn poll_hyperalloc_vfio_dma(state: &VfioRuntimeState) {
         op.status = EQ_HYPERALLOC_VFIO_DMA_STATUS_UNSUPPORTED;
         op.result_errno = libc::EINVAL;
         complete_hyperalloc_vfio_dma(state, &mut op);
-        return;
+        return true;
     }
     if op.status != EQ_HYPERALLOC_VFIO_DMA_STATUS_PENDING {
         warn!(
             "HyperAlloc VFIO DMA op has non-pending status: instance={} seq={} op={} status={}",
             state.instance_id, op.sequence, op.op, op.status
         );
-        return;
+        return true;
     }
 
     let size = if op.size == 0 {
@@ -1131,13 +1331,31 @@ fn poll_hyperalloc_vfio_dma(state: &VfioRuntimeState) {
     } else {
         op.size
     };
+    let execute_start = Instant::now();
+    let mut external_state_uncertain = false;
     let result = match op.op {
         EQ_HYPERALLOC_VFIO_DMA_OP_UNMAP => {
-            vfio_dma_unmap_one(state.container_fd, op.iova, size).map(|_| ())
+            match vfio_dma_unmap_one(state.container_fd, op.iova, size) {
+                Ok(_) => Ok(()),
+                Err((err, uncertain)) => {
+                    external_state_uncertain = uncertain;
+                    Err(err)
+                }
+            }
         }
         EQ_HYPERALLOC_VFIO_DMA_OP_MAP => {
             if let Some(vaddr) = vfio_guest_iova_to_vaddr(state, op.iova, size) {
-                vfio_dma_map_one(state.container_fd, op.iova, vaddr, size)
+                if op.flags & EQ_HYPERALLOC_VFIO_DMA_FLAG_MAP_POPULATE_VMA != 0 {
+                    match vfio_dma_map_one_with_populate(state, &op, vaddr, size) {
+                        Ok(()) => Ok(()),
+                        Err((err, uncertain)) => {
+                            external_state_uncertain = uncertain;
+                            Err(err)
+                        }
+                    }
+                } else {
+                    vfio_dma_map_one(state.container_fd, op.iova, vaddr, size)
+                }
             } else {
                 Err(ax_err_type!(
                     InvalidInput,
@@ -1152,9 +1370,10 @@ fn poll_hyperalloc_vfio_dma(state: &VfioRuntimeState) {
             op.status = EQ_HYPERALLOC_VFIO_DMA_STATUS_UNSUPPORTED;
             op.result_errno = libc::EINVAL;
             complete_hyperalloc_vfio_dma(state, &mut op);
-            return;
+            return true;
         }
     };
+    let execute_ns = elapsed_ns(execute_start);
 
     match result {
         Ok(()) => {
@@ -1166,17 +1385,49 @@ fn poll_hyperalloc_vfio_dma(state: &VfioRuntimeState) {
                 "HyperAlloc VFIO DMA op failed: instance={} seq={} op={} iova={:#x} size={:#x} err={:?}",
                 state.instance_id, op.sequence, op.op, op.iova, size, e
             );
-            op.status = EQ_HYPERALLOC_VFIO_DMA_STATUS_FAILED;
+            op.status = if external_state_uncertain {
+                EQ_HYPERALLOC_VFIO_DMA_STATUS_EXTERNAL_STATE_UNCERTAIN
+            } else {
+                EQ_HYPERALLOC_VFIO_DMA_STATUS_FAILED
+            };
             op.result_errno = libc::EIO;
         }
     }
     op.size = size;
+    let complete_start = Instant::now();
     complete_hyperalloc_vfio_dma(state, &mut op);
+    let complete_ns = elapsed_ns(complete_start);
+
+    let transactions = VFIO_HYPERALLOC_DMA_TRANSACTIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    let poll_total = VFIO_HYPERALLOC_DMA_POLL_NS
+        .fetch_add(poll_ns, Ordering::Relaxed)
+        .saturating_add(poll_ns);
+    let execute_total = VFIO_HYPERALLOC_DMA_EXECUTE_NS
+        .fetch_add(execute_ns, Ordering::Relaxed)
+        .saturating_add(execute_ns);
+    let complete_total = VFIO_HYPERALLOC_DMA_COMPLETE_NS
+        .fetch_add(complete_ns, Ordering::Relaxed)
+        .saturating_add(complete_ns);
+    if should_log_hyperalloc_completion(transactions) {
+        info!(
+            "VFIO HyperAlloc DMA transaction timing progress count={} op={} wait={} last_poll_ns={} last_execute_ns={} last_complete_ns={} avg_poll_ns={} avg_execute_ns={} avg_complete_ns={}",
+            transactions,
+            op.op,
+            wait_for_request,
+            poll_ns,
+            execute_ns,
+            complete_ns,
+            poll_total / transactions as u64,
+            execute_total / transactions as u64,
+            complete_total / transactions as u64,
+        );
+    }
+    true
 }
 
-fn poll_hyperalloc_vma_zap(state: &VfioRuntimeState) {
+fn poll_hyperalloc_vma_zap(state: &VfioRuntimeState) -> bool {
     let Ok(_poll_guard) = VFIO_HYPERALLOC_VMA_ZAP_POLL_LOCK.try_lock() else {
-        return;
+        return false;
     };
     let mut op = match ioctl::ioctl_microvm_guest_ram_mmap_zap_poll(
         state.instance_fd,
@@ -1190,12 +1441,12 @@ fn poll_hyperalloc_vma_zap(state: &VfioRuntimeState) {
                     state.instance_id, e
                 );
             }
-            return;
+            return false;
         }
     };
 
     if op.status == EQ_MICROVM_GUEST_RAM_MMAP_ZAP_STATUS_NONE {
-        return;
+        return false;
     }
     if op.version != EQ_MICROVM_GUEST_RAM_MMAP_ZAP_OP_VERSION {
         warn!(
@@ -1205,14 +1456,14 @@ fn poll_hyperalloc_vma_zap(state: &VfioRuntimeState) {
         op.status = EQ_MICROVM_GUEST_RAM_MMAP_ZAP_STATUS_UNSUPPORTED;
         op.result_errno = libc::EINVAL;
         complete_hyperalloc_vma_zap(state, &mut op);
-        return;
+        return true;
     }
     if op.status != EQ_MICROVM_GUEST_RAM_MMAP_ZAP_STATUS_PENDING {
         warn!(
             "HyperAlloc guest RAM mmap zap op has non-pending status: instance={} seq={} status={}",
             state.instance_id, op.sequence, op.status
         );
-        return;
+        return true;
     }
 
     match ioctl::ioctl_microvm_guest_ram_mmap_zap(
@@ -1226,10 +1477,20 @@ fn poll_hyperalloc_vma_zap(state: &VfioRuntimeState) {
             op.zapped_vmas = result.zapped_vmas;
             op.zapped_bytes = result.zapped_bytes;
             op.result_errno = 0;
-            info!(
-                "HyperAlloc guest RAM mmap zap op completed: instance={} seq={} gpa={:#x} len={:#x} zapped_vmas={} zapped_bytes={:#x}",
-                state.instance_id, op.sequence, op.gpa, op.len, op.zapped_vmas, op.zapped_bytes
-            );
+            let completion =
+                VFIO_HYPERALLOC_VMA_ZAP_COMPLETIONS.fetch_add(1, Ordering::Relaxed) + 1;
+            if should_log_hyperalloc_completion(completion) {
+                info!(
+                    "HyperAlloc guest RAM mmap zap progress completion={} instance={} seq={} gpa={:#x} len={:#x} zapped_vmas={} zapped_bytes={:#x}",
+                    completion,
+                    state.instance_id,
+                    op.sequence,
+                    op.gpa,
+                    op.len,
+                    op.zapped_vmas,
+                    op.zapped_bytes
+                );
+            }
         }
         Err(e) => {
             warn!(
@@ -1242,15 +1503,14 @@ fn poll_hyperalloc_vma_zap(state: &VfioRuntimeState) {
     }
 
     complete_hyperalloc_vma_zap(state, &mut op);
+    true
 }
 
 pub(crate) fn poll_hyperalloc_runtime_once_for_control() -> bool {
     let Some(state) = VFIO_RUNTIME_STATE.get() else {
         return false;
     };
-    poll_hyperalloc_vfio_dma(state);
-    poll_hyperalloc_vma_zap(state);
-    true
+    poll_hyperalloc_vfio_dma(state, false) | poll_hyperalloc_vma_zap(state)
 }
 
 fn start_hyperalloc_dma_poll_worker() {
@@ -1261,12 +1521,24 @@ fn start_hyperalloc_dma_poll_worker() {
     match thread::Builder::new()
         .name("vfio-hyperalloc-dma-poll".to_string())
         .spawn(|| {
+            let mut hot_until = Instant::now();
             loop {
+                let mut completed = false;
+                let now = Instant::now();
+                let hot = now < hot_until;
                 if let Some(state) = VFIO_RUNTIME_STATE.get() {
-                    poll_hyperalloc_vfio_dma(state);
-                    poll_hyperalloc_vma_zap(state);
+                    completed =
+                        poll_hyperalloc_vfio_dma(state, hot) | poll_hyperalloc_vma_zap(state);
                 }
-                thread::sleep(Duration::from_millis(20));
+                let now = Instant::now();
+                if completed {
+                    hot_until = now + VFIO_HYPERALLOC_HOT_POLL_WINDOW;
+                }
+                if now < hot_until {
+                    std::hint::spin_loop();
+                } else {
+                    thread::sleep(VFIO_HYPERALLOC_IDLE_POLL_INTERVAL);
+                }
             }
         }) {
         Ok(_) => info!("VFIO HyperAlloc DMA poll worker started"),
@@ -1739,12 +2011,15 @@ pub fn setup_vfio_dma_holder(
     }
     match ioctl::ioctl_microvm_guest_ram_mmap_state(resources.fd, resources.vm_id as u64) {
         Ok(state) => info!(
-            "MicroVM guest RAM mmap query after VFIO setup: instance={} generation={} current_mmaps={} stale_mmaps={} active_mmaps={}",
+            "MicroVM guest RAM mmap query after VFIO setup: instance={} generation={} current_mmaps={} stale_mmaps={} active_mmaps={} fault_huge_batches={} fault_single_ptes={} controlled_populates={}",
             resources.vm_id,
             state.generation,
             state.current_mmaps,
             state.stale_mmaps,
-            state.active_mmaps
+            state.active_mmaps,
+            state.fault_huge_batches,
+            state.fault_single_ptes,
+            state.controlled_populates
         ),
         Err(e) => warn!(
             "MicroVM guest RAM mmap query after VFIO setup failed: instance={} err={}",
@@ -1767,7 +2042,6 @@ pub fn run_foreground_daemon_loop() -> ! {
     let mut last_cmdq_trace = Instant::now() - Duration::from_secs(1);
     let mut last_route_refresh = Instant::now() - Duration::from_secs(1);
     let mut last_full_route_refresh = Instant::now() - Duration::from_secs(1);
-    let mut last_hyperalloc_dma_poll = Instant::now() - Duration::from_millis(100);
     let route_refresh_start = Instant::now();
     let forced_route_refresh_interval = env_duration_ms("AXCLI_VFIO_ROUTE_REFRESH_MS");
     let full_route_refresh_interval =
@@ -1776,7 +2050,8 @@ pub fn run_foreground_daemon_loop() -> ! {
     let mut last_runtime_snapshot = runtime_snapshot_interval
         .map(|interval| Instant::now() - interval)
         .unwrap_or_else(Instant::now);
-    if forced_route_refresh_interval.is_some() || full_route_refresh_interval != Duration::from_secs(1)
+    if forced_route_refresh_interval.is_some()
+        || full_route_refresh_interval != Duration::from_secs(1)
     {
         info!(
             "VFIO route refresh intervals route={:?} full_active={:?}",
@@ -1820,8 +2095,8 @@ pub fn run_foreground_daemon_loop() -> ! {
             if last_route_refresh.elapsed() >= route_refresh_interval {
                 if resize_refresh_remaining != 0 {
                     refresh_active_posted_irq_routes(state);
-                    let previous = VFIO_RESIZE_ROUTE_REFRESH_REMAINING
-                        .fetch_sub(1, Ordering::AcqRel);
+                    let previous =
+                        VFIO_RESIZE_ROUTE_REFRESH_REMAINING.fetch_sub(1, Ordering::AcqRel);
                     if previous == 1 {
                         info!("VFIO resize route-refresh burst completed");
                     }
@@ -1834,11 +2109,6 @@ pub fn run_foreground_daemon_loop() -> ! {
                     }
                 }
                 last_route_refresh = Instant::now();
-            }
-            if last_hyperalloc_dma_poll.elapsed() >= Duration::from_millis(100) {
-                poll_hyperalloc_vfio_dma(state);
-                poll_hyperalloc_vma_zap(state);
-                last_hyperalloc_dma_poll = Instant::now();
             }
             if let Some(interval) = runtime_snapshot_interval {
                 if last_runtime_snapshot.elapsed() >= interval {

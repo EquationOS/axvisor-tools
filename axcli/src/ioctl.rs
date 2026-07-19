@@ -5,7 +5,8 @@ use crate::microvm::{IovaMode, PciBdf, VfioResourceConfig};
 use eqvm_defs::{
     EqHyperAllocDebugReclaimReq, EqHyperAllocEqGateDebugEnqueueReq, EqHyperAllocEqGateDrainReq,
     EqHyperAllocQuery, EqHyperAllocVfioDmaOp, EqMicroVmGuestMemCopy, EqMicroVmGuestRamMmapZap,
-    EqMicroVmGuestRamMmapZapOp,
+    EqMicroVmGuestRamMmapPopulate, EqMicroVmGuestRamMmapZapOp,
+    EQ_HYPERALLOC_VFIO_DMA_FLAG_POLL_WAIT,
 };
 use libc::c_char;
 
@@ -25,6 +26,9 @@ pub struct MicroVmGuestRamMmapState {
     pub active_mmaps: u64,
     pub current_mmaps: u64,
     pub stale_mmaps: u64,
+    pub fault_huge_batches: u64,
+    pub fault_single_ptes: u64,
+    pub controlled_populates: u64,
 }
 
 include!(concat!(env!("OUT_DIR"), "/eqioctl.rs"));
@@ -98,6 +102,9 @@ const EQ_INSTANCE_MICROVM_GUEST_RAM_MMAP_ZAP_COMPLETE: u64 =
 const EQ_INSTANCE_MICROVM_STOP: u64 = iow::<eq_microvm_stop_arg_t>(0, 19);
 #[cfg(feature = "microvm")]
 const EQ_INSTANCE_MICROVM_BOOT: u64 = iow::<eq_microvm_boot_arg_t>(0, 20);
+#[cfg(feature = "microvm")]
+const EQ_INSTANCE_MICROVM_GUEST_RAM_MMAP_POPULATE: u64 =
+    iow::<EqMicroVmGuestRamMmapPopulate>(0, 21);
 
 const EQ_DEVICE_NAME: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"/dev/eqmanager\0") };
 
@@ -493,10 +500,16 @@ pub fn ioctl_microvm_boot(
 pub fn ioctl_hyperalloc_vfio_dma_poll(
     instance_fd: i32,
     instance_id: u64,
+    wait_for_request: bool,
 ) -> Result<EqHyperAllocVfioDmaOp, String> {
     let mut arg = EqHyperAllocVfioDmaOp {
         version: eqvm_defs::EQ_HYPERALLOC_VERSION,
         instance_id,
+        flags: if wait_for_request {
+            EQ_HYPERALLOC_VFIO_DMA_FLAG_POLL_WAIT
+        } else {
+            0
+        },
         ..EqHyperAllocVfioDmaOp::default()
     };
 
@@ -740,6 +753,51 @@ pub fn ioctl_microvm_guest_ram_mmap_zap(
         return Err(format!(
             "Eqdriver rejected MicroVM guest RAM mmap zap for instance {} gpa={:#x} len={:#x} errno={}",
             instance_id, gpa, len, arg.result_errno
+        ));
+    }
+
+    Ok(arg)
+}
+
+#[cfg(feature = "microvm")]
+pub fn ioctl_microvm_guest_ram_mmap_populate(
+    instance_fd: i32,
+    instance_id: u64,
+    gpa: u64,
+    len: u64,
+    user_vaddr: u64,
+) -> Result<EqMicroVmGuestRamMmapPopulate, String> {
+    let mut arg = EqMicroVmGuestRamMmapPopulate {
+        version: eqvm_defs::EQ_MICROVM_GUEST_RAM_MMAP_POPULATE_VERSION,
+        instance_id,
+        gpa,
+        len,
+        user_vaddr,
+        ..EqMicroVmGuestRamMmapPopulate::default()
+    };
+
+    let ret = unsafe {
+        libc::ioctl(
+            instance_fd,
+            EQ_INSTANCE_MICROVM_GUEST_RAM_MMAP_POPULATE as libc::c_ulong,
+            &mut arg as *mut _,
+        )
+    };
+
+    if ret < 0 {
+        return Err(format!(
+            "Failed to populate MicroVM guest RAM mmap for instance {} gpa={:#x} len={:#x} vaddr={:#x}: {}",
+            instance_id,
+            gpa,
+            len,
+            user_vaddr,
+            std::io::Error::last_os_error()
+        ));
+    }
+    if arg.result_errno != 0 {
+        return Err(format!(
+            "Eqdriver rejected MicroVM guest RAM mmap populate for instance {} gpa={:#x} len={:#x} vaddr={:#x} errno={}",
+            instance_id, gpa, len, user_vaddr, arg.result_errno
         ));
     }
 
@@ -1021,5 +1079,8 @@ pub fn ioctl_microvm_guest_ram_mmap_state(
         active_mmaps: arg.active_mmaps,
         current_mmaps: arg.current_mmaps,
         stale_mmaps: arg.stale_mmaps,
+        fault_huge_batches: arg.reserved[0],
+        fault_single_ptes: arg.reserved[1],
+        controlled_populates: arg.reserved[2],
     })
 }

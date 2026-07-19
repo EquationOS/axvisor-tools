@@ -183,8 +183,8 @@ fn configure_64bit_boot(
     params.hdr.header = KERNEL_HDR_MAGIC;
     params.hdr.cmd_line_ptr = u32::try_from(cmdline_addr.raw_value())
         .map_err(|_| ConfigurationError::BootParamValue("cmd_line_ptr"))?;
-    params.hdr.cmdline_size =
-        u32::try_from(cmdline_size).map_err(|_| ConfigurationError::BootParamValue("cmdline_size"))?;
+    params.hdr.cmdline_size = u32::try_from(cmdline_size)
+        .map_err(|_| ConfigurationError::BootParamValue("cmdline_size"))?;
     params.hdr.kernel_alignment = KERNEL_MIN_ALIGNMENT_BYTES;
     if let Some(initrd_config) = initrd {
         params.hdr.ramdisk_image = u32::try_from(initrd_config.address.raw_value())
